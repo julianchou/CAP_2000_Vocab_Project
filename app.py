@@ -19,6 +19,7 @@ from app_utils.filesystem import (
     manual_marker_path,
     set_manual_marker,
     has_manual_marker,
+    log_file_for_stage,
 )
 from app_utils.pipeline import StageRunner, load_stage_config
 import yaml
@@ -31,7 +32,6 @@ from app_utils.substeps import (
 )
 
 ROOT = Path(__file__).resolve().parent
-
 
 PROFILES_CFG = ROOT / "config" / "profiles.yaml"
 
@@ -53,9 +53,8 @@ section = st.sidebar.radio("功能模組", [
     "⚙️ Pipeline Manager",
     "💰 FinOps Monitor",
     "🎬 Studio & Publisher",
-])
+], key="nav_radio")
 
-# Common data
 # Common data (profile-aware)
 profiles = get_profile_map()
 # Sidebar profile switch
@@ -64,7 +63,7 @@ if "profile_id" not in st.session_state:
     st.session_state["profile_id"] = profile_ids[0]
 choices = [profiles.get(pid, {"name": pid}).get("name", pid) + f" ({pid})" for pid in profile_ids]
 idx_default = profile_ids.index(st.session_state["profile_id"]) if st.session_state["profile_id"] in profile_ids else 0
-selected = st.sidebar.selectbox("專案環境", choices, index=idx_default)
+selected = st.sidebar.selectbox("專案環境", choices, index=idx_default, key="profile_select")
 pid = selected.split("(")[-1].rstrip(")")
 if pid in profiles and pid != st.session_state["profile_id"]:
     st.session_state["profile_id"] = pid
@@ -77,7 +76,6 @@ stage_cfg = load_stage_config(ROOT, PATH_STAGES)
 runner = StageRunner(ROOT, PATH_STAGES, (ROOT / WS_ROOT))
 cost_model = load_cost_model(ROOT, PATH_COSTS)
 substeps_map = load_substeps_config(ROOT, PATH_SUBSTEPS)
-
 
 # --- helpers ---
 
@@ -121,7 +119,6 @@ def stage_table(eps):
     return pd.DataFrame(rows)
 
 
-
 def compute_substeps_status(eps):
     """Return per-episode No.3–17 status using the same logic
     as the details panel (evaluate_substeps_debug)."""
@@ -143,6 +140,7 @@ def compute_substeps_status(eps):
             "_rows": dbg,
         })
     return out
+
 def substeps_table(eps):
     rows = []
     snapshot = compute_substeps_status(eps)
@@ -154,6 +152,8 @@ def substeps_table(eps):
         rows.append(row)
     return pd.DataFrame(rows)
 
+# convenience
+STAGE_IDS = ["1","1.5","2","3","4","5","6","7"]
 
 # --- UI ---
 if section == "📊 Dashboard":
@@ -176,44 +176,41 @@ if section == "📊 Dashboard":
         # 手動確認控制（No.7 / No.13）
         with st.expander("手動確認工具 (僅 7 / 13)", expanded=False):
             eps_map = {f"Ep{e['_raw']['ep']:02d}": e for e in eps}
-            ep_choice = st.selectbox("選擇集數以標記手動步驟", list(eps_map.keys()))
+            ep_choice = st.selectbox("選擇集數以標記手動步驟", list(eps_map.keys()), key="manual_ep")
             target_m = eps_map[ep_choice]
             ep_info = target_m["_raw"]
             colA, colB, colC = st.columns([1, 1, 2])
             with colA:
                 s7_cur = has_manual_marker(ep_info["path"], "7")
-                s7_new = st.checkbox("Step 7 完成 (NotebookLM)", value=s7_cur)
+                s7_new = st.checkbox("Step 7 完成 (NotebookLM)", value=s7_cur, key="manual7")
             with colB:
                 s13_cur = has_manual_marker(ep_info["path"], "13")
-                s13_new = st.checkbox("Step 13 完成 (人工微調)", value=s13_cur)
+                s13_new = st.checkbox("Step 13 完成 (人工微調)", value=s13_cur, key="manual13")
             with colC:
-                if st.button("更新手動標記"):
+                if st.button("更新手動標記", key="manual_update"):
                     set_manual_marker(ep_info["path"], "7", s7_new)
                     set_manual_marker(ep_info["path"], "13", s13_new)
                     st.success("已更新手動標記，請重新展開刷新表格或切換頁籤。")
 
         # 檢核詳情 (可選集數)
-        # 檢核詳情 (可選集數)
-# rebuilt: aggregate by substep (one row per No.)
         with st.expander("檢核詳情 (No.3–17)", expanded=False):
-            ep_opts = {f'{e["Ep"]} ({e["Range"]})': e for e in eps}
+            ep_opts = {f"{e['Ep']} ({e['Range']})": e for e in eps}
             keys_list = list(ep_opts.keys())
             default_idx = 0
             for idx, k in enumerate(keys_list):
                 if k.startswith("Ep04 "):
                     default_idx = idx
                     break
-            choice = st.selectbox("選擇要檢核的集數", keys_list, index=default_idx)
+            choice = st.selectbox("選擇要檢核的集數", keys_list, index=default_idx, key="detail_ep")
             target = ep_opts.get(choice)
             if target:
                 info = target["_raw"]
-                st.caption(f'Episode Path: {info["path"]}')
+                st.caption(f"Episode Path: {info['path']}")
                 dbg = evaluate_substeps_debug(info["path"], substeps_map)
                 rows = []
                 for item in dbg:
                     pats = item.get("patterns", [])
-                    nonempty_required = any(p.get("nonempty") for p in pats)
-                    nonempty_patterns = [p for p in pats if p.get("nonempty")] 
+                    nonempty_patterns = [p for p in pats if p.get("nonempty")]
                     rule = (item.get("rule") or "any").lower()
                     # Require Nonempty: 是否有任何 pattern 標註 nonempty:true
                     nonempty_required = len(nonempty_patterns) > 0
@@ -227,7 +224,7 @@ if section == "📊 Dashboard":
                     matched_count = sum(p.get("matched_count",0) for p in pats)
                     matched_paths = []
                     for p in pats:
-                        matched_paths.extend(p.get("matched", []) )
+                        matched_paths.extend(p.get("matched", []))
                     matched_paths = matched_paths[:10]
                     rows.append({
                         "No": item.get("no"),
@@ -244,5 +241,55 @@ if section == "📊 Dashboard":
             else:
                 st.caption("找不到可檢核的集數。")
 
-import os
+# --- Pipeline Manager ---
+elif section == "⚙️ Pipeline Manager":
+    st.header("工作流引擎與日誌 (Pipeline Manager)")
+    eps = scan_episodes()
+    if not eps:
+        st.info("尚未發現 workspace 內容。請先建立或同步集數資料夾。")
+    else:
+        ep_map = {f"Ep{e['_raw']['ep']:02d} ({e['Range']})": e for e in eps}
+        ep_choice = st.selectbox("選擇集數", list(ep_map.keys()), key="pm_ep")
+        target = ep_map[ep_choice]
+        info = target["_raw"]
+        st.caption(f"Episode Path: {info['path']}")
+        # 目前狀態
+        st.subheader("階段控制 (1–7)")
+        cur = target["Current"]
+        cols = st.columns(8)
+        for i, sid in enumerate(STAGE_IDS):
+            with cols[i]:
+                st.metric(label=f"Stage {sid}", value=cur.get(sid, "pending"))
+        st.divider()
+        # 操作區
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1:
+            sid = st.selectbox("選擇要執行的階段", STAGE_IDS, key="pm_stage")
+        with c2:
+            run_btn = st.button("執行所選階段", key="pm_run")
+        with c3:
+            st.write("「執行」後可於下方日誌檢視輸出。")
+        if run_btn:
+            status = runner.run_stage(info, sid)
+            st.success(f"已執行 Stage {sid}，目前狀態：{status['stages'].get(sid)}")
+        # 日誌檢視
+        with st.expander("終端機日誌面板 (Log Viewer)", expanded=False):
+            log_tabs = st.tabs([f"Stage {sid}" for sid in STAGE_IDS])
+            for sid, tab in zip(STAGE_IDS, log_tabs):
+                with tab:
+                    lp = log_file_for_stage(info["path"], sid)
+                    if lp.exists():
+                        st.download_button("下載 log", data=lp.read_bytes(), file_name=lp.name, key=f"dl_{sid}")
+                        st.code(lp.read_text(encoding="utf-8", errors="ignore")[-5000:])
+                    else:
+                        st.caption("尚無此階段的日誌。")
 
+# --- FinOps ---
+elif section == "💰 FinOps Monitor":
+    st.header("成本與配額控管 (FinOps Monitor)")
+    st.write("此區塊保留，未變更先前行為。")
+
+# --- Studio & Publisher ---
+elif section == "🎬 Studio & Publisher":
+    st.header("影音預覽與發布中樞 (Studio & Publisher)")
+    st.write("此區塊保留，未變更先前行為。")
