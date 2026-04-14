@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 import json
@@ -213,7 +213,17 @@ if section == "📊 Dashboard":
                 for item in dbg:
                     pats = item.get("patterns", [])
                     nonempty_required = any(p.get("nonempty") for p in pats)
-                    nonempty_ok = all((not p.get("nonempty")) or p.get("satisfied") for p in pats) if pats else True
+                    nonempty_patterns = [p for p in pats if p.get("nonempty")] 
+                    rule = (item.get("rule") or "any").lower()
+                    # Require Nonempty: 是否有任何 pattern 標註 nonempty:true
+                    nonempty_required = len(nonempty_patterns) > 0
+                    # Nonempty OK: 與子步驟 Rule 對齊
+                    if not nonempty_patterns:
+                        nonempty_ok = True
+                    elif rule == "any":
+                        nonempty_ok = any(p.get("satisfied") for p in nonempty_patterns)
+                    else:
+                        nonempty_ok = all(p.get("satisfied") for p in nonempty_patterns)
                     matched_count = sum(p.get("matched_count",0) for p in pats)
                     matched_paths = []
                     for p in pats:
