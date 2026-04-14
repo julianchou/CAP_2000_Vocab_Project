@@ -23,7 +23,7 @@ substeps:
 
   - no: "5"
     key: "step05_cover"
-    name: "產生封面圖"
+    name: "產品影片封面圖"
     rule: any
     outputs:
       - pattern: "04_images/cover.png"
