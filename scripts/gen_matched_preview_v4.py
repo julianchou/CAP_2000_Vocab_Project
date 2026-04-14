@@ -1,4 +1,4 @@
-import os
+﻿import os
 import csv
 import argparse
 import traceback
@@ -13,7 +13,7 @@ client = genai.Client()
 
 # --- 目錄設定 ---
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 def process_image_standard(img_path):
     """

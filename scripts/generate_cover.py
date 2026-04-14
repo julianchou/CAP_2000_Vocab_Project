@@ -1,3 +1,4 @@
+﻿import os
 import argparse
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
@@ -5,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 # 設定路徑
 base_dir = Path(__file__).parent.parent
 core_assets_dir = base_dir / "core" / "assets"
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 TEMPLATE_NAME = "cover_template.png"
 
 def find_font():

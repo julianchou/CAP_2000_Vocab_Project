@@ -1,4 +1,4 @@
-import os
+﻿import os
 import argparse
 import subprocess
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 def merge_audio_for_episode(ep_num, base_dir):
     print(f"\n🎬 正在處理第 {ep_num:02d} 集的音檔合併...")
     
-    workspace_dir = base_dir / "workspace"
+    workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
     core_dir = base_dir / "core"
     
     # 開頭音檔固定路徑

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import srt
 import json
 import csv
@@ -13,7 +13,7 @@ client = genai.Client()
 
 # --- 目錄設定 ---
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 MODEL_NAME = "gemini-2.5-pro"
 
 def generate_storyboard(ep_num):

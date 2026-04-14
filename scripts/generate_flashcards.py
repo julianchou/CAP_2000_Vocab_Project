@@ -1,4 +1,4 @@
-import os
+﻿import os
 import argparse
 import pandas as pd
 from pathlib import Path
@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 base_dir = Path(__file__).parent.parent
 core_assets_dir = base_dir / "core" / "assets"
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 TEMPLATE_FILENAME = "flashcard_template.png"
 
@@ -93,9 +93,9 @@ def process_episode(ep_num, filter_words=None):
     print(f"✅ 完成！")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=int, required=True)
+    parser = argparse.ArgumentParser()`r`n    parser.add_argument("--ep", type=int)`r`n    parser.add_argument("--start", type=int)
     parser.add_argument("--words", type=str)
     args = parser.parse_args()
     f_words = [w.strip() for w in args.words.split(',')] if args.words else None
-    process_episode(args.start, f_words)
+    process_episode(args.ep or args.start, f_words)
+

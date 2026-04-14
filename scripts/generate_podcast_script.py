@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import argparse
 import pandas as pd
@@ -11,7 +11,7 @@ client = genai.Client()
 
 # --- 設定區 ---
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 MODEL_NAME = "gemini-2.5-pro"
 
 def generate_json_script(ep_num):

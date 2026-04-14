@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import argparse
 import pickle
@@ -19,7 +19,7 @@ client = genai.Client()
 
 # --- 目錄與 Drive 設定 ---
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 # 🔑 包含 YouTube 上傳與 Drive 檔案操作權限
 SCOPES = [

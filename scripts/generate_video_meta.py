@@ -1,10 +1,11 @@
+﻿import os
 import pandas as pd
 import argparse
 from pathlib import Path
 
 # 設定路徑
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 def generate_video_description(ep_num):
     # 尋找資料夾

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import argparse
 from pathlib import Path
 from dotenv import load_dotenv
@@ -8,7 +8,7 @@ load_dotenv()
 client = genai.Client()
 
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 MODEL_NAME = "gemini-2.5-pro"
 
 def review_subtitles_with_llm(ep_num):

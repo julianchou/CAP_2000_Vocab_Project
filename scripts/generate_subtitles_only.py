@@ -1,3 +1,4 @@
+﻿import os
 import whisper
 import srt
 import datetime
@@ -12,7 +13,7 @@ PUNCTUATIONS = ['，', '。', '！', '？', '、', ',', '.', '!', '?']
 
 # 專案路徑設定
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 def generate_optimized_subtitles(ep_num):
     # 尋找對應的集數資料夾

@@ -1,3 +1,4 @@
+﻿import os
 import asyncio
 import json
 import argparse
@@ -22,7 +23,7 @@ SPEAKER_CONFIG = {
 }
 
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 async def synthesize_audio(ep_num):
     target_folder = next(workspace_dir.glob(f"Ep{ep_num:02d}_*"), None)

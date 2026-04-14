@@ -1,4 +1,4 @@
-import os
+﻿import os
 import csv
 import json
 import pickle
@@ -14,7 +14,7 @@ from google.auth.transport.requests import Request
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl'] 
 
 base_dir = Path(__file__).parent.parent
-workspace_dir = base_dir / "workspace"
+workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 CLIENT_SECRETS_FILE = base_dir / "client_secret.json"
 TOKEN_FILE = base_dir / "token_youtube.pickle"
 SCHEDULE_FILE = base_dir / "upload_schedule.csv"
