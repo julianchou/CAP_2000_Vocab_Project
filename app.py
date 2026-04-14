@@ -253,37 +253,110 @@ elif section == "⚙️ Pipeline Manager":
         target = ep_map[ep_choice]
         info = target["_raw"]
         st.caption(f"Episode Path: {info['path']}")
-        # 目前狀態
-        st.subheader("階段控制 (1–7)")
-        cur = target["Current"]
-        cols = st.columns(8)
-        for i, sid in enumerate(STAGE_IDS):
-            with cols[i]:
-                st.metric(label=f"Stage {sid}", value=cur.get(sid, "pending"))
-        st.divider()
-        # 操作區
-        c1, c2, c3 = st.columns([1,1,2])
-        with c1:
-            sid = st.selectbox("選擇要執行的階段", STAGE_IDS, key="pm_stage")
-        with c2:
-            run_btn = st.button("執行所選階段", key="pm_run")
-        with c3:
-            st.write("「執行」後可於下方日誌檢視輸出。")
-        if run_btn:
-            status = runner.run_stage(info, sid)
-            st.success(f"已執行 Stage {sid}，目前狀態：{status['stages'].get(sid)}")
-        # 日誌檢視
-        with st.expander("終端機日誌面板 (Log Viewer)", expanded=False):
-            log_tabs = st.tabs([f"Stage {sid}" for sid in STAGE_IDS])
-            for sid, tab in zip(STAGE_IDS, log_tabs):
-                with tab:
-                    lp = log_file_for_stage(info["path"], sid)
-                    if lp.exists():
-                        st.download_button("下載 log", data=lp.read_bytes(), file_name=lp.name, key=f"dl_{sid}")
-                        st.code(lp.read_text(encoding="utf-8", errors="ignore")[-5000:])
-                    else:
-                        st.caption("尚無此階段的日誌。")
 
+        # 對應關係 (依 profile)
+        def get_mapping(profile_id: str):
+            # mode: auto -> 可執行(stage)，manual -> 僅人工，na -> 無對應/外部
+            mapping = {
+                '1':  [3,4,5,6,7],
+                '1.5':[8],
+                '2':  [9],
+                '3':  [10,11],
+                '4':  [12,13,14],
+                '5':  [15],
+                '6':  [16],
+                '7':  [17],
+            }
+            sub2stage = {}
+            exec_mode = {}
+            for sid, lst in mapping.items():
+                for n in lst:
+                    sub2stage[str(n)] = sid
+            # 可執行的子步驟（有對應 stage 且不是純手動）
+            manual_only = {'7','11','13'}
+            for n in range(3,18):
+                ns = str(n)
+                if ns in manual_only:
+                    exec_mode[ns] = 'manual'
+                elif ns in sub2stage:
+                    exec_mode[ns] = 'auto'
+                else:
+                    exec_mode[ns] = 'na'
+            return mapping, sub2stage, exec_mode
+        stage2subs, sub2stage, exec_mode = get_mapping(st.session_state["profile_id"])
+
+        tab_stage, tab_sub = st.tabs(["階段控制 (1–7)", "子步驟 (3–17)"])
+
+        with tab_stage:
+            cur = target["Current"]
+            cols = st.columns(8)
+            for i, sid in enumerate(STAGE_IDS):
+                with cols[i]:
+                    st.metric(label=f"Stage {sid}", value=cur.get(sid, "pending"))
+            st.divider()
+            c1, c2, c3 = st.columns([1,1,2])
+            with c1:
+                sid = st.selectbox("選擇要執行的階段", STAGE_IDS, key="pm_stage")
+            with c2:
+                run_btn = st.button("執行所選階段", key="pm_run")
+            with c3:
+                st.write("「執行」後可於下方日誌檢視輸出。")
+            if run_btn:
+                status = runner.run_stage(info, sid)
+                st.success(f"已執行 Stage {sid}，目前狀態：{status['stages'].get(sid)}")
+            with st.expander("終端機日誌面板 (Log Viewer)", expanded=False):
+                log_tabs = st.tabs([f"Stage {sid}" for sid in STAGE_IDS])
+                for sid, tab in zip(STAGE_IDS, log_tabs):
+                    with tab:
+                        lp = log_file_for_stage(info["path"], sid)
+                        if lp.exists():
+                            st.download_button("下載 log", data=lp.read_bytes(), file_name=lp.name, key=f"dl_{sid}")
+                            st.code(lp.read_text(encoding="utf-8", errors="ignore")[-5000:])
+                        else:
+                            st.caption("尚無此階段的日誌。")
+
+        with tab_sub:
+            dbg = evaluate_substeps_debug(info["path"], substeps_map)
+            by_no = {str(r.get('no')): r for r in dbg}
+            cols = ["No","Name","Stage","Step OK","Nonempty OK","Run"]
+            data = []
+            for n in range(3,18):
+                ns = str(n)
+                row = by_no.get(ns, {})
+                pats = row.get('patterns', [])
+                nonempty_patterns = [p for p in pats if p.get('nonempty')]
+                rule = (row.get('rule') or 'any').lower()
+                nonempty_required = len(nonempty_patterns) > 0
+                if not nonempty_patterns:
+                    nonempty_ok = True
+                elif rule == 'any':
+                    nonempty_ok = any(p.get('satisfied') for p in nonempty_patterns)
+                else:
+                    nonempty_ok = all(p.get('satisfied') for p in nonempty_patterns)
+                stage_for = sub2stage.get(ns, '—')
+                step_ok = '🟢' if row.get('ok') else '⚪'
+                nonempty_ok_i = '✅' if nonempty_ok else ('❌' if nonempty_required else '')
+                # Run controls
+                if exec_mode.get(ns) == 'auto':
+                    if st.button(f"Run (→ Stage {stage_for})", key=f"run_sub_{ns}"):
+                        st.session_state['__run_result__'] = runner.run_stage(info, stage_for)
+                        st.success(f"已執行 Stage {stage_for}，請稍後查看日誌與狀態。")
+                    run_label = f"→ Stage {stage_for}"
+                elif exec_mode.get(ns) == 'manual':
+                    st.button("手動步驟", key=f"run_sub_{ns}", disabled=True)
+                    run_label = "手動"
+                else:
+                    st.button("無對應", key=f"run_sub_{ns}", disabled=True)
+                    run_label = "—"
+                data.append([ns, row.get('name', ''), stage_for, step_ok, nonempty_ok_i, run_label])
+            st.dataframe(pd.DataFrame(data, columns=cols), use_container_width=True)
+
+        with st.expander("1–7 與 3–17 對應關係", expanded=False):
+            map_rows = []
+            for sid in STAGE_IDS:
+                subs = stage2subs.get(sid, [])
+                map_rows.append({"Stage": sid, "Substeps": ", ".join(str(x) for x in subs)})
+            st.table(pd.DataFrame(map_rows))
 # --- FinOps ---
 elif section == "💰 FinOps Monitor":
     st.header("成本與配額控管 (FinOps Monitor)")
