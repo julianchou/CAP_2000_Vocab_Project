@@ -1,8 +1,4 @@
-﻿# Sub-steps mapping derived from Google Sheet (NotebookLM 工作流, No 3–17)
-# Output patterns are relative to each episode folder: workspace/EpXX_YYYY_ZZZZ/
-# rule:any -> any one output exists is done; rule:all -> all outputs must exist.
-# nonempty:true means file must be non-zero; for folders/globs it means at least one match.
-substeps:
+﻿substeps:
   - no: "3"
     key: "step03_vocab_content"
     name: "產生單字卡內容"
@@ -12,6 +8,10 @@ substeps:
         nonempty: true
       - pattern: "03_storyboards/vocab_data.json"
         nonempty: true
+    run:
+      type: python
+      script: scripts/generate_vocab_content.py
+      args: ["--start", "{ep}"]
 
   - no: "4"
     key: "step04_flashcards"
@@ -20,6 +20,10 @@ substeps:
     outputs:
       - pattern: "04_images/flashcards/*.*"
       - pattern: "04_images/*.png"
+    run:
+      type: python
+      script: scripts/generate_flashcards.py
+      args: ["--ep", "{ep}"]
 
   - no: "5"
     key: "step05_cover"
@@ -28,6 +32,10 @@ substeps:
     outputs:
       - pattern: "04_images/cover.png"
         nonempty: true
+    run:
+      type: python
+      script: scripts/generate_cover.py
+      args: ["--ep", "{ep}", "--start_idx", "{start}", "--end_idx", "{end}"]
 
   - no: "6"
     key: "step06_prompt"
@@ -36,6 +44,10 @@ substeps:
     outputs:
       - pattern: "notebooklm_prompt_ep*.txt"
         nonempty: true
+    run:
+      type: python
+      script: scripts/generate_notebooklm_prompt.py
+      args: ["--ep", "{ep}"]
 
   - no: "7"
     key: "step07_tts_generate"
@@ -43,8 +55,8 @@ substeps:
     rule: any
     outputs:
       - pattern: "00_logs/step07_manual_done.txt"
-
       - pattern: "00_logs/step7_manual_done.txt"
+
   - no: "8"
     key: "step08_audio_download"
     name: "下載並儲存語音"
@@ -60,6 +72,10 @@ substeps:
     outputs:
       - pattern: "02_subtitles/notebooklm_audio.srt"
         nonempty: true
+    run:
+      type: python
+      script: scripts/generate_subtitles_only.py
+      args: ["--ep", "{ep}"]
 
   - no: "10"
     key: "step10_subtitles_fix"
@@ -68,6 +84,10 @@ substeps:
     outputs:
       - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
         nonempty: true
+    run:
+      type: python
+      script: scripts/llm_subtitle_reviewer.py
+      args: ["--ep", "{ep}"]
 
   - no: "11"
     key: "step11_subtitles_manual"
@@ -84,6 +104,10 @@ substeps:
     outputs:
       - pattern: "03_storyboards/storyboard.csv"
         nonempty: true
+    run:
+      type: python
+      script: scripts/llm_director.py
+      args: ["--ep", "{ep}"]
 
   - no: "13"
     key: "step13_storyboard_manual"
@@ -101,6 +125,10 @@ substeps:
     outputs:
       - pattern: "04_images/preview_images/*.*"
       - pattern: "04_images/ai_generated/*.png"
+    run:
+      type: python
+      script: scripts/gen_matched_preview_v4.py
+      args: ["--ep", "{ep}"]
 
   - no: "15"
     key: "step15_inputs_list"
@@ -109,8 +137,10 @@ substeps:
     outputs:
       - pattern: "05_output/inputs.txt"
         nonempty: true
-      - pattern: "inputs.txt"
-        nonempty: true
+    run:
+      type: python
+      script: scripts/gen_matched_preview_v4.py
+      args: ["--ep", "{ep}"]
 
   - no: "16"
     key: "step16_render"
@@ -119,6 +149,10 @@ substeps:
     outputs:
       - pattern: "05_output/final_video.mp4"
         nonempty: true
+    run:
+      type: python
+      script: run_stage6_render.py
+      args: ["--ep", "{ep}"]
 
   - no: "17"
     key: "step17_youtube_meta"

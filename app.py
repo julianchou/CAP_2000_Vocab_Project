@@ -256,7 +256,6 @@ elif section == "⚙️ Pipeline Manager":
 
         # 對應關係 (依 profile)
         def get_mapping(profile_id: str):
-            # mode: auto -> 可執行(stage)，manual -> 僅人工，na -> 無對應/外部
             mapping = {
                 '1':  [3,4,5,6,7],
                 '1.5':[8],
@@ -333,6 +332,7 @@ elif section == "⚙️ Pipeline Manager":
                 else:
                     nonempty_ok = all(p.get('satisfied') for p in nonempty_patterns)
                 stage_for = sub2stage.get(ns)
+                run_spec = row.get('run') or {}
                 cols = st.columns([0.6, 2.2, 2.0, 1.2, 2.6])
                 with cols[0]:
                     st.markdown(f"**No.{ns}**")
@@ -353,10 +353,18 @@ elif section == "⚙️ Pipeline Manager":
                         if st.button("前往 Studio & Publisher", key=f"goto_pub_{ns}"):
                             st.session_state['nav_radio'] = "🎬 Studio & Publisher"
                             st.experimental_rerun()
-                    elif exec_mode.get(ns) == 'auto' and stage_for:
-                        if st.button(f"執行對應階段 (Stage {stage_for})", key=f"run_sub_{ns}"):
-                            st.session_state['__run_result__'] = runner.run_stage(info, stage_for)
-                            st.success(f"已執行 Stage {stage_for}，請稍後於日誌查看輸出。")
+                    elif run_spec.get('script'):
+                        step_def = {
+                            'name': row.get('name',''),
+                            'type': run_spec.get('type','python'),
+                            'script': run_spec.get('script'),
+                            'args': run_spec.get('args') or [],
+                        }
+                        show_cmd = f"{step_def['type']} {step_def['script']} {' '.join(step_def['args'])}"
+                        if st.button('執行子步驟', key=f"run_sub_{ns}"):
+                            res = runner.run_substep(info, ns, step_def)
+                            st.success(f"已執行子步驟 No.{ns}。log: {res['log']}")
+                        st.caption("將執行：" + show_cmd)
                     elif exec_mode.get(ns) == 'manual' and ns in ('7','13'):
                         done = has_manual_marker(info['path'], ns)
                         new_val = st.checkbox("標記完成", value=done, key=f"man_{ns}")
@@ -366,7 +374,7 @@ elif section == "⚙️ Pipeline Manager":
                     else:
                         st.caption("無對應自動化")
             st.divider()
-            st.caption("說明：\n- 手動步驟（7,13）可在此切換完成標記。\n- 其它子步驟按鈕會導向執行對應的階段腳本。\n- 第17步 (發布) 請到 Studio & Publisher。")
+            st.caption("說明：\n- 手動步驟（7,13）可在此切換完成標記。\n- 其它子步驟按鈕會直接執行對應的 Python 腳本。\n- 第17步 (發布) 請到 Studio & Publisher。")
 
         with st.expander("1–7 與 3–17 對應關係", expanded=False):
             map_rows = []
@@ -384,4 +392,5 @@ elif section == "💰 FinOps Monitor":
 elif section == "🎬 Studio & Publisher":
     st.header("影音預覽與發布中樞 (Studio & Publisher)")
     st.write("此區塊保留，未變更先前行為。")
+
 
