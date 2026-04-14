@@ -19,7 +19,8 @@ def load_stage_config(root: Path, path_override: Path | None = None) -> Dict:
     return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
 
-class StageRunner:\n    def __init__(self, root: Path, stages_path: Path | None = None, workspace_root: Path | None = None):
+class StageRunner:
+    def __init__(self, root: Path, stages_path: Path | None = None, workspace_root: Path | None = None):
         self.root = root
         self.cfg = load_stage_config(root, stages_path)
         self.workspace_root = (workspace_root or (root / "workspace")).resolve()
@@ -124,3 +125,4 @@ class StageRunner:\n    def __init__(self, root: Path, stages_path: Path | None 
         log_path = log_file_for_stage(ep_info["path"], f"sub{sub_no}")
         ok, msg = self._run_step(ep_info, f"sub{sub_no}", step, log_path)
         return {"ok": ok, "message": msg, "log": str(log_path)}
+
