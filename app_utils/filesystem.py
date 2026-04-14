@@ -97,7 +97,10 @@ def storyboard_csv_path(ep_path: Path) -> Path:
     return ep_path / "03_storyboards" / "storyboard.csv"
 
 
-def inputs_txt_path(ep_path: Path) -> Path:\n    p1 = ep_path / "05_output" / "inputs.txt"\n    return p1 if p1.exists() else (ep_path / "inputs.txt")
+def inputs_txt_path(ep_path: Path) -> Path:
+    p1 = ep_path / "05_output" / "inputs.txt"
+    return p1 if p1.exists() else (ep_path / "inputs.txt")
+
 
 
 def youtube_meta_paths(ep_path: Path) -> List[Path]:
@@ -121,7 +124,7 @@ def _file_nonempty(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
-def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
+ def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
     """Infer stage statuses from filesystem. Preserve prev error/running if not completed."""
     st = STATUS_DEFAULT.copy()
     # Stage 1: images exist
@@ -136,7 +139,7 @@ def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
     # Stage 3: fixed srt exists
     if subtitles_fixed_path(ep_path).exists():
         st["3"] = "done"
-    '# Stage 4: ai review / storyboard exists
+    # Stage 4: ai review / storyboard exists
     for marker in [ep_path / "03_storyboards" / "ai_review.json", ep_path / "03_storyboards" / "ai_review_done.txt"]:
         if marker.exists():
             st["4"] = "done"
@@ -145,9 +148,6 @@ def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
         st["4"] = "done"
     # Stage 5: inputs.txt exists (either 05_output/inputs.txt or root inputs.txt) and non-empty
     if _file_nonempty(inputs_txt_path(ep_path)):
-        st["5"] = "done"
-    # Stage 6: final video exists' inputs.txt exists and non-empty OR storyboard.csv exists
-    if _file_nonempty(inputs_txt_path(ep_path)) or storyboard_csv_path(ep_path).exists():
         st["5"] = "done"
     # Stage 6: final video exists
     if video_output_path(ep_path).exists():
@@ -164,7 +164,6 @@ def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
             if st.get(sid) != "done" and pv in ("error", "running"):
                 st[sid] = pv
     return st
-
 
 def manual_marker_path(ep_path: Path, step_no: str) -> Path:
     return ensure_logs_dir(ep_path) / MANUAL_MARKER_TEMPLATE.format(no=str(step_no))
@@ -184,4 +183,5 @@ def set_manual_marker(ep_path: Path, step_no: str, done: bool) -> None:
 
 def has_manual_marker(ep_path: Path, step_no: str) -> bool:
     return manual_marker_path(ep_path, step_no).exists()
+
 
