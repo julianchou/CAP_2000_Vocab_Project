@@ -272,8 +272,7 @@ elif section == "⚙️ Pipeline Manager":
             for sid, lst in mapping.items():
                 for n in lst:
                     sub2stage[str(n)] = sid
-            # 可執行的子步驟（有對應 stage 且不是純手動）
-            manual_only = {'7','11','13'}
+            manual_only = {'7','13'}
             for n in range(3,18):
                 ns = str(n)
                 if ns in manual_only:
@@ -284,6 +283,7 @@ elif section == "⚙️ Pipeline Manager":
                     exec_mode[ns] = 'na'
             return mapping, sub2stage, exec_mode
         stage2subs, sub2stage, exec_mode = get_mapping(st.session_state["profile_id"])
+        stage_names = {str(s.get('id')): s.get('name','') for s in (stage_cfg.get('stages') or [])}
 
         tab_stage, tab_sub = st.tabs(["階段控制 (1–7)", "子步驟 (3–17)"])
 
@@ -316,10 +316,9 @@ elif section == "⚙️ Pipeline Manager":
                             st.caption("尚無此階段的日誌。")
 
         with tab_sub:
+            st.caption("在此直接執行 3–16（第17發布請到 Studio & Publisher）。")
             dbg = evaluate_substeps_debug(info["path"], substeps_map)
             by_no = {str(r.get('no')): r for r in dbg}
-            cols = ["No","Name","Stage","Step OK","Nonempty OK","Run"]
-            data = []
             for n in range(3,18):
                 ns = str(n)
                 row = by_no.get(ns, {})
@@ -333,31 +332,50 @@ elif section == "⚙️ Pipeline Manager":
                     nonempty_ok = any(p.get('satisfied') for p in nonempty_patterns)
                 else:
                     nonempty_ok = all(p.get('satisfied') for p in nonempty_patterns)
-                stage_for = sub2stage.get(ns, '—')
-                step_ok = '🟢' if row.get('ok') else '⚪'
-                nonempty_ok_i = '✅' if nonempty_ok else ('❌' if nonempty_required else '')
-                # Run controls
-                if exec_mode.get(ns) == 'auto':
-                    if st.button(f"Run (→ Stage {stage_for})", key=f"run_sub_{ns}"):
-                        st.session_state['__run_result__'] = runner.run_stage(info, stage_for)
-                        st.success(f"已執行 Stage {stage_for}，請稍後查看日誌與狀態。")
-                    run_label = f"→ Stage {stage_for}"
-                elif exec_mode.get(ns) == 'manual':
-                    st.button("手動步驟", key=f"run_sub_{ns}", disabled=True)
-                    run_label = "手動"
-                else:
-                    st.button("無對應", key=f"run_sub_{ns}", disabled=True)
-                    run_label = "—"
-                data.append([ns, row.get('name', ''), stage_for, step_ok, nonempty_ok_i, run_label])
-            st.dataframe(pd.DataFrame(data, columns=cols), use_container_width=True)
+                stage_for = sub2stage.get(ns)
+                cols = st.columns([0.6, 2.2, 2.0, 1.2, 2.6])
+                with cols[0]:
+                    st.markdown(f"**No.{ns}**")
+                with cols[1]:
+                    st.write(row.get('name',''))
+                    if pats:
+                        st.caption("Patterns: " + ", ".join([p.get('pattern','') for p in pats]))
+                with cols[2]:
+                    if stage_for:
+                        st.write(f"Stage {stage_for} {stage_names.get(stage_for,'')}")
+                    else:
+                        st.write('—')
+                    st.caption("Step OK: " + ("🟢" if row.get('ok') else "⚪"))
+                with cols[3]:
+                    st.write("Nonempty OK: " + ("✅" if nonempty_ok else ("❌" if nonempty_required else "")))
+                with cols[4]:
+                    if ns == '17':
+                        if st.button("前往 Studio & Publisher", key=f"goto_pub_{ns}"):
+                            st.session_state['nav_radio'] = "🎬 Studio & Publisher"
+                            st.experimental_rerun()
+                    elif exec_mode.get(ns) == 'auto' and stage_for:
+                        if st.button(f"執行對應階段 (Stage {stage_for})", key=f"run_sub_{ns}"):
+                            st.session_state['__run_result__'] = runner.run_stage(info, stage_for)
+                            st.success(f"已執行 Stage {stage_for}，請稍後於日誌查看輸出。")
+                    elif exec_mode.get(ns) == 'manual' and ns in ('7','13'):
+                        done = has_manual_marker(info['path'], ns)
+                        new_val = st.checkbox("標記完成", value=done, key=f"man_{ns}")
+                        if st.button("更新標記", key=f"man_update_{ns}"):
+                            set_manual_marker(info['path'], ns, new_val)
+                            st.success("已更新手動標記。")
+                    else:
+                        st.caption("無對應自動化")
+            st.divider()
+            st.caption("說明：\n- 手動步驟（7,13）可在此切換完成標記。\n- 其它子步驟按鈕會導向執行對應的階段腳本。\n- 第17步 (發布) 請到 Studio & Publisher。")
 
         with st.expander("1–7 與 3–17 對應關係", expanded=False):
             map_rows = []
             for sid in STAGE_IDS:
                 subs = stage2subs.get(sid, [])
-                map_rows.append({"Stage": sid, "Substeps": ", ".join(str(x) for x in subs)})
-            st.table(pd.DataFrame(map_rows))
-# --- FinOps ---
+                chinese = stage_names.get(sid,'')
+                subs_text = ", ".join([f"{x} " + (by_no.get(str(x),{}).get('name','')) for x in subs])
+                map_rows.append({"Stage": f"{sid} {chinese}", "Substeps": subs_text})
+            st.table(pd.DataFrame(map_rows))# --- FinOps ---
 elif section == "💰 FinOps Monitor":
     st.header("成本與配額控管 (FinOps Monitor)")
     st.write("此區塊保留，未變更先前行為。")
@@ -366,3 +384,4 @@ elif section == "💰 FinOps Monitor":
 elif section == "🎬 Studio & Publisher":
     st.header("影音預覽與發布中樞 (Studio & Publisher)")
     st.write("此區塊保留，未變更先前行為。")
+
