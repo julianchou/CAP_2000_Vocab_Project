@@ -19,17 +19,14 @@ STATUS_DEFAULT = {
     "7": "pending",
 }
 
-
 def workspace_dir(root: Path, ws_override: str | None = None) -> Path:
     return root / (ws_override or "workspace")
-
 
 def list_episode_dirs(root: Path, ws_override: str | None = None) -> List[Path]:
     ws = workspace_dir(root, ws_override)
     if not ws.exists():
         return []
     return sorted([p for p in ws.iterdir() if p.is_dir() and EP_DIR_PATTERN.match(p.name)])
-
 
 def parse_episode_info(ep_path: Path) -> Dict:
     m = EP_DIR_PATTERN.match(ep_path.name)
@@ -42,10 +39,8 @@ def parse_episode_info(ep_path: Path) -> Dict:
         "path": ep_path,
     }
 
-
 def episode_status_path(ep_path: Path) -> Path:
     return ep_path / "status.json"
-
 
 def read_status(ep_path: Path) -> Dict:
     p = episode_status_path(ep_path)
@@ -56,59 +51,46 @@ def read_status(ep_path: Path) -> Dict:
             pass
     return {"stages": STATUS_DEFAULT.copy(), "updated_at": None}
 
-
 def write_status(ep_path: Path, data: Dict) -> None:
     data = dict(data)
     data["updated_at"] = datetime.now().isoformat(timespec="seconds")
     episode_status_path(ep_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def ensure_logs_dir(ep_path: Path) -> Path:
     p = ep_path / "00_logs"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-
 def log_file_for_stage(ep_path: Path, stage_id: str) -> Path:
     return ensure_logs_dir(ep_path) / f"stage_{stage_id.replace('.', '_')}.log"
-
 
 def video_output_path(ep_path: Path) -> Path:
     return ep_path / "05_output" / "final_video.mp4"
 
-
 def subtitles_raw_path(ep_path: Path) -> Path:
     return ep_path / "02_subtitles" / "notebooklm_audio.srt"
-
 
 def subtitles_fixed_path(ep_path: Path) -> Path:
     return ep_path / "02_subtitles" / "notebooklm_audio_fixed.srt"
 
-
 def audio_merged_path(ep_path: Path) -> Path:
     return ep_path / "01_audio" / "notebooklm_audio.m4a"
-
 
 def images_dir(ep_path: Path) -> Path:
     return ep_path / "04_images"
 
-
 def storyboard_csv_path(ep_path: Path) -> Path:
     return ep_path / "03_storyboards" / "storyboard.csv"
-
 
 def inputs_txt_path(ep_path: Path) -> Path:
     p1 = ep_path / "05_output" / "inputs.txt"
     return p1 if p1.exists() else (ep_path / "inputs.txt")
-
-
 
 def youtube_meta_paths(ep_path: Path) -> List[Path]:
     return [
         ep_path / "05_output" / "youtube_meta.json",
         ep_path / "youtube_meta.json",
     ]
-
 
 def _has_any_image(ep_path: Path) -> bool:
     p = images_dir(ep_path)
@@ -119,12 +101,10 @@ def _has_any_image(ep_path: Path) -> bool:
             return True
     return False
 
-
 def _file_nonempty(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
-
- def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
+def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
     """Infer stage statuses from filesystem. Preserve prev error/running if not completed."""
     st = STATUS_DEFAULT.copy()
     # Stage 1: images exist
@@ -168,7 +148,6 @@ def _file_nonempty(p: Path) -> bool:
 def manual_marker_path(ep_path: Path, step_no: str) -> Path:
     return ensure_logs_dir(ep_path) / MANUAL_MARKER_TEMPLATE.format(no=str(step_no))
 
-
 def set_manual_marker(ep_path: Path, step_no: str, done: bool) -> None:
     p = manual_marker_path(ep_path, step_no)
     if done:
@@ -180,8 +159,5 @@ def set_manual_marker(ep_path: Path, step_no: str, done: bool) -> None:
             except Exception:
                 pass
 
-
 def has_manual_marker(ep_path: Path, step_no: str) -> bool:
     return manual_marker_path(ep_path, step_no).exists()
-
-
