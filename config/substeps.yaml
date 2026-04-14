@@ -44,6 +44,7 @@ substeps:
     outputs:
       - pattern: "00_logs/step07_manual_done.txt"
 
+      - pattern: "00_logs/step7_manual_done.txt"
   - no: "8"
     key: "step08_audio_download"
     name: "下載並儲存語音"
