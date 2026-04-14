@@ -1,0 +1,14 @@
+﻿# Cost model (editable). Numbers are placeholders for planning only.
+unit_costs:
+  imagen_per_image_usd: 0.050
+  gemini_per_card_usd: 0.001
+  whisper_per_min_usd: 0.006
+  tts_per_min_usd: 0.015
+  youtube_upload_quota_unit: 1600  # placeholder units
+assumptions:
+  words_per_episode: 30
+  images_per_word: 1
+  avg_audio_minutes_per_episode: 8
+thresholds:
+  budget_usd_max_per_batch: 50
+  youtube_daily_quota_max_units: 10000

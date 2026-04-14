@@ -74,7 +74,7 @@ PATH_STAGES = profile.get("stages")
 PATH_SUBSTEPS = profile.get("substeps")
 PATH_COSTS = profile.get("costs")
 stage_cfg = load_stage_config(ROOT, PATH_STAGES)
-runner = StageRunner(ROOT, PATH_STAGES)
+runner = StageRunner(ROOT, PATH_STAGES, (ROOT / WS_ROOT))
 cost_model = load_cost_model(ROOT, PATH_COSTS)
 substeps_map = load_substeps_config(ROOT, PATH_SUBSTEPS)
 
@@ -245,3 +245,4 @@ if section == "📊 Dashboard":
                 st.caption("找不到可檢核的集數。")
 
 import os
+

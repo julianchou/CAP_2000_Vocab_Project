@@ -1,0 +1,13 @@
+﻿profiles:
+  - id: vocab
+    name: 2000單字模式
+    workspace: workspaces/vocab
+    stages: config/vocab/stages.yaml
+    substeps: config/vocab/substeps.yaml
+    costs: config/vocab/costs.yaml
+  - id: grammar
+    name: 文法模式
+    workspace: workspaces/grammar
+    stages: config/grammar/stages.yaml
+    substeps: config/grammar/substeps.yaml
+    costs: config/grammar/costs.yaml
