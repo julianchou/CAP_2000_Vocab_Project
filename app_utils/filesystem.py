@@ -97,8 +97,7 @@ def storyboard_csv_path(ep_path: Path) -> Path:
     return ep_path / "03_storyboards" / "storyboard.csv"
 
 
-def inputs_txt_path(ep_path: Path) -> Path:
-    return ep_path / "inputs.txt"
+def inputs_txt_path(ep_path: Path) -> Path:\n    p1 = ep_path / "05_output" / "inputs.txt"\n    return p1 if p1.exists() else (ep_path / "inputs.txt")
 
 
 def youtube_meta_paths(ep_path: Path) -> List[Path]:
@@ -137,12 +136,17 @@ def infer_stage_statuses(ep_path: Path, prev: Optional[Dict] = None) -> Dict:
     # Stage 3: fixed srt exists
     if subtitles_fixed_path(ep_path).exists():
         st["3"] = "done"
-    # Stage 4: ai review marker (heuristic)
+    '# Stage 4: ai review / storyboard exists
     for marker in [ep_path / "03_storyboards" / "ai_review.json", ep_path / "03_storyboards" / "ai_review_done.txt"]:
         if marker.exists():
             st["4"] = "done"
             break
-    # Stage 5: inputs.txt exists and non-empty OR storyboard.csv exists
+    if st.get("4") != "done" and storyboard_csv_path(ep_path).exists():
+        st["4"] = "done"
+    # Stage 5: inputs.txt exists (either 05_output/inputs.txt or root inputs.txt) and non-empty
+    if _file_nonempty(inputs_txt_path(ep_path)):
+        st["5"] = "done"
+    # Stage 6: final video exists' inputs.txt exists and non-empty OR storyboard.csv exists
     if _file_nonempty(inputs_txt_path(ep_path)) or storyboard_csv_path(ep_path).exists():
         st["5"] = "done"
     # Stage 6: final video exists
@@ -180,3 +184,4 @@ def set_manual_marker(ep_path: Path, step_no: str, done: bool) -> None:
 
 def has_manual_marker(ep_path: Path, step_no: str) -> bool:
     return manual_marker_path(ep_path, step_no).exists()
+
