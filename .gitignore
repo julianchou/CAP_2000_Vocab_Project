@@ -1,0 +1,36 @@
+﻿# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Envs
+.venv/
+venv/
+env/
+
+# Local config & secrets
+.env
+client_secret*.json
+*token*.pickle
+.token*
+.streamlit/
+
+# Workspace outputs (episodes)
+workspace/
+app_assets/substeps_snapshot_*.json
+upload_schedule.csv
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Media artifacts
+*.mp4
+*.m4a
+*.wav
+*.webm
+
+# Logs
+**/00_logs/

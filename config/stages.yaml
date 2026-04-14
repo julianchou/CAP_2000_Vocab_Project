@@ -1,0 +1,80 @@
+﻿# Pipeline stages configuration for CAP 2000 AI Video CMS
+# Commands are best-effort; missing scripts will be reported without crashing.
+stages:
+  - id: "1"
+    key: "stage1_assets"
+    name: "素材準備"
+    steps:
+      - name: "產生單字卡圖片"
+        type: python
+        script: scripts/generate_flashcards.py
+        args: ["--ep", "{ep}"]
+        skip_if_dir_has_files: "04_images"
+      - name: "產生封面圖"
+        type: python
+        script: scripts/generate_cover.py
+        args: ["--ep", "{ep}", "--start", "{start}", "--end", "{end}"]
+        optional: true
+  - id: "1.5"
+    key: "stage1_5_audio"
+    name: "音訊處理 (合併片頭)"
+    steps:
+      - name: "合併片頭音訊"
+        type: python
+        script: scripts/merge_intro_audio.py
+        args: ["--ep", "{ep}"]
+        optional: true
+  - id: "2"
+    key: "stage2_subtitles_asr"
+    name: "字幕生成 (Whisper)"
+    steps:
+      - name: "Whisper 產生字幕"
+        type: python
+        script: scripts/generate_subtitles_only.py
+        args: ["--ep", "{ep}"]
+  - id: "3"
+    key: "stage3_subtitles_llm"
+    name: "字幕校對 (LLM)"
+    steps:
+      - name: "AI 字幕校對"
+        type: python
+        script: scripts/llm_subtitle_reviewer.py
+        args: ["--ep", "{ep}"]
+  - id: "4"
+    key: "stage4_ai_review"
+    name: "AI Review"
+    steps:
+      - name: "AI 審查流程"
+        type: python
+        script: run_stage4_ai_review.py
+        args: ["--ep", "{ep}"]
+        optional: true
+  - id: "5"
+    key: "stage5_storyboard"
+    name: "分鏡匹配"
+    steps:
+      - name: "生成分鏡與預覽圖"
+        type: python
+        script: scripts/gen_matched_preview_v4.py
+        args: ["--ep", "{ep}"]
+  - id: "6"
+    key: "stage6_render"
+    name: "影片渲染"
+    steps:
+      - name: "FFmpeg 渲染"
+        type: python
+        script: run_stage6_render.py
+        args: ["--ep", "{ep}"]
+  - id: "7"
+    key: "stage7_publish"
+    name: "發布總管"
+    steps:
+      - name: "產生 YouTube Metadata"
+        type: python
+        script: scripts/generate_youtube_meta.py
+        args: ["--ep", "{ep}"]
+      - name: "上傳 YouTube"
+        type: python
+        script: scripts/upload_to_youtube.py
+        args: ["--ep", "{ep}"]
+        optional: true

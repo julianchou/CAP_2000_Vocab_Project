@@ -1,0 +1,128 @@
+﻿# Sub-steps mapping derived from Google Sheet (NotebookLM 工作流, No 3–17)
+# Output patterns are relative to each episode folder: workspace/EpXX_YYYY_ZZZZ/
+# rule:any -> any one output exists is done; rule:all -> all outputs must exist.
+# nonempty:true means file must be non-zero; for folders/globs it means at least one match.
+substeps:
+  - no: "3"
+    key: "step03_vocab_content"
+    name: "產生單字卡內容"
+    rule: any
+    outputs:
+      - pattern: "03_storyboards/vocab_data.csv"
+        nonempty: true
+      - pattern: "03_storyboards/vocab_data.json"
+        nonempty: true
+
+  - no: "4"
+    key: "step04_flashcards"
+    name: "產生單字卡圖片"
+    rule: any
+    outputs:
+      - pattern: "04_images/flashcards/*.*"
+      - pattern: "04_images/*.png"
+
+  - no: "5"
+    key: "step05_cover"
+    name: "產生封面圖"
+    rule: any
+    outputs:
+      - pattern: "04_images/cover.png"
+        nonempty: true
+
+  - no: "6"
+    key: "step06_prompt"
+    name: "產生語音摘要 Prompt"
+    rule: any
+    outputs:
+      - pattern: "notebooklm_prompt_ep*.txt"
+        nonempty: true
+
+  - no: "7"
+    key: "step07_tts_generate"
+    name: "產生雙人對話語音（NotebookLM 手動）"
+    rule: any
+    outputs:
+      - pattern: "00_logs/step07_manual_done.txt"
+
+  - no: "8"
+    key: "step08_audio_download"
+    name: "下載並儲存語音"
+    rule: any
+    outputs:
+      - pattern: "01_audio/notebooklm_audio.m4a"
+        nonempty: true
+
+  - no: "9"
+    key: "step09_subtitles_raw"
+    name: "Whisper 產生字幕"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio.srt"
+        nonempty: true
+
+  - no: "10"
+    key: "step10_subtitles_fix"
+    name: "AI 字幕校對"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
+        nonempty: true
+
+  - no: "11"
+    key: "step11_subtitles_manual"
+    name: "人工字幕校正"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
+        nonempty: true
+
+  - no: "12"
+    key: "step12_storyboard_ai"
+    name: "AI 依語境分鏡規劃"
+    rule: any
+    outputs:
+      - pattern: "03_storyboards/storyboard.csv"
+        nonempty: true
+
+  - no: "13"
+    key: "step13_storyboard_manual"
+    name: "修改分鏡/替換單字卡（人工）"
+    rule: all
+    outputs:
+      - pattern: "03_storyboards/storyboard.csv"
+        nonempty: true
+      - pattern: "00_logs/step13_manual_done.txt"
+
+  - no: "14"
+    key: "step14_preview_images"
+    name: "AI 產生分鏡圖片"
+    rule: any
+    outputs:
+      - pattern: "04_images/preview_images/*.*"
+      - pattern: "04_images/ai_generated/*.png"
+
+  - no: "15"
+    key: "step15_inputs_list"
+    name: "產生合成清單"
+    rule: any
+    outputs:
+      - pattern: "05_output/inputs.txt"
+        nonempty: true
+      - pattern: "inputs.txt"
+        nonempty: true
+
+  - no: "16"
+    key: "step16_render"
+    name: "FFmpeg 影片合成"
+    rule: any
+    outputs:
+      - pattern: "05_output/final_video.mp4"
+        nonempty: true
+
+  - no: "17"
+    key: "step17_youtube_meta"
+    name: "產生Youtube metadata"
+    rule: any
+    outputs:
+      - pattern: "05_output/youtube_meta.json"
+        nonempty: true

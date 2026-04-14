@@ -1,0 +1,21 @@
+# --- AI 與 API 串接 ---
+google-genai                 # Google 最新版 Gemini SDK (支援 2.0 Flash)
+openai                       # 用於 Whisper 字幕產生 (或 OpenAI API)
+python-dotenv                # 用於讀取 .env 檔案中的環境變數
+
+# --- Google Drive & YouTube API (Stage 7 發布流程) ---
+google-api-python-client     # Google API 核心客戶端
+google-auth-httplib2         # Google 授權輔助套件
+google-auth-oauthlib         # Google OAuth 2.0 登入驗證套件
+
+# --- 資料處理與素材處理 ---
+pandas                       # 用於處理 CSV 與單字清單
+openpyxl                     # 讓 pandas 支援讀寫 Excel 檔案
+Pillow                       # 用於圖片與圖卡處理 (PIL)
+requests                     # 用於呼叫 API 與下載網路檔案
+
+# --- 網頁控制台介面 (SaaS 化) ---
+streamlit                    # 用於打造互動式 Web 儀表板與影片預覽
+
+# --- 系統工具 ---
+tqdm                         # 顯示終端機進度條streamlit>=1.33\npandas\nPyYAML\npython-dotenv\n
