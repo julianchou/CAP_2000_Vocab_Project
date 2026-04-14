@@ -8,17 +8,17 @@ import yaml
 from .filesystem import read_status, write_status, log_file_for_stage
 
 
-def load_stage_config(root: Path) -> Dict:
-    cfg_path = root / "config" / "stages.yaml"
+def load_stage_config(root: Path, path_override: Path | None = None) -> Dict:
+    cfg_path = (root / path_override) if (path_override and not Path(path_override).is_absolute()) else (path_override or (root / "config" / "stages.yaml"))
     if not cfg_path.exists():
         return {"stages": []}
     return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
 
 class StageRunner:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, stages_path: Path | None = None):
         self.root = root
-        self.cfg = load_stage_config(root)
+        self.cfg = load_stage_config(root, stages_path)
 
     def _format_args(self, args: List[str], ep_info: Dict) -> List[str]:
         out = []

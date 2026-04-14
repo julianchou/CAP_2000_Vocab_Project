@@ -20,12 +20,12 @@ STATUS_DEFAULT = {
 }
 
 
-def workspace_dir(root: Path) -> Path:
-    return root / "workspace"
+def workspace_dir(root: Path, ws_override: str | None = None) -> Path:
+    return root / (ws_override or "workspace")
 
 
-def list_episode_dirs(root: Path) -> List[Path]:
-    ws = workspace_dir(root)
+def list_episode_dirs(root: Path, ws_override: str | None = None) -> List[Path]:
+    ws = workspace_dir(root, ws_override)
     if not ws.exists():
         return []
     return sorted([p for p in ws.iterdir() if p.is_dir() and EP_DIR_PATTERN.match(p.name)])

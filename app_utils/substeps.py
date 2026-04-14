@@ -19,8 +19,8 @@ class SubStep:
     outputs: List[OutputSpec]
 
 
-def load_substeps_config(root: Path) -> List[SubStep]:
-    cfg = root / "config" / "substeps.yaml"
+def load_substeps_config(root: Path, path_override: Path | None = None) -> List[SubStep]:
+    cfg = (root / path_override) if (path_override and not Path(path_override).is_absolute()) else (path_override or (root / "config" / "substeps.yaml"))
     items: List[SubStep] = []
     if cfg.exists():
         raw = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}

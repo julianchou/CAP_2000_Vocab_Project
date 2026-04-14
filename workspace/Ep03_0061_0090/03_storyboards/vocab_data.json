@@ -1,0 +1,212 @@
+[
+  {
+    "Word": "angle",
+    "POS": "n. 名詞",
+    "Meaning": "角度",
+    "English_Sentence": "The corner forms a right angle.",
+    "Chinese_Translation": "這個角落形成一個直角。"
+  },
+  {
+    "Word": "angry",
+    "POS": "adj. 形容詞",
+    "Meaning": "生氣的",
+    "English_Sentence": "She was angry about the delay.",
+    "Chinese_Translation": "她對延誤感到生氣。"
+  },
+  {
+    "Word": "animal",
+    "POS": "n. 名詞",
+    "Meaning": "動物",
+    "English_Sentence": "A dog is a loyal animal.",
+    "Chinese_Translation": "狗是一種忠實的動物。"
+  },
+  {
+    "Word": "ankle",
+    "POS": "n. 名詞",
+    "Meaning": "腳踝",
+    "English_Sentence": "He twisted his ankle playing basketball.",
+    "Chinese_Translation": "他打籃球時扭傷了腳踝。"
+  },
+  {
+    "Word": "another",
+    "POS": "adj. 形容詞",
+    "Meaning": "另一個",
+    "English_Sentence": "Can I have another piece of cake?",
+    "Chinese_Translation": "我可以再吃一塊蛋糕嗎？"
+  },
+  {
+    "Word": "answer",
+    "POS": "v. 動詞",
+    "Meaning": "回答",
+    "English_Sentence": "Please answer my question clearly.",
+    "Chinese_Translation": "請清楚回答我的問題。"
+  },
+  {
+    "Word": "ant",
+    "POS": "n. 名詞",
+    "Meaning": "螞蟻",
+    "English_Sentence": "An ant is a tiny insect.",
+    "Chinese_Translation": "螞蟻是一種微小的昆蟲。"
+  },
+  {
+    "Word": "any",
+    "POS": "adj. 形容詞",
+    "Meaning": "任何的",
+    "English_Sentence": "Do you have any questions?",
+    "Chinese_Translation": "你有任何問題嗎？"
+  },
+  {
+    "Word": "any",
+    "POS": "adj. 形容詞",
+    "Meaning": "任何（的）",
+    "English_Sentence": "We don't have any milk left.",
+    "Chinese_Translation": "我們沒有剩下任何牛奶了。"
+  },
+  {
+    "Word": "anyone",
+    "POS": "pron. 代名詞",
+    "Meaning": "任何人",
+    "English_Sentence": "Does anyone know the answer?",
+    "Chinese_Translation": "有任何人知道答案嗎？"
+  },
+  {
+    "Word": "anything",
+    "POS": "pron. 代名詞",
+    "Meaning": "任何事物",
+    "English_Sentence": "Do you need anything from the store?",
+    "Chinese_Translation": "你需要從商店買任何東西嗎？"
+  },
+  {
+    "Word": "anywhere",
+    "POS": "adv. 副詞",
+    "Meaning": "任何地方",
+    "English_Sentence": "We can meet anywhere you like.",
+    "Chinese_Translation": "我們可以在你喜歡的任何地方見面。"
+  },
+  {
+    "Word": "apartment",
+    "POS": "n. 名詞",
+    "Meaning": "公寓",
+    "English_Sentence": "My apartment is small but cozy.",
+    "Chinese_Translation": "我的公寓雖小但很舒適。"
+  },
+  {
+    "Word": "apologize",
+    "POS": "v. 動詞",
+    "Meaning": "道歉",
+    "English_Sentence": "You should apologize for your mistake.",
+    "Chinese_Translation": "你應該為你的錯誤道歉。"
+  },
+  {
+    "Word": "appear",
+    "POS": "v. 動詞",
+    "Meaning": "出現；看起來",
+    "English_Sentence": "He appears happy today.",
+    "Chinese_Translation": "他今天看起來很開心。"
+  },
+  {
+    "Word": "apple",
+    "POS": "n. 名詞",
+    "Meaning": "蘋果",
+    "English_Sentence": "An apple a day keeps the doctor away.",
+    "Chinese_Translation": "一天一蘋果，醫生遠離我。"
+  },
+  {
+    "Word": "appreciate",
+    "POS": "v. 動詞",
+    "Meaning": "欣賞；感激",
+    "English_Sentence": "I really appreciate your help.",
+    "Chinese_Translation": "我真的很感謝你的幫助。"
+  },
+  {
+    "Word": "April",
+    "POS": "n. 名詞",
+    "Meaning": "四月",
+    "English_Sentence": "April is my favorite month.",
+    "Chinese_Translation": "四月是我最喜歡的月份。"
+  },
+  {
+    "Word": "area",
+    "POS": "n. 名詞",
+    "Meaning": "區域；範圍",
+    "English_Sentence": "This area is quiet and safe.",
+    "Chinese_Translation": "這個區域安靜又安全。"
+  },
+  {
+    "Word": "argue",
+    "POS": "v. 動詞",
+    "Meaning": "爭論；辯論",
+    "English_Sentence": "Don't argue with me about this.",
+    "Chinese_Translation": "不要為了這件事跟我爭論。"
+  },
+  {
+    "Word": "arm",
+    "POS": "n. 名詞",
+    "Meaning": "手臂",
+    "English_Sentence": "My arm hurts after lifting weights.",
+    "Chinese_Translation": "舉重後我的手臂很痛。"
+  },
+  {
+    "Word": "armchair",
+    "POS": "n. 名詞",
+    "Meaning": "扶手椅",
+    "English_Sentence": "He enjoys reading in his comfortable armchair.",
+    "Chinese_Translation": "他喜歡坐在舒適的扶手椅上看書。"
+  },
+  {
+    "Word": "army",
+    "POS": "n. 名詞",
+    "Meaning": "軍隊",
+    "English_Sentence": "The army protects the country from invaders.",
+    "Chinese_Translation": "軍隊保護國家免受入侵者。"
+  },
+  {
+    "Word": "arrange",
+    "POS": "v. 動詞",
+    "Meaning": "安排",
+    "English_Sentence": "Can you arrange a meeting for next week?",
+    "Chinese_Translation": "你能安排下週的會議嗎？"
+  },
+  {
+    "Word": "arrive",
+    "POS": "v. 動詞",
+    "Meaning": "到達",
+    "English_Sentence": "We will arrive at the airport by noon.",
+    "Chinese_Translation": "我們中午前會抵達機場。"
+  },
+  {
+    "Word": "art",
+    "POS": "n. 名詞",
+    "Meaning": "藝術",
+    "English_Sentence": "Modern art can be very thought-provoking.",
+    "Chinese_Translation": "現代藝術可以非常引人深思。"
+  },
+  {
+    "Word": "artist",
+    "POS": "n. 名詞",
+    "Meaning": "藝術家",
+    "English_Sentence": "She is a talented artist who paints beautiful landscapes.",
+    "Chinese_Translation": "她是一位才華洋溢的藝術家，畫著美麗的風景。"
+  },
+  {
+    "Word": "Asian",
+    "POS": "adj. 形容詞",
+    "Meaning": "亞洲的",
+    "English_Sentence": "Many Asian countries have rich cultural histories.",
+    "Chinese_Translation": "許多亞洲國家擁有豐富的文化歷史。"
+  },
+  {
+    "Word": "ask",
+    "POS": "v. 動詞",
+    "Meaning": "問",
+    "English_Sentence": "Don't be afraid to ask for help.",
+    "Chinese_Translation": "別害怕尋求幫助。"
+  },
+  {
+    "Word": "asleep",
+    "POS": "adj. 形容詞",
+    "Meaning": "睡著的",
+    "English_Sentence": "The baby fell asleep in his mother's arms.",
+    "Chinese_Translation": "寶寶在媽媽懷裡睡著了。"
+  }
+]

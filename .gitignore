@@ -16,7 +16,7 @@ client_secret*.json
 .streamlit/
 
 # Workspace outputs (episodes)
-workspace/
+workspaces/
 app_assets/substeps_snapshot_*.json
 upload_schedule.csv
 

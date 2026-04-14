@@ -3,8 +3,8 @@ from typing import Dict
 import yaml
 
 
-def load_cost_model(root: Path) -> Dict:
-    p = root / "config" / "costs.yaml"
+def load_cost_model(root: Path, path_override: Path | None = None) -> Dict:
+    p = (root / path_override) if (path_override and not Path(path_override).is_absolute()) else (path_override or (root / "config" / "costs.yaml"))
     if not p.exists():
         return {
             "unit_costs": {

@@ -21,6 +21,7 @@ from app_utils.filesystem import (
     has_manual_marker,
 )
 from app_utils.pipeline import StageRunner, load_stage_config
+import yaml
 from app_utils.finops import load_cost_model, estimate_batch_cost, gating
 from app_utils.ui_helpers import with_emoji
 from app_utils.substeps import (
@@ -30,6 +31,19 @@ from app_utils.substeps import (
 )
 
 ROOT = Path(__file__).resolve().parent
+
+
+PROFILES_CFG = ROOT / "config" / "profiles.yaml"
+
+def load_profiles():
+    if PROFILES_CFG.exists():
+        data = yaml.safe_load(PROFILES_CFG.read_text(encoding="utf-8")) or {}
+        return data.get("profiles", [])
+    return []
+
+def get_profile_map():
+    profs = load_profiles()
+    return {p.get("id"): p for p in profs}
 
 st.set_page_config(page_title="CAP 2000 AI Video CMS", layout="wide")
 
@@ -42,17 +56,34 @@ section = st.sidebar.radio("功能模組", [
 ])
 
 # Common data
-stage_cfg = load_stage_config(ROOT)
-runner = StageRunner(ROOT)
-cost_model = load_cost_model(ROOT)
-substeps_map = load_substeps_config(ROOT)
+# Common data (profile-aware)
+profiles = get_profile_map()
+# Sidebar profile switch
+profile_ids = list(profiles.keys()) or ["vocab"]
+if "profile_id" not in st.session_state:
+    st.session_state["profile_id"] = profile_ids[0]
+choices = [profiles.get(pid, {"name": pid}).get("name", pid) + f" ({pid})" for pid in profile_ids]
+idx_default = profile_ids.index(st.session_state["profile_id"]) if st.session_state["profile_id"] in profile_ids else 0
+selected = st.sidebar.selectbox("專案環境", choices, index=idx_default)
+pid = selected.split("(")[-1].rstrip(")")
+if pid in profiles and pid != st.session_state["profile_id"]:
+    st.session_state["profile_id"] = pid
+profile = profiles.get(st.session_state["profile_id"], {})
+WS_ROOT = profile.get("workspace", "workspace")
+PATH_STAGES = profile.get("stages")
+PATH_SUBSTEPS = profile.get("substeps")
+PATH_COSTS = profile.get("costs")
+stage_cfg = load_stage_config(ROOT, PATH_STAGES)
+runner = StageRunner(ROOT, PATH_STAGES)
+cost_model = load_cost_model(ROOT, PATH_COSTS)
+substeps_map = load_substeps_config(ROOT, PATH_SUBSTEPS)
 
 
 # --- helpers ---
 
 def scan_episodes():
     eps = []
-    for p in list_episode_dirs(ROOT):
+    for p in list_episode_dirs(ROOT, WS_ROOT):
         info = parse_episode_info(p)
         raw_prev = read_status(p)
         computed = infer_stage_statuses(p, prev=raw_prev)
