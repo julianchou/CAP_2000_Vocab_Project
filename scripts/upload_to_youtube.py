@@ -115,9 +115,17 @@ def upload_episode(youtube, ep_num, privacy_status="private", publish_at=None, p
 
     output_dir = target_folder / "05_output"
     video_path = output_dir / "final_video.mp4"
-    meta_path = output_dir / "youtube_meta.json"
+    meta_candidates = [
+        output_dir / "youtube_meta.json",
+        target_folder / "youtube_meta.json",
+    ]
     cover_path = target_folder / "04_images" / "cover.png"
-    srt_path = output_dir / "notebooklm_audio_fixed.srt"
+    srt_candidates = [
+        output_dir / "notebooklm_audio_fixed.srt",
+        target_folder / "02_subtitles" / "notebooklm_audio_fixed.srt",
+    ]
+    meta_path = next((p for p in meta_candidates if p.exists()), meta_candidates[0])
+    srt_path = next((p for p in srt_candidates if p.exists()), srt_candidates[0])
 
     if not video_path.exists() or not meta_path.exists():
         print(f"❌ 缺少影片或 Meta 檔，跳過。")

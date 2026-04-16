@@ -92,10 +92,11 @@
   - no: "11"
     key: "step11_subtitles_manual"
     name: "人工字幕校正"
-    rule: any
+    rule: all
     outputs:
       - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
         nonempty: true
+      - pattern: "00_logs/step11_manual_done.txt"
 
   - no: "12"
     key: "step12_storyboard_ai"
