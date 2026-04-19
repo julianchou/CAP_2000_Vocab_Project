@@ -1,8 +1,8 @@
-﻿substeps:
+substeps:
   - no: "3"
     key: "step03_vocab_content"
     name: "產生單字卡內容"
-    rule: any
+    rule: all
     outputs:
       - pattern: "03_storyboards/vocab_data.csv"
         nonempty: true
@@ -11,7 +11,7 @@
     run:
       type: python
       script: scripts/generate_vocab_content.py
-      args: ["--start", "{ep}"]
+      args: ["--ep", "{ep}"]
 
   - no: "4"
     key: "step04_flashcards"
@@ -19,14 +19,39 @@
     rule: any
     outputs:
       - pattern: "04_images/flashcards/*.*"
-      - pattern: "04_images/*.png"
     run:
       type: python
       script: scripts/generate_flashcards.py
       args: ["--ep", "{ep}"]
 
   - no: "5"
-    key: "step05_cover"
+    key: "step05_cloze_questions"
+    name: "產生克漏字題目檔"
+    rule: all
+    outputs:
+      - pattern: "03_storyboards/cloze_questions.csv"
+        nonempty: true
+      - pattern: "03_storyboards/cloze_questions.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/generate_cloze_quiz.py
+      args: ["--ep", "{ep}"]
+
+  - no: "6"
+    key: "step06_cloze_flashcards"
+    name: "產生克漏字題目卡/答案卡"
+    rule: all
+    outputs:
+      - pattern: "04_images/cloze_cards/questions/*.png"
+      - pattern: "04_images/cloze_cards/answers/*.png"
+    run:
+      type: python
+      script: scripts/generate_cloze_flashcards.py
+      args: ["--ep", "{ep}"]
+
+  - no: "7"
+    key: "step07_cover"
     name: "產品影片封面圖"
     rule: any
     outputs:
@@ -37,8 +62,8 @@
       script: scripts/generate_cover.py
       args: ["--ep", "{ep}", "--start_idx", "{start}", "--end_idx", "{end}"]
 
-  - no: "6"
-    key: "step06_prompt"
+  - no: "8"
+    key: "step08_prompt"
     name: "產生語音摘要 Prompt"
     rule: any
     outputs:
@@ -49,24 +74,38 @@
       script: scripts/generate_notebooklm_prompt.py
       args: ["--ep", "{ep}"]
 
-  - no: "7"
-    key: "step07_tts_generate"
+  - no: "9"
+    key: "step09_tts_generate"
     name: "產生雙人對話語音（NotebookLM 手動）"
     rule: any
     outputs:
-      - pattern: "00_logs/step07_manual_done.txt"
-      - pattern: "00_logs/step7_manual_done.txt"
+      - pattern: "00_logs/step09_manual_done.txt"
+      - pattern: "00_logs/step9_manual_done.txt"
 
-  - no: "8"
-    key: "step08_audio_download"
+  - no: "10"
+    key: "step10_audio_download"
     name: "下載並儲存語音"
     rule: any
     outputs:
       - pattern: "01_audio/notebooklm_audio.m4a"
         nonempty: true
 
-  - no: "9"
-    key: "step09_subtitles_raw"
+  - no: "10.5"
+    key: "step10_5_merge_intro"
+    name: "合併片頭音訊"
+    rule: all
+    outputs:
+      - pattern: "01_audio/notebooklm_audio.m4a"
+        nonempty: true
+      - pattern: "00_logs/step10_5_intro_merged.txt"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/merge_intro_audio.py
+      args: ["--ep", "{ep}"]
+
+  - no: "11"
+    key: "step11_subtitles_raw"
     name: "Whisper 產生字幕"
     rule: any
     outputs:
@@ -77,8 +116,8 @@
       script: scripts/generate_subtitles_only.py
       args: ["--ep", "{ep}"]
 
-  - no: "10"
-    key: "step10_subtitles_fix"
+  - no: "12"
+    key: "step12_subtitles_fix"
     name: "AI 字幕校對"
     rule: any
     outputs:
@@ -89,17 +128,17 @@
       script: scripts/llm_subtitle_reviewer.py
       args: ["--ep", "{ep}"]
 
-  - no: "11"
-    key: "step11_subtitles_manual"
+  - no: "13"
+    key: "step13_subtitles_manual"
     name: "人工字幕校正"
     rule: all
     outputs:
       - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
         nonempty: true
-      - pattern: "00_logs/step11_manual_done.txt"
+      - pattern: "00_logs/step13_manual_done.txt"
 
-  - no: "12"
-    key: "step12_storyboard_ai"
+  - no: "14"
+    key: "step14_storyboard_ai"
     name: "AI 依語境分鏡規劃"
     rule: any
     outputs:
@@ -110,17 +149,17 @@
       script: scripts/llm_director.py
       args: ["--ep", "{ep}"]
 
-  - no: "13"
-    key: "step13_storyboard_manual"
+  - no: "15"
+    key: "step15_storyboard_manual"
     name: "修改分鏡/替換單字卡（人工）"
     rule: all
     outputs:
       - pattern: "03_storyboards/storyboard.csv"
         nonempty: true
-      - pattern: "00_logs/step13_manual_done.txt"
+      - pattern: "00_logs/step15_manual_done.txt"
 
-  - no: "14"
-    key: "step14_preview_images"
+  - no: "16"
+    key: "step16_preview_images"
     name: "AI 產生分鏡圖片"
     rule: any
     outputs:
@@ -131,8 +170,8 @@
       script: scripts/gen_matched_preview_v4.py
       args: ["--ep", "{ep}"]
 
-  - no: "15"
-    key: "step15_inputs_list"
+  - no: "17"
+    key: "step17_inputs_list"
     name: "產生合成清單"
     rule: any
     outputs:
@@ -143,8 +182,8 @@
       script: scripts/gen_matched_preview_v4.py
       args: ["--ep", "{ep}"]
 
-  - no: "16"
-    key: "step16_render"
+  - no: "18"
+    key: "step18_render"
     name: "FFmpeg 影片合成"
     rule: any
     outputs:
@@ -155,8 +194,8 @@
       script: run_stage6_render.py
       args: ["--ep", "{ep}"]
 
-  - no: "17"
-    key: "step17_youtube_meta"
+  - no: "19"
+    key: "step19_youtube_meta"
     name: "產生Youtube metadata"
     rule: any
     outputs:

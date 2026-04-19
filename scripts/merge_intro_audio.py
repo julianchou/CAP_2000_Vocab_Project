@@ -22,6 +22,7 @@ def merge_audio_for_episode(ep_num, base_dir):
     # 組合主音檔路徑
     main_audio_path = target_folder / "01_audio" / "notebooklm_audio.m4a"
     temp_output_path = target_folder / "01_audio" / "temp_notebooklm_audio.m4a"
+    marker_path = target_folder / "00_logs" / "step10_5_intro_merged.txt"
 
     # 檢查檔案是否存在
     if not intro_path.exists():
@@ -53,6 +54,8 @@ def merge_audio_for_episode(ep_num, base_dir):
         
         # 如果成功，用暫存檔覆蓋原始的 m4a
         temp_output_path.replace(main_audio_path)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("intro merged\n", encoding="utf-8")
         print(f"✅ 第 {ep_num:02d} 集音檔合併成功！已覆寫: {main_audio_path.name}")
 
     except subprocess.CalledProcessError:

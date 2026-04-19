@@ -15,6 +15,20 @@ client = genai.Client()
 base_dir = Path(__file__).parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
+def next_variant_path(base_path: Path) -> Path:
+    stem = base_path.stem
+    suffix = base_path.suffix
+    variants = sorted(base_path.parent.glob(f"{stem}__v*{suffix}"))
+    if not variants:
+        return base_path.parent / f"{stem}__v02{suffix}"
+    last = variants[-1]
+    marker = last.stem.split("__v")[-1]
+    try:
+        next_no = int(marker) + 1
+    except Exception:
+        next_no = len(variants) + 2
+    return base_path.parent / f"{stem}__v{next_no:02d}{suffix}"
+
 def process_image_standard(img_path):
     """
     ⚡ 關鍵新增：強制圖片標準化
@@ -42,6 +56,13 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
     source_type = row.get("source_type", "AI").strip().lower()
 
     if source_type == "flashcard":
+        custom_image_path = row.get("custom_image_path", "").strip()
+        if custom_image_path:
+            custom_img = Path(custom_image_path)
+            if custom_img.exists():
+                print(f"📁 [Flashcard] 使用自訂圖卡: {custom_img.name}")
+                process_image_standard(custom_img)
+                return custom_img
         word = row.get("flashcard_word", "").strip()
         img_path = flashcards_folder / f"{word}.png"
         if not img_path.exists():
@@ -56,17 +77,18 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
 
     start_t = str(row["start_time"]).strip()
     img_name = f"img_{start_t}.png"
-    img_path = ai_images_folder / img_name
+    base_img_path = ai_images_folder / img_name
+    img_path = next_variant_path(base_img_path) if force_ai_regenerate else base_img_path
     raw_prompt = row.get("image_prompt", "").strip()
     prompt_text = raw_prompt if raw_prompt else "A clean educational background, soft blue and white gradient, 16:9"
 
-    if img_path.exists() and not force_ai_regenerate:
+    if base_img_path.exists() and not force_ai_regenerate:
         print(f"⏭️ {img_name} 已存在，重新標準化以確保安全。")
-        process_image_standard(img_path)
-        return img_path
+        process_image_standard(base_img_path)
+        return base_img_path
 
     try:
-        print(f"🎨 正在為 AI 場景生成圖片 ({img_name})...")
+        print(f"🎨 正在為 AI 場景生成圖片 ({img_path.name})...")
         result = client.models.generate_images(
             model='imagen-4.0-generate-001',
             prompt=prompt_text,
@@ -77,9 +99,9 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
         )
         result.generated_images[0].image.save(img_path)
         process_image_standard(img_path)
-        print(f"✅ {img_name} 產圖成功且標準化！")
+        print(f"✅ {img_path.name} 產圖成功且標準化！")
     except Exception as e:
-        print(f"🚨 {img_name} 生成失敗: {e}")
+        print(f"🚨 {img_path.name} 生成失敗: {e}")
         fallback_img = Image.new('RGB', (1920, 1080), color=(44, 62, 80))
         fallback_img.save(img_path)
 

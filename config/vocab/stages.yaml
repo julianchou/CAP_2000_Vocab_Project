@@ -1,5 +1,4 @@
-﻿# Pipeline stages configuration for CAP 2000 AI Video CMS
-# Commands are best-effort; missing scripts will be reported without crashing.
+# Pipeline stages configuration for CAP 2000 AI Video CMS
 stages:
   - id: "1"
     key: "stage1_assets"
@@ -9,7 +8,14 @@ stages:
         type: python
         script: scripts/generate_flashcards.py
         args: ["--ep", "{ep}"]
-        skip_if_dir_has_files: "04_images"
+      - name: "產生克漏字題目"
+        type: python
+        script: scripts/generate_cloze_quiz.py
+        args: ["--ep", "{ep}"]
+      - name: "產生克漏字題目卡與答案卡"
+        type: python
+        script: scripts/generate_cloze_flashcards.py
+        args: ["--ep", "{ep}"]
       - name: "產生封面圖"
         type: python
         script: scripts/generate_cover.py

@@ -66,6 +66,14 @@ class StageRunner:
     def _proc_meta_path(self, log_path: Path) -> Path:
         return log_path.with_suffix(log_path.suffix + ".proc.json")
 
+    def _proc_last_meta_path(self, log_path: Path) -> Path:
+        return log_path.with_suffix(log_path.suffix + ".proc.last.json")
+
+    def _ts_label(self, ts: int | float | None) -> str:
+        if not ts:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
     def _is_pid_running(self, pid: int) -> bool:
         if pid <= 0:
             return False
@@ -88,13 +96,27 @@ class StageRunner:
     def get_substep_state(self, ep_info: Dict, sub_no: str) -> Dict:
         log_path = log_file_for_stage(ep_info["path"], f"sub{sub_no}")
         proc_meta_path = self._proc_meta_path(log_path)
+        proc_last_meta_path = self._proc_last_meta_path(log_path)
         state = {
             "running": False,
             "pid": None,
             "log": str(log_path),
             "proc_meta": str(proc_meta_path),
+            "proc_last_meta": str(proc_last_meta_path),
+            "started_at": None,
+            "ended_at": None,
+            "step_name": None,
         }
         if not proc_meta_path.exists():
+            if proc_last_meta_path.exists():
+                try:
+                    last_meta = json.loads(proc_last_meta_path.read_text(encoding="utf-8"))
+                    state["pid"] = int(last_meta.get("pid", 0) or 0)
+                    state["started_at"] = last_meta.get("started_at")
+                    state["ended_at"] = last_meta.get("ended_at")
+                    state["step_name"] = last_meta.get("step_name")
+                except Exception:
+                    pass
             return state
         try:
             meta = json.loads(proc_meta_path.read_text(encoding="utf-8"))
@@ -103,9 +125,34 @@ class StageRunner:
 
         pid = int(meta.get("pid", 0) or 0)
         state["pid"] = pid
+        state["started_at"] = meta.get("started_at")
+        state["step_name"] = meta.get("step_name")
         running = self._is_pid_running(pid)
         state["running"] = running
         if not running:
+            ended_at = int(log_path.stat().st_mtime) if log_path.exists() else int(time.time())
+            state["ended_at"] = ended_at
+            last_meta = {
+                "pid": pid,
+                "started_at": meta.get("started_at"),
+                "ended_at": ended_at,
+                "step_name": meta.get("step_name"),
+            }
+            try:
+                proc_last_meta_path.write_text(
+                    json.dumps(last_meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            try:
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(
+                        f"==== END sub{sub_no} | {meta.get('step_name', 'step')} | "
+                        f"{self._ts_label(ended_at)} ===\n"
+                    )
+            except Exception:
+                pass
             try:
                 proc_meta_path.unlink()
             except FileNotFoundError:
@@ -122,12 +169,18 @@ class StageRunner:
             step_name, _step_type, cmd, env = self._prepare_step(ep_info, step)
         except Exception as e:
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"\n==== FAIL sub{sub_no} | {step.get('name', 'step')} | {e} ===\n")
+                lf.write(
+                    f"\n==== FAIL sub{sub_no} | {step.get('name', 'step')} | "
+                    f"{self._ts_label(time.time())} | {e} ===\n"
+                )
             return {"ok": False, "started": False, "message": str(e), "log": str(log_path)}
 
         proc_meta_path = self._proc_meta_path(log_path)
+        proc_last_meta_path = self._proc_last_meta_path(log_path)
         with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(f"\n==== RUN sub{sub_no} | {step_name} ====: {cmd}\n")
+            lf.write(
+                f"\n==== RUN sub{sub_no} | {step_name} | {self._ts_label(time.time())} ====: {cmd}\n"
+            )
             p = subprocess.Popen(
                 cmd,
                 cwd=str(self.root),
@@ -148,6 +201,10 @@ class StageRunner:
             ),
             encoding="utf-8",
         )
+        try:
+            proc_last_meta_path.unlink()
+        except FileNotFoundError:
+            pass
         return {"ok": True, "started": True, "message": "started", "pid": p.pid, "log": str(log_path)}
 
     def _run_step(self, ep_info: Dict, stage_id: str, step: Dict, log_path: Path) -> Tuple[bool, str]:
@@ -157,7 +214,8 @@ class StageRunner:
             try:
                 step_name, step_type, cmd, env = self._prepare_step(ep_info, step)
                 output_encoding = "utf-8" if step_type == "python" else (locale.getpreferredencoding(False) or "utf-8")
-                lf.write(f"\n==== RUN {stage_id} | {step_name} ====: {cmd}\n")
+                started_at = int(time.time())
+                lf.write(f"\n==== RUN {stage_id} | {step_name} | {self._ts_label(started_at)} ====: {cmd}\n")
                 p = subprocess.Popen(
                     cmd,
                     cwd=str(self.root),
@@ -172,20 +230,21 @@ class StageRunner:
                 for line in p.stdout:
                     lf.write(line)
                 code = p.wait()
+                ended_at = int(time.time())
                 if code == 0:
-                    lf.write(f"==== OK {stage_id} | {step_name} ===\n")
+                    lf.write(f"==== OK {stage_id} | {step_name} | {self._ts_label(ended_at)} ===\n")
                     return True, "ok"
                 else:
-                    lf.write(f"==== FAIL {stage_id} | {step_name} | code={code} ===\n")
+                    lf.write(f"==== FAIL {stage_id} | {step_name} | {self._ts_label(ended_at)} | code={code} ===\n")
                     return False, f"exit {code}"
             except RuntimeError as e:
-                lf.write(f"==== SKIP {stage_id} | {step_name} | {e} ===\n")
+                lf.write(f"==== SKIP {stage_id} | {step_name} | {self._ts_label(time.time())} | {e} ===\n")
                 return True, str(e)
             except FileNotFoundError:
-                lf.write(f"==== FAIL {stage_id} | {step_name} | FileNotFoundError ===\n")
+                lf.write(f"==== FAIL {stage_id} | {step_name} | {self._ts_label(time.time())} | FileNotFoundError ===\n")
                 return False, "FileNotFound"
             except Exception as e:
-                lf.write(f"==== FAIL {stage_id} | {step_name} | {e} ===\n")
+                lf.write(f"==== FAIL {stage_id} | {step_name} | {self._ts_label(time.time())} | {e} ===\n")
                 return False, str(e)
 
     def run_stage(self, ep_info: Dict, stage_id: str) -> Dict:

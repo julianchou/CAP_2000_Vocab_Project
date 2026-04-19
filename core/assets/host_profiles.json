@@ -1,0 +1,13 @@
+{
+  "style_config": "Cute 3D cartoon style, Pixar-like character design, vibrant colors, soft studio lighting, highly detailed, 4k render.",
+  "characters": {
+    "john": {
+      "name": "John",
+      "description": "A cute cheerful young boy with messy brown hair, big energetic eyes, wearing a green hoodie and a gaming headset."
+    },
+    "mary": {
+      "name": "Mary",
+      "description": "A smart young girl with long blonde pigtails, wearing round glasses and a bright yellow professional teacher outfit."
+    }
+  }
+}

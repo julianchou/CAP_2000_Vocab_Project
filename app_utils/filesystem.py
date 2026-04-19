@@ -22,11 +22,25 @@ STATUS_DEFAULT = {
 def workspace_dir(root: Path, ws_override: str | None = None) -> Path:
     return root / (ws_override or "workspace")
 
+def episode_dir_name(ep: int, start: int, end: int) -> str:
+    return f"Ep{int(ep):02d}_{int(start):04d}_{int(end):04d}"
+
 def list_episode_dirs(root: Path, ws_override: str | None = None) -> List[Path]:
     ws = workspace_dir(root, ws_override)
     if not ws.exists():
         return []
     return sorted([p for p in ws.iterdir() if p.is_dir() and EP_DIR_PATTERN.match(p.name)])
+
+def find_episode_dirs_by_ep(root: Path, ep: int, ws_override: str | None = None) -> List[Path]:
+    target_ep = int(ep)
+    return [
+        p for p in list_episode_dirs(root, ws_override)
+        if parse_episode_info(p).get("ep") == target_ep
+    ]
+
+def find_episode_dir(root: Path, ep: int, ws_override: str | None = None) -> Optional[Path]:
+    matches = find_episode_dirs_by_ep(root, ep, ws_override)
+    return matches[0] if matches else None
 
 def parse_episode_info(ep_path: Path) -> Dict:
     m = EP_DIR_PATTERN.match(ep_path.name)
