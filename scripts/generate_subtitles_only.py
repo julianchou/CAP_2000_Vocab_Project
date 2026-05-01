@@ -2,8 +2,8 @@
 import whisper
 import srt
 import datetime
-import os
 import argparse
+import sys
 from pathlib import Path
 
 # --- 設定區 ---
@@ -13,6 +13,11 @@ PUNCTUATIONS = ['，', '。', '！', '？', '、', ',', '.', '!', '?']
 
 # 專案路徑設定
 base_dir = Path(__file__).parent.parent
+if str(base_dir) not in sys.path:
+    sys.path.insert(0, str(base_dir))
+
+from app_utils.power import keep_system_awake
+
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 def generate_optimized_subtitles(ep_num):
@@ -29,16 +34,17 @@ def generate_optimized_subtitles(ep_num):
         print(f"❌ 錯誤：找不到音訊檔 {audio_path}")
         return
 
-    print(f"🚀 正在載入 Whisper 模型...")
-    model = whisper.load_model(MODEL_SIZE)
-    
-    print(f"📝 正在辨識第 {ep_num} 集語音並獲取字級時間戳記...")
-    result = model.transcribe(
-        str(audio_path), 
-        verbose=False, 
-        initial_prompt="以下是繁體中文的對話內容，請包含正確的標點符號。",
-        word_timestamps=True 
-    )
+    with keep_system_awake(f"No.{ep_num:02d} Whisper 產生字幕"):
+        print(f"🚀 正在載入 Whisper 模型...")
+        model = whisper.load_model(MODEL_SIZE)
+        
+        print(f"📝 正在辨識第 {ep_num} 集語音並獲取字級時間戳記...")
+        result = model.transcribe(
+            str(audio_path), 
+            verbose=False, 
+            initial_prompt="以下是繁體中文的對話內容，請包含正確的標點符號。",
+            word_timestamps=True 
+        )
     
     subs = []
     sub_index = 1

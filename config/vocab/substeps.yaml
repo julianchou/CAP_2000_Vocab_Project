@@ -1,7 +1,7 @@
 substeps:
   - no: "3"
     key: "step03_vocab_content"
-    name: "產生單字卡內容"
+    name: "產生單字資料"
     rule: all
     outputs:
       - pattern: "03_storyboards/vocab_data.csv"
@@ -15,7 +15,7 @@ substeps:
 
   - no: "4"
     key: "step04_flashcards"
-    name: "產生單字卡圖片"
+    name: "產生單字卡"
     rule: any
     outputs:
       - pattern: "04_images/flashcards/*.*"
@@ -26,7 +26,7 @@ substeps:
 
   - no: "5"
     key: "step05_cloze_questions"
-    name: "產生克漏字題目檔"
+    name: "產生克漏字題"
     rule: all
     outputs:
       - pattern: "03_storyboards/cloze_questions.csv"
@@ -40,7 +40,7 @@ substeps:
 
   - no: "6"
     key: "step06_cloze_flashcards"
-    name: "產生克漏字題目卡/答案卡"
+    name: "產生克漏字卡"
     rule: all
     outputs:
       - pattern: "04_images/cloze_cards/questions/*.png"
@@ -52,7 +52,7 @@ substeps:
 
   - no: "7"
     key: "step07_cover"
-    name: "產品影片封面圖"
+    name: "產生封面"
     rule: any
     outputs:
       - pattern: "04_images/cover.png"
@@ -76,7 +76,7 @@ substeps:
 
   - no: "9"
     key: "step09_tts_generate"
-    name: "產生雙人對話語音（NotebookLM 手動）"
+    name: "人工到 NotebookLM 產生語音摘要"
     rule: any
     outputs:
       - pattern: "00_logs/step09_manual_done.txt"
@@ -84,7 +84,7 @@ substeps:
 
   - no: "10"
     key: "step10_audio_download"
-    name: "下載並儲存語音"
+    name: "下載語音音訊"
     rule: any
     outputs:
       - pattern: "01_audio/notebooklm_audio.m4a"
@@ -130,7 +130,7 @@ substeps:
 
   - no: "13"
     key: "step13_subtitles_manual"
-    name: "人工字幕校正"
+    name: "人工字幕確認"
     rule: all
     outputs:
       - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
@@ -151,7 +151,7 @@ substeps:
 
   - no: "15"
     key: "step15_storyboard_manual"
-    name: "修改分鏡/替換單字卡（人工）"
+    name: "人工微調分鏡"
     rule: all
     outputs:
       - pattern: "03_storyboards/storyboard.csv"
@@ -196,8 +196,20 @@ substeps:
 
   - no: "19"
     key: "step19_youtube_meta"
-    name: "產生Youtube metadata"
+    name: "產生 Youtube metadata"
     rule: any
     outputs:
       - pattern: "05_output/youtube_meta.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/generate_youtube_meta.py
+      args: ["--ep", "{ep}"]
+
+  - no: "20"
+    key: "step20_upload_youtube"
+    name: "上傳 Youtube"
+    rule: any
+    outputs:
+      - pattern: "05_output/upload.ok"
         nonempty: true

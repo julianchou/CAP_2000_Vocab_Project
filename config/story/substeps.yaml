@@ -1,0 +1,194 @@
+substeps:
+  - no: "1.1"
+    key: "story_episode_scaffold"
+    name: "新增集數，產生目錄架構"
+    rule: all
+    outputs:
+      - pattern: "01_preproduction"
+      - pattern: "02_story"
+      - pattern: "03_characters_scenes"
+      - pattern: "04_audio_subtitles"
+      - pattern: "05_storyboards"
+      - pattern: "06_video"
+      - pattern: "07_publish"
+    run:
+      type: python
+      script: scripts/story_stage1_prep.py
+      args: ["--ep", "{ep}"]
+
+  - no: "1.2"
+    key: "story_brainstorm"
+    name: "產生 5 個故事大綱候選並選擇本次故事"
+    rule: all
+    outputs:
+      - pattern: "01_preproduction/story_outline_options.json"
+        nonempty: true
+      - pattern: "01_preproduction/story_brainstorm_options.json"
+        nonempty: true
+      - pattern: "01_preproduction/selected_story.json"
+        nonempty: true
+      - pattern: "01_preproduction/selected_story.md"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_generate_outline_options.py
+      args: ["--ep", "{ep}"]
+
+  - no: "2.1"
+    key: "story_outline_paragraphs"
+    name: "建立故事大綱及段落"
+    rule: any
+    outputs:
+      - pattern: "02_story/story_outline.json"
+        nonempty: true
+      - pattern: "02_story/story_outline.md"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_build_outline.py
+      args: ["--ep", "{ep}"]
+
+  - no: "2.2"
+    key: "story_script"
+    name: "產出各段落旁白與角色對話"
+    rule: any
+    outputs:
+      - pattern: "02_story/story_script.json"
+        nonempty: true
+      - pattern: "02_story/story_script.md"
+        nonempty: true
+      - pattern: "02_story/story_text_for_tts.txt"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_build_script.py
+      args: ["--ep", "{ep}"]
+
+  - no: "3.1"
+    key: "story_characters"
+    name: "角色人物塑造"
+    rule: any
+    outputs:
+      - pattern: "03_characters_scenes/characters.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_build_characters.py
+      args: ["--ep", "{ep}"]
+
+  - no: "3.2"
+    key: "story_locations"
+    name: "場景塑造"
+    rule: any
+    outputs:
+      - pattern: "03_characters_scenes/locations.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_build_locations.py
+      args: ["--ep", "{ep}"]
+
+  - no: "4.1"
+    key: "story_tts_lines"
+    name: "依內容及角色產生各段句及對話列表"
+    rule: any
+    outputs:
+      - pattern: "04_audio_subtitles/tts_lines.json"
+        nonempty: true
+      - pattern: "04_audio_subtitles/tts_lines.csv"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_build_tts_lines.py
+      args: ["--ep", "{ep}"]
+
+  - no: "4.2"
+    key: "story_tts_audio"
+    name: "呼叫文字轉語音API"
+    rule: all
+    outputs:
+      - pattern: "04_audio_subtitles/voice_cast.json"
+        nonempty: true
+      - pattern: "04_audio_subtitles/voice_segments/*.*"
+    run:
+      type: python
+      script: scripts/story_generate_tts_audio.py
+      args: ["--ep", "{ep}"]
+
+  - no: "4.3"
+    key: "story_audio_merge"
+    name: "將語音合併"
+    rule: any
+    outputs:
+      - pattern: "04_audio_subtitles/story_audio.m4a"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_merge_audio.py
+      args: ["--ep", "{ep}"]
+
+  - no: "4.4"
+    key: "story_subtitles"
+    name: "語音轉字幕"
+    rule: any
+    outputs:
+      - pattern: "04_audio_subtitles/story_subtitles.srt"
+        nonempty: true
+      - pattern: "04_audio_subtitles/story_subtitles.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_generate_subtitles.py
+      args: ["--ep", "{ep}"]
+
+  - no: "5.1"
+    key: "story_subtitles_to_storyboard"
+    name: "AI 依語境分鏡規劃"
+    rule: any
+    outputs:
+      - pattern: "05_storyboards/storyboard.csv"
+        nonempty: true
+      - pattern: "05_storyboards/storyboard.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/story_subtitles_to_storyboard.py
+      args: ["--ep", "{ep}"]
+
+  - no: "5.2"
+    key: "story_storyboard_images"
+    name: "分鏡轉圖片"
+    rule: any
+    outputs:
+      - pattern: "05_storyboards/images/*.*"
+
+  - no: "5.3"
+    key: "story_images_to_animation"
+    name: "圖片轉動畫"
+    rule: any
+    outputs:
+      - pattern: "05_storyboards/animations/*.*"
+
+  - no: "6.1"
+    key: "story_video_render"
+    name: "FFmpeg 影片合成"
+    rule: any
+    outputs:
+      - pattern: "06_video/final_video.mp4"
+        nonempty: true
+
+  - no: "7.1"
+    key: "story_cover"
+    name: "產出封面"
+    rule: any
+    outputs:
+      - pattern: "07_publish/cover.png"
+        nonempty: true
+
+  - no: "7.2"
+    key: "story_youtube_metadata"
+    name: "產生Youtube metadata"
+    rule: any
+    outputs:
+      - pattern: "07_publish/youtube_meta.json"
+        nonempty: true

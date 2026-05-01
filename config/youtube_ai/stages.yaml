@@ -1,0 +1,43 @@
+stages:
+  - id: "1"
+    key: "data_integration"
+    name: "多頻道數據集成"
+    steps:
+      - name: "初始化資料庫"
+        type: python
+        script: scripts/youtube_ai_init_db.py
+        args: []
+      - name: "OAuth 授權並同步頻道"
+        type: python
+        script: scripts/youtube_ai_sync_channels.py
+        args: []
+
+  - id: "2"
+    key: "ai_insights"
+    name: "LLM 智能診斷與優化"
+    steps:
+      - name: "AI 診斷規劃預留"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "youtube_ai", "--item", "insights"]
+        optional: true
+
+  - id: "3"
+    key: "execution_scheduling"
+    name: "執行計劃與整合排程"
+    steps:
+      - name: "任務與排程規劃預留"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "youtube_ai", "--item", "tasks"]
+        optional: true
+
+  - id: "4"
+    key: "monitoring_reporting"
+    name: "監控反饋與自動化通知"
+    steps:
+      - name: "每日戰報規劃預留"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "youtube_ai", "--item", "briefing"]
+        optional: true

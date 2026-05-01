@@ -1,0 +1,8 @@
+unit_costs:
+  youtube_data_api_units: 0
+  youtube_analytics_api_units: 0
+  llm_analysis_usd: 0.02
+assumptions:
+  avg_channels: 3
+  avg_videos_per_channel: 100
+  avg_daily_llm_reports: 1

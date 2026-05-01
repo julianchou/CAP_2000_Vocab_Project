@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from app_utils.power import keep_system_awake
+
 
 VIDEO_FPS = 30
 VIDEO_WIDTH = 1920
@@ -75,7 +77,7 @@ def ffmpeg_visual_filter() -> str:
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> None:
-    print("▶", " ".join(cmd))
+    print("$", " ".join(cmd))
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
@@ -132,11 +134,11 @@ def build_segment_from_animation(target_folder: Path, animation_path: Path, outp
 
 
 def render_final_video(ep_num: int, workspace_dir: Path) -> None:
-    print(f"\n🎬 [Stage 6] 正在渲染第 {ep_num:02d} 集影片...")
+    print(f"\n[Stage 6] 開始處理第 {ep_num:02d} 集影片合成...")
 
     target_folder = get_ep_folder(workspace_dir, ep_num)
     if not target_folder:
-        print(f"❌ 找不到第 {ep_num:02d} 集資料夾。")
+        print(f"找不到第 {ep_num:02d} 集資料夾。")
         return
 
     storyboard_csv = target_folder / "03_storyboards" / "storyboard.csv"
@@ -148,13 +150,13 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
     concat_list = output_dir / "segments.txt"
 
     if not storyboard_csv.exists():
-        print(f"❌ 找不到分鏡表：{storyboard_csv}")
+        print(f"找不到分鏡檔：{storyboard_csv}")
         return
     if not audio_file.exists():
-        print(f"❌ 找不到音訊：{audio_file}")
+        print(f"找不到音訊檔：{audio_file}")
         return
     if not subtitle_file.exists():
-        print(f"❌ 找不到字幕：{subtitle_file}")
+        print(f"找不到字幕檔：{subtitle_file}")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -162,86 +164,87 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
 
     rows = read_storyboard_rows(storyboard_csv)
     if not rows:
-        print("❌ storyboard.csv 沒有 scene 資料。")
+        print("storyboard.csv 沒有任何 scene。")
         return
 
-    segment_lines: list[str] = []
+    with keep_system_awake(f"No.{ep_num:02d} FFmpeg 影片合成"):
+        segment_lines: list[str] = []
 
-    for idx, row in enumerate(rows, start=1):
-        duration = scene_duration(row)
-        segment_path = segments_dir / f"seg_{idx:03d}.mp4"
-        animation_path = scene_animation_path(target_folder, row)
-        image_path = scene_image_path(target_folder, row)
+        for idx, row in enumerate(rows, start=1):
+            duration = scene_duration(row)
+            segment_path = segments_dir / f"seg_{idx:03d}.mp4"
+            animation_path = scene_animation_path(target_folder, row)
+            image_path = scene_image_path(target_folder, row)
 
-        print(
-            f"🧩 Scene {row.get('scene_id', idx)} | duration={duration:.3f}s | "
-            f"animation={'Y' if animation_path else 'N'} | image={'Y' if image_path else 'N'}"
-        )
-
-        if animation_path and animation_path.exists():
-            build_segment_from_animation(target_folder, animation_path, segment_path, duration)
-        elif image_path and image_path.exists():
-            build_segment_from_image(target_folder, image_path, segment_path, duration)
-        else:
-            raise FileNotFoundError(
-                f"Scene {row.get('scene_id', idx)} 沒有可用圖片或動畫，無法渲染。"
+            print(
+                f"[scene] {row.get('scene_id', idx)} | duration={duration:.3f}s | "
+                f"animation={'Y' if animation_path else 'N'} | image={'Y' if image_path else 'N'}"
             )
 
-        segment_lines.append(f"file '{rel_posix(segment_path, output_dir)}'")
+            if animation_path and animation_path.exists():
+                build_segment_from_animation(target_folder, animation_path, segment_path, duration)
+            elif image_path and image_path.exists():
+                build_segment_from_image(target_folder, image_path, segment_path, duration)
+            else:
+                raise FileNotFoundError(
+                    f"Scene {row.get('scene_id', idx)} 找不到可用的動畫或圖片來源。"
+                )
 
-    concat_list.write_text("\n".join(segment_lines) + "\n", encoding="utf-8")
-    print(f"📝 已更新 concat 清單：{concat_list}")
+            segment_lines.append(f"file '{rel_posix(segment_path, output_dir)}'")
 
-    subtitle_rel = rel_posix(subtitle_file, target_folder)
+        concat_list.write_text("\n".join(segment_lines) + "\n", encoding="utf-8")
+        print(f"已建立 concat 清單：{concat_list}")
 
-    run_cmd(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            rel_posix(concat_list, target_folder),
-            "-i",
-            rel_posix(audio_file, target_folder),
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            "-vf",
-            (
-                "subtitles="
-                f"{subtitle_rel}:"
-                "force_style='FontName=Microsoft JhengHei,FontSize=16,"
-                "PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=1,"
-                "Outline=2,MarginL=40,MarginR=40,WrapStyle=1'"
-            ),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "medium",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            rel_posix(output_file, target_folder),
-        ],
-        cwd=target_folder,
-    )
+        subtitle_rel = rel_posix(subtitle_file, target_folder)
 
-    print(f"✅ 第 {ep_num:02d} 集 final_video.mp4 已輸出：{output_file}")
+        run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                rel_posix(concat_list, target_folder),
+                "-i",
+                rel_posix(audio_file, target_folder),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-vf",
+                (
+                    "subtitles="
+                    f"{subtitle_rel}:"
+                    "force_style='FontName=Microsoft JhengHei,FontSize=16,"
+                    "PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=1,"
+                    "Outline=2,MarginL=40,MarginR=40,WrapStyle=1'"
+                ),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                rel_posix(output_file, target_folder),
+            ],
+            cwd=target_folder,
+        )
+
+    print(f"第 {ep_num:02d} 集 final_video.mp4 已輸出：{output_file}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Stage 6: 使用靜圖或動畫渲染最終影片")
-    parser.add_argument("--ep", type=int, help="指定單一集數")
+    parser = argparse.ArgumentParser(description="Stage 6: 產生最終影片並燒錄字幕。")
+    parser.add_argument("--ep", type=int, help="單集集數")
     parser.add_argument("--start", type=int, help="起始集數")
     parser.add_argument("--end", type=int, help="結束集數")
     args = parser.parse_args()
@@ -259,7 +262,7 @@ def main() -> None:
     for ep in range(start_ep, end_ep + 1):
         render_final_video(ep, workspace_dir)
 
-    print(f"\n✅ Stage 6 完成：第 {start_ep:02d} 到 {end_ep:02d} 集")
+    print(f"\nStage 6 完成，處理範圍：{start_ep:02d} - {end_ep:02d}")
 
 
 if __name__ == "__main__":

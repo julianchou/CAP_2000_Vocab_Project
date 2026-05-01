@@ -1,0 +1,26 @@
+{
+  "id": "sched_stage3_ep13_14_20260426_081858",
+  "profile_id": "vocab",
+  "stage_id": "3",
+  "stage_name": "分鏡規劃",
+  "episodes": [
+    13,
+    14
+  ],
+  "schedule_at": "2026-04-26T08:30:00",
+  "status": "done",
+  "created_at": "2026-04-26T08:18:58",
+  "started_at": "2026-04-26T08:30:01",
+  "ended_at": "2026-04-26T08:32:03",
+  "current_episode": null,
+  "completed_episodes": [
+    13,
+    14
+  ],
+  "failed_episodes": [],
+  "last_message": "finished with status=done",
+  "task_name": "CAP2000_Schedule_sched_stage3_ep13_14_20260426_081858",
+  "task_mode": "interactive",
+  "wake_to_run": true,
+  "launcher_path": "C:\\Project\\CAP_2000_Vocab_Project\\runtime\\schedule_jobs\\vocab\\sched_stage3_ep13_14_20260426_081858.launch.ps1"
+}

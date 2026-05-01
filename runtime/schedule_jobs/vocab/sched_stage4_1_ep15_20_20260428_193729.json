@@ -1,0 +1,34 @@
+{
+  "id": "sched_stage4_1_ep15_20_20260428_193729",
+  "profile_id": "vocab",
+  "stage_id": "4.1",
+  "stage_name": "將所有 AI 圖片轉成動畫",
+  "episodes": [
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "schedule_at": "2026-04-28T19:37:29",
+  "status": "error",
+  "created_at": "2026-04-28T19:37:29",
+  "started_at": "2026-04-28T19:37:30",
+  "ended_at": "2026-04-28T20:19:15",
+  "current_episode": null,
+  "completed_episodes": [],
+  "failed_episodes": [
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "last_message": "finished with status=error",
+  "task_name": "",
+  "task_mode": "immediate",
+  "wake_to_run": false,
+  "launcher_path": "C:\\Project\\CAP_2000_Vocab_Project\\runtime\\schedule_jobs\\vocab\\sched_stage4_1_ep15_20_20260428_193729.launch.ps1"
+}

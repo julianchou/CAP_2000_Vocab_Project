@@ -1,0 +1,13 @@
+
+==== REGISTER schedule:sched_stage4_ep13_14_20260426_091959 | 排程執行 Stage 4 產生分鏡圖片 | 2026-04-26 09:20:01 ====: CAP2000_Schedule_sched_stage4_ep13_14_20260426_091959 @ 2026-04-26T09:30:00 | mode=interactive | wake_to_run=true | note=registered with interactive token
+
+==== RUN schedule:sched_stage4_ep13_14_20260426_091959 | stage 4 | 2026-04-26 09:30:01 ====: episodes=[13, 14] scheduled_at=2026-04-26 09:30
+[power] Preventing system sleep: Scheduled stage 4 (sched_stage4_ep13_14_20260426_091959)
+[schedule] starting queued stage run
+[schedule] start episode 13 (1/2) stage 4
+[schedule] episode 13 completed stage 4
+[schedule] start episode 14 (2/2) stage 4
+[schedule] episode 14 completed stage 4
+[power] Restored normal sleep policy: Scheduled stage 4 (sched_stage4_ep13_14_20260426_091959)
+[schedule] finished status=done completed=[13, 14] failed=[]
+==== END schedule:sched_stage4_ep13_14_20260426_091959 | schedule:sched_stage4_ep13_14_20260426_091959 | 2026-04-26 09:35:15 ===

@@ -1,0 +1,13 @@
+
+==== REGISTER schedule:sched_stage2_ep13_14_20260426_012047 | 排程執行 Stage 2 字幕處理 | 2026-04-26 01:20:48 ====: CAP2000_Schedule_sched_stage2_ep13_14_20260426_012047 @ 2026-04-26T02:15:00 | mode=interactive | wake_to_run=true | note=registered with interactive token
+
+==== RUN schedule:sched_stage2_ep13_14_20260426_012047 | stage 2 | 2026-04-26 03:01:31 ====: episodes=[13, 14] scheduled_at=2026-04-26 02:15
+[power] Preventing system sleep: Scheduled stage 2 (sched_stage2_ep13_14_20260426_012047)
+[schedule] starting queued stage run
+[schedule] start episode 13 (1/2) stage 2
+[schedule] episode 13 completed stage 2
+[schedule] start episode 14 (2/2) stage 2
+[schedule] episode 14 completed stage 2
+[power] Restored normal sleep policy: Scheduled stage 2 (sched_stage2_ep13_14_20260426_012047)
+[schedule] finished status=done completed=[13, 14] failed=[]
+==== END schedule:sched_stage2_ep13_14_20260426_012047 | schedule:sched_stage2_ep13_14_20260426_012047 | 2026-04-26 04:12:15 ===

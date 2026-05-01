@@ -11,3 +11,15 @@
     stages: config/grammar/stages.yaml
     substeps: config/grammar/substeps.yaml
     costs: config/grammar/costs.yaml
+  - id: story
+    name: 故事生成模式
+    workspace: workspaces/story
+    stages: config/story/stages.yaml
+    substeps: config/story/substeps.yaml
+    costs: config/story/costs.yaml
+  - id: youtube_ai
+    name: YouTube AI 增長專家系統
+    workspace: workspaces/youtube_ai
+    stages: config/youtube_ai/stages.yaml
+    substeps: config/youtube_ai/substeps.yaml
+    costs: config/youtube_ai/costs.yaml

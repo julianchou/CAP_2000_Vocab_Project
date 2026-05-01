@@ -1,85 +1,92 @@
-# Pipeline stages configuration for CAP 2000 AI Video CMS
 stages:
   - id: "1"
-    key: "stage1_assets"
-    name: "素材準備"
+    key: "stage1_vocab_prep"
+    name: "單字與摘要準備"
     steps:
-      - name: "產生單字卡圖片"
+      - name: "No.3 產生單字資料"
+        type: python
+        script: scripts/generate_vocab_content.py
+        args: ["--ep", "{ep}"]
+      - name: "No.4 產生單字卡"
         type: python
         script: scripts/generate_flashcards.py
         args: ["--ep", "{ep}"]
-      - name: "產生克漏字題目"
+      - name: "No.5 產生克漏字題"
         type: python
         script: scripts/generate_cloze_quiz.py
         args: ["--ep", "{ep}"]
-      - name: "產生克漏字題目卡與答案卡"
+      - name: "No.6 產生克漏字卡"
         type: python
         script: scripts/generate_cloze_flashcards.py
         args: ["--ep", "{ep}"]
-      - name: "產生封面圖"
+      - name: "No.7 產生封面"
         type: python
         script: scripts/generate_cover.py
-        args: ["--ep", "{ep}", "--start", "{start}", "--end", "{end}"]
+        args: ["--ep", "{ep}", "--start_idx", "{start}", "--end_idx", "{end}"]
         optional: true
-  - id: "1.5"
-    key: "stage1_5_audio"
-    name: "音訊處理 (合併片頭)"
+      - name: "No.8 產生語音摘要 Prompt"
+        type: python
+        script: scripts/generate_notebooklm_prompt.py
+        args: ["--ep", "{ep}"]
+
+  - id: "2"
+    key: "stage2_subtitles"
+    name: "字幕處理"
     steps:
-      - name: "合併片頭音訊"
+      - name: "No.10.5 合併片頭音訊"
         type: python
         script: scripts/merge_intro_audio.py
         args: ["--ep", "{ep}"]
         optional: true
-  - id: "2"
-    key: "stage2_subtitles_asr"
-    name: "字幕生成 (Whisper)"
-    steps:
-      - name: "Whisper 產生字幕"
+      - name: "No.11 Whisper 產生字幕"
         type: python
         script: scripts/generate_subtitles_only.py
         args: ["--ep", "{ep}"]
-  - id: "3"
-    key: "stage3_subtitles_llm"
-    name: "字幕校對 (LLM)"
-    steps:
-      - name: "AI 字幕校對"
+      - name: "No.12 AI 字幕校對"
         type: python
         script: scripts/llm_subtitle_reviewer.py
         args: ["--ep", "{ep}"]
-  - id: "4"
-    key: "stage4_ai_review"
-    name: "AI Review"
+
+  - id: "3"
+    key: "stage3_storyboard"
+    name: "分鏡規劃"
     steps:
-      - name: "AI 審查流程"
+      - name: "No.14 AI 依語境分鏡規劃"
         type: python
-        script: run_stage4_ai_review.py
+        script: scripts/llm_director.py
         args: ["--ep", "{ep}"]
-        optional: true
-  - id: "5"
-    key: "stage5_storyboard"
-    name: "分鏡匹配"
+
+  - id: "4"
+    key: "stage4_images"
+    name: "產生分鏡圖片"
     steps:
-      - name: "生成分鏡與預覽圖"
+      - name: "No.16 AI 產生分鏡圖片"
         type: python
         script: scripts/gen_matched_preview_v4.py
         args: ["--ep", "{ep}"]
-  - id: "6"
-    key: "stage6_render"
-    name: "影片渲染"
+
+  - id: "5"
+    key: "stage5_render"
+    name: "影片合成"
     steps:
-      - name: "FFmpeg 渲染"
+      - name: "No.17 產生合成清單"
+        type: python
+        script: scripts/gen_matched_preview_v4.py
+        args: ["--ep", "{ep}"]
+      - name: "No.18 FFmpeg 影片合成"
         type: python
         script: run_stage6_render.py
         args: ["--ep", "{ep}"]
-  - id: "7"
-    key: "stage7_publish"
-    name: "發布總管"
-    steps:
-      - name: "產生 YouTube Metadata"
+      - name: "No.19 產生 Youtube metadata"
         type: python
         script: scripts/generate_youtube_meta.py
         args: ["--ep", "{ep}"]
-      - name: "上傳 YouTube"
+
+  - id: "6"
+    key: "stage6_publish"
+    name: "上傳 YouTube"
+    steps:
+      - name: "No.20 上傳 Youtube"
         type: python
         script: scripts/upload_to_youtube.py
         args: ["--ep", "{ep}"]

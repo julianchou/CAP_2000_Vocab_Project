@@ -1,0 +1,104 @@
+stages:
+  - id: "1"
+    key: "stage1_story_prep"
+    name: "前置作業"
+    steps:
+      - name: "新增集數，產生故事目錄架構"
+        type: python
+        script: scripts/story_stage1_prep.py
+        args: ["--ep", "{ep}"]
+      - name: "產生 5 個故事大綱候選"
+        type: python
+        script: scripts/story_generate_outline_options.py
+        args: ["--ep", "{ep}"]
+
+  - id: "2"
+    key: "stage2_story_content"
+    name: "故事內容建立"
+    steps:
+      - name: "建立故事大綱及段落"
+        type: python
+        script: scripts/story_build_outline.py
+        args: ["--ep", "{ep}"]
+      - name: "產出各段落旁白與角色對話"
+        type: python
+        script: scripts/story_build_script.py
+        args: ["--ep", "{ep}"]
+
+  - id: "3"
+    key: "stage3_characters_scenes"
+    name: "人物、場景塑造"
+    steps:
+      - name: "角色人物塑造"
+        type: python
+        script: scripts/story_build_characters.py
+        args: ["--ep", "{ep}"]
+      - name: "場景塑造"
+        type: python
+        script: scripts/story_build_locations.py
+        args: ["--ep", "{ep}"]
+
+  - id: "4"
+    key: "stage4_audio_subtitles"
+    name: "語音及字幕處理"
+    steps:
+      - name: "產生角色/內容/TTS 對話列表"
+        type: python
+        script: scripts/story_build_tts_lines.py
+        args: ["--ep", "{ep}"]
+      - name: "呼叫文字轉語音 API"
+        type: python
+        script: scripts/story_generate_tts_audio.py
+        args: ["--ep", "{ep}"]
+      - name: "將語音合併"
+        type: python
+        script: scripts/story_merge_audio.py
+        args: ["--ep", "{ep}"]
+      - name: "語音轉字幕"
+        type: python
+        script: scripts/story_generate_subtitles.py
+        args: ["--ep", "{ep}"]
+
+  - id: "5"
+    key: "stage5_storyboards"
+    name: "分鏡內容處理"
+    steps:
+      - name: "AI 依語境分鏡規劃"
+        type: python
+        script: scripts/story_subtitles_to_storyboard.py
+        args: ["--ep", "{ep}"]
+      - name: "分鏡轉圖片"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "5", "--item", "images"]
+        optional: true
+      - name: "圖片轉動畫"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "5", "--item", "animations"]
+        optional: true
+
+  - id: "6"
+    key: "stage6_video"
+    name: "影片合成"
+    steps:
+      - name: "FFmpeg 合併圖片、動畫、語音、字幕"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "6", "--item", "final_video"]
+        optional: true
+
+  - id: "7"
+    key: "stage7_youtube"
+    name: "Youtube上傳"
+    steps:
+      - name: "產出封面"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "7", "--item", "cover"]
+        optional: true
+      - name: "產生Youtube metadata"
+        type: python
+        script: scripts/story_stage_placeholder.py
+        args: ["--ep", "{ep}", "--stage", "7", "--item", "youtube_metadata"]
+        optional: true

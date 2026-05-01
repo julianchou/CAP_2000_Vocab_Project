@@ -21,6 +21,17 @@ workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "worksp
 MODEL_NAME = "gemini-2.5-pro"
 HOST_PROFILE_PATH = base_dir / "core" / "assets" / "host_profiles.json"
 
+def detect_profile_id() -> str:
+    profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
+    if profile_id:
+        return profile_id
+    if workspace_dir.parent.name == "workspaces" and workspace_dir.name:
+        return workspace_dir.name
+    return "default"
+
+def shared_prompt_path() -> Path:
+    return base_dir / "config" / detect_profile_id() / "prompts" / "storyboard_prompt.txt"
+
 PREV_CLOZE_ANSWER_TOKEN = "__PREV_CLOZE_Q1_ANSWER__"
 CURRENT_CLOZE_QUESTION_TOKEN = "__CURRENT_CLOZE_Q1_QUESTION__"
 
@@ -71,8 +82,8 @@ DEFAULT_PROMPT_TEMPLATE = """你是一位專業的英語教學影片分鏡導演
 """
 
 
-def prompt_template_path_for(target_folder: Path) -> Path:
-    return target_folder / "03_storyboards" / "storyboard_prompt.txt"
+def prompt_template_path_for(_target_folder: Path) -> Path:
+    return shared_prompt_path()
 
 
 def ensure_prompt_template(target_folder: Path) -> Path:
@@ -110,7 +121,13 @@ def build_host_profile_rules(host_profiles: dict) -> str:
         f"- Mary: {mary_desc}",
         "- If an AI scene includes the podcast hosts, presenters, or generic on-screen narrators, use John and Mary instead of anonymous people.",
         "- When both hosts appear together, default to John on the left and Mary on the right unless the action clearly needs a different arrangement.",
-        "- Put the host descriptions directly inside image_prompt instead of generic phrases like 'a man and a woman' or 'podcast hosts'.",
+        "- Keep the hosts as supporting figures unless the subtitle clearly requires them to be the only main subject.",
+        "- Prefer wide shot, medium-long shot, side angle, or over-the-shoulder staging; avoid portrait framing, close-ups, and large front-facing faces.",
+        "- In quiz, explanation, or infographic scenes, keep the board, text, or teaching object as the main visual focus and place the hosts smaller near the edges.",
+        "- Preserve host identity through consistent hairstyle, glasses, outfit, silhouette, color palette, and left/right placement instead of detailed facial close-ups.",
+        "- Keep Mary's long blonde pigtails clearly visible whenever Mary appears.",
+        "- Keep John's messy brown hair, green hoodie, and gaming headset consistent whenever John appears.",
+        "- Avoid direct front-facing eye contact to camera; prefer three-quarter view or side angle for host scenes.",
         "- If a scene is purely object-based, abstract, or clearly requires another role, do not force the hosts into that scene.",
     ]
     return "\n".join(rules)
@@ -261,6 +278,14 @@ def scene_needs_host_consistency(scene: dict) -> bool:
     return any(keyword in haystack for keyword in keywords)
 
 
+def compact_identity_description(description: str) -> str:
+    text = str(description or "").strip().rstrip(".")
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
 def apply_host_profiles_to_prompt(image_prompt: str, host_profiles: dict) -> str:
     if not host_profiles:
         return image_prompt
@@ -271,13 +296,26 @@ def apply_host_profiles_to_prompt(image_prompt: str, host_profiles: dict) -> str
     if not john_desc or not mary_desc:
         return image_prompt
     action_prompt = strip_visual_suffix(image_prompt)
+    john_identity = compact_identity_description(john_desc)
+    mary_identity = compact_identity_description(mary_desc)
     prefix_parts = []
     if style:
         prefix_parts.append(style)
-    prefix_parts.append("A wide shot featuring two recurring podcast hosts.")
-    prefix_parts.append(f"On the left side: {john_desc}")
-    prefix_parts.append(f"On the right side: {mary_desc}")
-    prefix_parts.append(f"Action and Scene: {action_prompt}")
+    prefix_parts.append("Educational wide shot composition.")
+    prefix_parts.append("The main teaching object or educational action should be the visual focus.")
+    prefix_parts.append("If the recurring hosts appear, keep them as small supporting figures near the left and right edges.")
+    prefix_parts.append("Avoid portrait framing, centered character posters, close facial emphasis, direct eye contact to camera, and large front-facing faces.")
+    prefix_parts.append("Prefer medium-long shot, side angle, three-quarter view, or over-the-shoulder staging.")
+    prefix_parts.append("Preserve host identity through hairstyle, glasses, outfit, silhouette, and left/right placement rather than close facial detail.")
+    if john_identity:
+        prefix_parts.append(f"John design reference: {john_identity}.")
+    if mary_identity:
+        prefix_parts.append(f"Mary design reference: {mary_identity}.")
+        if "pigtail" in mary_identity.lower():
+            prefix_parts.append("Keep Mary's long blonde pigtails clearly visible whenever she appears.")
+    if "messy brown hair" in john_identity.lower():
+        prefix_parts.append("Keep John's messy brown hair clearly readable whenever he appears.")
+    prefix_parts.append(f"Scene content: {action_prompt}")
     return " ".join(prefix_parts).strip() + " aspect ratio 16:9, cinematic wide shot"
 
 

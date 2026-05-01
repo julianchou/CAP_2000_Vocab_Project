@@ -1,0 +1,106 @@
+substeps:
+  - no: "1.1"
+    key: "oauth_center"
+    name: "多頻道 OAuth 授權中心"
+    rule: any
+    outputs:
+      - pattern: "youtube_ai.db"
+        nonempty: true
+      - pattern: "config/channels.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/youtube_ai_sync_channels.py
+      args: []
+
+  - no: "1.2"
+    key: "daily_etl"
+    name: "自動化指標抓取 Daily ETL"
+    rule: any
+    outputs:
+      - pattern: "etl_runs/*.json"
+
+  - no: "1.3"
+    key: "metadata_store"
+    name: "素材元數據存儲"
+    rule: any
+    outputs:
+      - pattern: "metadata_snapshots/*.json"
+
+  - no: "1.4"
+    key: "history_cache"
+    name: "數據庫歷史緩存"
+    rule: any
+    outputs:
+      - pattern: "youtube_ai.db"
+        nonempty: true
+
+  - no: "2.1"
+    key: "anomaly_diagnostics"
+    name: "異常表現診斷引擎"
+    rule: any
+    outputs:
+      - pattern: "insights/anomaly_*.json"
+
+  - no: "2.2"
+    key: "ctr_optimization"
+    name: "視覺與文案優化建議"
+    rule: any
+    outputs:
+      - pattern: "insights/ctr_*.json"
+
+  - no: "2.3"
+    key: "seo_enhancement"
+    name: "SEO 自動化增強"
+    rule: any
+    outputs:
+      - pattern: "insights/seo_*.json"
+
+  - no: "2.4"
+    key: "sentiment_faq"
+    name: "觀眾情緒與需求分析"
+    rule: any
+    outputs:
+      - pattern: "insights/comments_*.json"
+
+  - no: "3.1"
+    key: "task_sync"
+    name: "跨平台任務同步"
+    rule: any
+    outputs:
+      - pattern: "tasks/*.json"
+
+  - no: "3.2"
+    key: "posting_time_optimizer"
+    name: "發布時機預測"
+    rule: any
+    outputs:
+      - pattern: "insights/posting_time_*.json"
+
+  - no: "3.3"
+    key: "action_logging"
+    name: "修改紀錄存儲"
+    rule: any
+    outputs:
+      - pattern: "action_logs/*.json"
+
+  - no: "4.1"
+    key: "daily_briefing"
+    name: "每日 AI 戰報推播"
+    rule: any
+    outputs:
+      - pattern: "briefings/*.json"
+
+  - no: "4.2"
+    key: "performance_tracking"
+    name: "A/B Testing 成效追蹤"
+    rule: any
+    outputs:
+      - pattern: "experiments/*.json"
+
+  - no: "4.3"
+    key: "memory_store"
+    name: "策略對話存儲"
+    rule: any
+    outputs:
+      - pattern: "memory/*.json"

@@ -2,17 +2,25 @@
 import csv
 import argparse
 import traceback
+import tempfile
+import sys
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from PIL import Image
+from app_utils.asset_tags import tag_asset_from_row
 
 load_dotenv()
 client = genai.Client()
 
 # --- 目錄設定 ---
-base_dir = Path(__file__).parent.parent
+base_dir = BASE_DIR
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
 def next_variant_path(base_path: Path) -> Path:
@@ -29,6 +37,25 @@ def next_variant_path(base_path: Path) -> Path:
         next_no = len(variants) + 2
     return base_path.parent / f"{stem}__v{next_no:02d}{suffix}"
 
+def save_png_atomic(image: Image.Image, target_path: Path):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path_str = tempfile.mkstemp(
+        prefix=f"{target_path.stem}__",
+        suffix=target_path.suffix,
+        dir=str(target_path.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+    try:
+        image.save(temp_path, "PNG")
+        temp_path.replace(target_path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
 def process_image_standard(img_path):
     """
     ⚡ 關鍵新增：強制圖片標準化
@@ -44,7 +71,7 @@ def process_image_standard(img_path):
                 print(f"🔧 修正尺寸：{img_path.name} ({img.size} -> 1920x1080)")
                 img = img.resize((1920, 1080), Image.Resampling.LANCZOS)
             
-            img.save(img_path, "PNG")
+            save_png_atomic(img, img_path)
     except Exception as e:
         print(f"🚨 無法標準化圖片 {img_path.name}: {e}")
 
@@ -62,6 +89,7 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
             if custom_img.exists():
                 print(f"📁 [Flashcard] 使用自訂圖卡: {custom_img.name}")
                 process_image_standard(custom_img)
+                tag_asset_from_row(custom_img, row, asset_kind="image", overwrite=False)
                 return custom_img
         word = row.get("flashcard_word", "").strip()
         img_path = flashcards_folder / f"{word}.png"
@@ -69,10 +97,11 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
             print(f"⚠️ 警告：找不到單字圖卡 {word}.png")
             fallback_img = Image.new('RGB', (1920, 1080), color=(44, 62, 80))
             img_path.parent.mkdir(parents=True, exist_ok=True)
-            fallback_img.save(img_path)
+            save_png_atomic(fallback_img, img_path)
         else:
             print(f"📁 [Flashcard] 使用並標準化圖卡: {word}.png")
             process_image_standard(img_path)
+        tag_asset_from_row(img_path, row, asset_kind="image", overwrite=False)
         return img_path
 
     start_t = str(row["start_time"]).strip()
@@ -85,6 +114,7 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
     if base_img_path.exists() and not force_ai_regenerate:
         print(f"⏭️ {img_name} 已存在，重新標準化以確保安全。")
         process_image_standard(base_img_path)
+        tag_asset_from_row(base_img_path, row, asset_kind="image", overwrite=False)
         return base_img_path
 
     try:
@@ -97,14 +127,31 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
                 aspect_ratio="16:9"
             )
         )
-        result.generated_images[0].image.save(img_path)
-        process_image_standard(img_path)
+        generated_image = result.generated_images[0].image
+        fd, temp_path_str = tempfile.mkstemp(
+            prefix=f"{img_path.stem}__",
+            suffix=img_path.suffix,
+            dir=str(img_path.parent),
+        )
+        os.close(fd)
+        temp_path = Path(temp_path_str)
+        try:
+            generated_image.save(temp_path)
+            process_image_standard(temp_path)
+            temp_path.replace(img_path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
         print(f"✅ {img_path.name} 產圖成功且標準化！")
     except Exception as e:
         print(f"🚨 {img_path.name} 生成失敗: {e}")
         fallback_img = Image.new('RGB', (1920, 1080), color=(44, 62, 80))
-        fallback_img.save(img_path)
+        save_png_atomic(fallback_img, img_path)
 
+    tag_asset_from_row(img_path, row, asset_kind="image", overwrite=True)
     return img_path
 
 def generate_preview(ep_num, scene_id: int | None = None):
@@ -137,10 +184,10 @@ def generate_preview(ep_num, scene_id: int | None = None):
         target_row = next((row for row in rows if str(row.get("scene_id", "")).strip() == str(scene_id)), None)
         if not target_row:
             print(f"❌ 找不到 scene_id={scene_id}")
-            return
+            return None
         img_path = generate_scene_image(target_folder, target_row, force_ai_regenerate=True)
         print(f"✅ Scene {scene_id} 已完成單獨產圖：{img_path}")
-        return
+        return img_path
 
     cumulative_time = 0.0
 
@@ -169,6 +216,7 @@ def generate_preview(ep_num, scene_id: int | None = None):
             f.write("\n".join(inputs_list))
             f.write(f"\n{inputs_list[-1].splitlines()[0]}")
         print(f"✅ 第 {ep_num:02d} 集 inputs.txt 更新完成！")
+    return inputs_txt_path if inputs_list else None
 
 def main():
     parser = argparse.ArgumentParser(description="產生匹配的圖片與 FFmpeg inputs.txt")

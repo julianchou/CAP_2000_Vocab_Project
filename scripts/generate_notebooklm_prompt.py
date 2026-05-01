@@ -11,6 +11,17 @@ from episode_range_utils import resolve_episode_range
 base_dir = Path(__file__).resolve().parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 
+def detect_profile_id() -> str:
+    profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
+    if profile_id:
+        return profile_id
+    if workspace_dir.parent.name == "workspaces" and workspace_dir.name:
+        return workspace_dir.name
+    return "default"
+
+def shared_prompt_path() -> Path:
+    return base_dir / "config" / detect_profile_id() / "prompts" / "notebooklm_prompt_template.txt"
+
 DEFAULT_PROMPT_TEMPLATE = """【節目設定】
 這是一集《會考英文隨身聽》節目，主題是國中會考英文 2000 單字教學。
 集數：第 {{EPISODE}} 集
@@ -37,13 +48,14 @@ DEFAULT_PROMPT_TEMPLATE = """【節目設定】
 """
 
 
-def prompt_template_path_for(target_folder: Path) -> Path:
-    return target_folder / "notebooklm_prompt_template.txt"
+def prompt_template_path_for(_target_folder: Path) -> Path:
+    return shared_prompt_path()
 
 
 def ensure_prompt_template(target_folder: Path) -> Path:
     prompt_path = prompt_template_path_for(target_folder)
     if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(DEFAULT_PROMPT_TEMPLATE, encoding="utf-8")
     return prompt_path
 

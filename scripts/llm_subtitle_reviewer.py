@@ -1,6 +1,8 @@
 import argparse
+from datetime import timedelta
 import os
 from pathlib import Path
+import re
 
 import srt
 from dotenv import load_dotenv
@@ -15,6 +17,17 @@ client = genai.Client()
 base_dir = Path(__file__).resolve().parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 MODEL_NAME = "gemini-2.5-pro"
+
+def detect_profile_id() -> str:
+    profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
+    if profile_id:
+        return profile_id
+    if workspace_dir.parent.name == "workspaces" and workspace_dir.name:
+        return workspace_dir.name
+    return "default"
+
+def shared_prompt_path() -> Path:
+    return base_dir / "config" / detect_profile_id() / "prompts" / "subtitle_review_prompt.txt"
 
 DEFAULT_PROMPT_TEMPLATE = """你是一位專業的影片字幕校對專家。請針對以下 SRT 內容進行修正，並務必遵守下列規則：
 
@@ -45,8 +58,8 @@ DEFAULT_PROMPT_TEMPLATE = """你是一位專業的影片字幕校對專家。請
 """
 
 
-def prompt_template_path_for(target_folder: Path) -> Path:
-    return target_folder / "02_subtitles" / "subtitle_review_prompt.txt"
+def prompt_template_path_for(_target_folder: Path) -> Path:
+    return shared_prompt_path()
 
 
 def ensure_prompt_template(target_folder: Path) -> Path:
@@ -109,6 +122,108 @@ def validate_cleaned_srt(raw_srt_content: str, cleaned_srt: str) -> tuple[bool, 
     return True, "ok"
 
 
+TIMECODE_RE = re.compile(r"(?P<hours>\d{2}):(?P<minutes>\d{2}):(?P<seconds>\d{2}),(?P<millis>\d{3})")
+
+
+def repair_short_video_hour_rollover(raw_srt_content: str, cleaned_srt: str) -> tuple[str, str | None]:
+    """Repair LLM outputs that misrender 00:10:xx as 01:00:xx for short videos."""
+    try:
+        raw_items = parse_srt_or_raise(raw_srt_content)
+    except Exception:
+        return cleaned_srt, None
+
+    raw_last_end = raw_items[-1].end.total_seconds()
+    if raw_last_end >= 3600:
+        return cleaned_srt, None
+
+    replacements = 0
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal replacements
+        hours = int(match.group("hours"))
+        minutes = int(match.group("minutes"))
+        seconds = int(match.group("seconds"))
+        millis = int(match.group("millis"))
+        if hours == 0 or minutes >= 10:
+            return match.group(0)
+
+        repaired_minutes = hours * 10 + minutes
+        if repaired_minutes >= 60:
+            return match.group(0)
+
+        replacements += 1
+        return f"00:{repaired_minutes:02d}:{seconds:02d},{millis:03d}"
+
+    repaired_srt = TIMECODE_RE.sub(repl, cleaned_srt)
+    if replacements == 0:
+        return cleaned_srt, None
+
+    return repaired_srt, f"repaired {replacements} timestamp(s) with short-video rollover normalization"
+
+
+def repair_non_positive_durations(raw_srt_content: str, cleaned_srt: str) -> tuple[str, str | None]:
+    """Repair cues whose start time is at or after their end time."""
+    try:
+        cleaned_items = parse_srt_or_raise(cleaned_srt)
+    except Exception:
+        return cleaned_srt, None
+
+    repairs = 0
+    for item in cleaned_items:
+        if item.end > item.start:
+            continue
+
+        drift_seconds = item.start.total_seconds() - item.end.total_seconds()
+        minute_steps = max(int(drift_seconds // 60) + 1, 1)
+        candidate_start = item.start - timedelta(minutes=minute_steps)
+        if candidate_start < timedelta(0) or candidate_start >= item.end:
+            return cleaned_srt, None
+
+        item.start = candidate_start
+        repairs += 1
+
+    if repairs == 0:
+        return cleaned_srt, None
+
+    repaired_srt = srt.compose(cleaned_items)
+    return repaired_srt, f"repaired {repairs} non-positive subtitle duration(s)"
+
+
+def repair_timeline_overlaps(raw_srt_content: str, cleaned_srt: str) -> tuple[str, str | None]:
+    """Repair overlapping subtitle cues without altering the subtitle text."""
+    try:
+        cleaned_items = parse_srt_or_raise(cleaned_srt)
+    except Exception:
+        return cleaned_srt, None
+
+    repairs = 0
+    for previous_item, current_item in zip(cleaned_items, cleaned_items[1:]):
+        if current_item.start >= previous_item.end:
+            continue
+
+        if current_item.start > previous_item.start:
+            previous_item.end = current_item.start
+            repairs += 1
+            continue
+
+        if current_item.end > previous_item.end:
+            current_item.start = previous_item.end
+            repairs += 1
+            continue
+
+        return cleaned_srt, None
+
+    for item in cleaned_items:
+        if item.end <= item.start:
+            item.end = item.start + timedelta(milliseconds=20)
+
+    if repairs == 0:
+        return cleaned_srt, None
+
+    repaired_srt = srt.compose(cleaned_items)
+    return repaired_srt, f"repaired {repairs} overlapping timestamp boundary/boundaries"
+
+
 def review_subtitles_with_llm(ep_num: int):
     target_folder, _start_word, _end_word = resolve_episode_range(workspace_dir, ep_num)
     input_srt = target_folder / "02_subtitles" / "notebooklm_audio.srt"
@@ -130,12 +245,34 @@ def review_subtitles_with_llm(ep_num: int):
         cleaned_srt = response.text.replace("```srt", "").replace("```", "").strip()
         ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
         if not ok:
+            repaired_srt, repair_note = repair_short_video_hour_rollover(raw_srt_content, cleaned_srt)
+            if repair_note:
+                cleaned_srt = repaired_srt
+                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+                if ok:
+                    message = f"ok ({repair_note})"
+        if not ok:
+            repaired_srt, repair_note = repair_non_positive_durations(raw_srt_content, cleaned_srt)
+            if repair_note:
+                cleaned_srt = repaired_srt
+                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+                if ok:
+                    message = f"ok ({repair_note})"
+        if not ok:
+            repaired_srt, repair_note = repair_timeline_overlaps(raw_srt_content, cleaned_srt)
+            if repair_note:
+                cleaned_srt = repaired_srt
+                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+                if ok:
+                    message = f"ok ({repair_note})"
+        if not ok:
             rejected_path = output_srt.with_suffix(".rejected.srt")
             rejected_path.write_text(cleaned_srt, encoding="utf-8")
             raise ValueError(
                 f"AI subtitle output rejected: {message}. rejected copy saved to {rejected_path}"
             )
         output_srt.write_text(cleaned_srt, encoding="utf-8")
+        print(f"Subtitle review validation: {message}")
         print(f"Subtitle review completed: {output_srt}")
     except Exception as e:
         print(f"Error: {e}")
