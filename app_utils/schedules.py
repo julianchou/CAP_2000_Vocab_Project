@@ -151,6 +151,54 @@ def _is_pid_running(pid: int) -> bool:
         return False
 
 
+def _kill_pid_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            encoding=locale.getpreferredencoding(False) or "utf-8",
+            errors="ignore",
+            check=False,
+        )
+        return
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
+def _unregister_schedule_task(root: Path, task_name: str) -> None:
+    task_name = str(task_name or "").strip()
+    if not task_name:
+        return
+    unregister_script = (root / "scripts" / "unregister_schedule_task.ps1").resolve()
+    try:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(unregister_script),
+                "-TaskName",
+                task_name,
+            ],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding=locale.getpreferredencoding(False) or "utf-8",
+            errors="ignore",
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def get_schedule_job_state(root: Path, profile_id: str, job_id: str) -> Dict:
     log_path = schedule_job_log_path(root, profile_id, job_id)
     proc_meta_path = _proc_meta_path(log_path)
@@ -216,6 +264,75 @@ def get_schedule_job_state(root: Path, profile_id: str, job_id: str) -> Dict:
         except FileNotFoundError:
             pass
     return state
+
+
+def stop_schedule_job(root: Path, profile_id: str, job_id: str) -> Dict:
+    job = read_schedule_job(root, profile_id, job_id)
+    state = get_schedule_job_state(root, profile_id, job_id)
+    if not job:
+        return {"ok": False, "message": "schedule job not found"}
+
+    if not state.get("running"):
+        update_schedule_job(
+            root,
+            profile_id,
+            job_id,
+            {
+                "status": "stopped",
+                "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                "current_episode": None,
+                "last_message": "stopped",
+            },
+        )
+        _unregister_schedule_task(root, str(job.get("task_name", "")))
+        return {"ok": True, "stopped": False, "message": "job was not running"}
+
+    pid = int(state.get("pid") or 0)
+    if pid > 0:
+        _kill_pid_tree(pid)
+
+    _unregister_schedule_task(root, str(job.get("task_name", "")))
+
+    log_path = schedule_job_log_path(root, profile_id, job_id)
+    ended_at = int(time.time())
+    last_meta = {
+        "pid": pid,
+        "started_at": state.get("started_at"),
+        "ended_at": ended_at,
+        "step_name": state.get("step_name") or f"schedule:{job_id}",
+    }
+    try:
+        _proc_last_meta_path(log_path).write_text(
+            json.dumps(last_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    try:
+        _proc_meta_path(log_path).unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"\n==== STOP schedule:{job_id} | {last_meta['step_name']} | "
+                f"{_ts_label(ended_at)} ====: interrupted by user\n"
+            )
+    except Exception:
+        pass
+
+    update_schedule_job(
+        root,
+        profile_id,
+        job_id,
+        {
+            "status": "stopped",
+            "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ended_at)),
+            "current_episode": None,
+            "last_message": "stopped by user",
+        },
+    )
+    return {"ok": True, "stopped": True, "message": "stopped", "pid": pid}
 
 
 def start_schedule_job(
@@ -436,31 +553,7 @@ def delete_schedule_job(root: Path, profile_id: str, job_id: str) -> Dict:
         except Exception:
             pass
 
-    task_name = str(job.get("task_name", "")).strip()
-    if task_name:
-        unregister_script = (root / "scripts" / "unregister_schedule_task.ps1").resolve()
-        try:
-            subprocess.run(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(unregister_script),
-                    "-TaskName",
-                    task_name,
-                ],
-                cwd=str(root),
-                capture_output=True,
-                text=True,
-                encoding=locale.getpreferredencoding(False) or "utf-8",
-                errors="ignore",
-                check=False,
-            )
-        except Exception:
-            pass
+    _unregister_schedule_task(root, str(job.get("task_name", "")))
 
     log_path = schedule_job_log_path(root, profile_id, job_id)
     targets = [

@@ -1,14 +1,21 @@
 ﻿import os
 import csv
+import json
 import argparse
 import traceback
 import tempfile
 import sys
+import re
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 from google import genai
 from google.genai import types
@@ -18,10 +25,109 @@ from app_utils.asset_tags import tag_asset_from_row
 
 load_dotenv()
 client = genai.Client()
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".m4v"}
 
 # --- 目錄設定 ---
 base_dir = BASE_DIR
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
+
+def episode_search_roots() -> list[Path]:
+    roots = [workspace_dir, base_dir / "workspaces" / "story", base_dir / "workspaces" / "vocab", base_dir / "workspace"]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root.resolve())
+        if key not in seen:
+            out.append(root)
+            seen.add(key)
+    return out
+
+def find_episode_folder(ep_num: int) -> Path | None:
+    for root in episode_search_roots():
+        target = next(root.glob(f"Ep{ep_num:02d}_*"), None) if root.exists() else None
+        if target:
+            return target
+    return None
+
+def storyboard_csv_for_episode(target_folder: Path) -> Path:
+    story_path = target_folder / "05_storyboards" / "storyboard.csv"
+    if story_path.exists():
+        return story_path
+    return target_folder / "03_storyboards" / "storyboard.csv"
+
+def image_dirs_for_episode(target_folder: Path, storyboard_csv: Path) -> tuple[Path, Path, Path]:
+    if "05_storyboards" in storyboard_csv.parts:
+        root = target_folder / "05_storyboards" / "images"
+        return root / "ai_generated", root / "flashcards", target_folder / "05_storyboards" / "ffmpeg"
+    return (
+        target_folder / "04_images" / "ai_generated",
+        target_folder / "04_images" / "flashcards",
+        target_folder / "05_output",
+    )
+
+def split_names(value: str) -> list[str]:
+    names: list[str] = []
+    for part in re.split(r"[,，、/|]+", str(value or "")):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+def load_character_profiles(target_folder: Path) -> dict[str, dict]:
+    path = target_folder / "03_characters_scenes" / "characters.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    profiles: dict[str, dict] = {}
+    for item in data.get("characters") or []:
+        name = str(item.get("name", "")).strip()
+        if name:
+            profiles[name] = item
+    return profiles
+
+def character_reference_prompt(target_folder: Path, row: dict) -> str:
+    profiles = load_character_profiles(target_folder)
+    if not profiles:
+        return ""
+    row_text = " ".join(
+        str(row.get(key, "") or "")
+        for key in ["characters", "image_prompt", "summary", "reason", "subtitle_reference"]
+    )
+    names = split_names(str(row.get("characters", "")))
+    for name in profiles:
+        if name in row_text and name not in names:
+            names.append(name)
+    refs: list[str] = []
+    for name in names:
+        profile = profiles.get(name)
+        if not profile:
+            continue
+        visual = profile.get("visual_design") or {}
+        image_generation = profile.get("image_generation") or {}
+        palette = ", ".join(visual.get("color_palette") or [])
+        tags = ", ".join(visual.get("consistency_tags") or [])
+        parts = [
+            f"{name} must keep the same design in every scene",
+            str(image_generation.get("prompt_en", "")).strip(),
+            f"fixed color palette: {palette}" if palette else "",
+            f"fixed consistency tags: {tags}" if tags else "",
+            f"fixed default expression: {visual.get('default_expression', '')}" if visual.get("default_expression") else "",
+            f"fixed costume/features: {visual.get('costume_or_features', '')}" if visual.get("costume_or_features") else "",
+        ]
+        ref = ". ".join(part for part in parts if part)
+        if ref:
+            refs.append(ref)
+    if not refs:
+        return ""
+    return (
+        "Character consistency reference from No.3.1 characters.json. This reference has higher priority than the scene action: "
+        + " ".join(refs)
+        + " Do not redesign these characters between scenes; keep face shape, body shape, colors, costume/features, and overall style identical. Scene action prompt: "
+    )
 
 def next_variant_path(base_path: Path) -> Path:
     stem = base_path.stem
@@ -75,12 +181,43 @@ def process_image_standard(img_path):
     except Exception as e:
         print(f"🚨 無法標準化圖片 {img_path.name}: {e}")
 
-def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bool = False):
-    ai_images_folder = target_folder / "04_images" / "ai_generated"
-    flashcards_folder = target_folder / "04_images" / "flashcards"
+def resolve_scene_asset(target_folder: Path, value: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = target_folder / path
+    return path if path.exists() and path.is_file() and path.stat().st_size > 0 else None
+
+def existing_assigned_visual(target_folder: Path, row: dict) -> tuple[Path | None, str]:
+    for key in ["animation_video_path", "animation_asset"]:
+        path = resolve_scene_asset(target_folder, row.get(key, ""))
+        if path and path.suffix.lower() in VIDEO_SUFFIXES:
+            return path, key
+    for key in ["custom_image_path", "asset", "image_asset"]:
+        path = resolve_scene_asset(target_folder, row.get(key, ""))
+        if path and path.suffix.lower() in IMAGE_SUFFIXES:
+            return path, key
+    return None, ""
+
+def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bool = False, storyboard_csv: Path | None = None):
+    storyboard_csv = storyboard_csv or storyboard_csv_for_episode(target_folder)
+    ai_images_folder, flashcards_folder, _output_folder = image_dirs_for_episode(target_folder, storyboard_csv)
     ai_images_folder.mkdir(parents=True, exist_ok=True)
 
     source_type = row.get("source_type", "AI").strip().lower()
+
+    if not force_ai_regenerate:
+        assigned_visual, assigned_key = existing_assigned_visual(target_folder, row)
+        if assigned_visual:
+            print(f"⏭️ Scene {row.get('scene_id', '')} 已指定素材 ({assigned_key})，略過 AI 產圖：{assigned_visual}")
+            if assigned_visual.suffix.lower() in IMAGE_SUFFIXES:
+                process_image_standard(assigned_visual)
+                tag_asset_from_row(assigned_visual, row, asset_kind="image", overwrite=False)
+            elif assigned_visual.suffix.lower() in VIDEO_SUFFIXES:
+                tag_asset_from_row(assigned_visual, row, asset_kind="animation", overwrite=False)
+            return assigned_visual
 
     if source_type == "flashcard":
         custom_image_path = row.get("custom_image_path", "").strip()
@@ -110,6 +247,9 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
     img_path = next_variant_path(base_img_path) if force_ai_regenerate else base_img_path
     raw_prompt = row.get("image_prompt", "").strip()
     prompt_text = raw_prompt if raw_prompt else "A clean educational background, soft blue and white gradient, 16:9"
+    character_ref = character_reference_prompt(target_folder, row)
+    if character_ref:
+        prompt_text = character_ref + prompt_text.strip()
 
     if base_img_path.exists() and not force_ai_regenerate:
         print(f"⏭️ {img_name} 已存在，重新標準化以確保安全。")
@@ -154,18 +294,36 @@ def generate_scene_image(target_folder: Path, row: dict, force_ai_regenerate: bo
     tag_asset_from_row(img_path, row, asset_kind="image", overwrite=True)
     return img_path
 
+def set_scene_image_default(storyboard_csv: Path, scene_id: int | str, image_path: Path) -> None:
+    with storyboard_csv.open(mode="r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+    for col in ["custom_image_path"]:
+        if col not in fieldnames:
+            fieldnames.append(col)
+    target_path = str(image_path).replace("\\", "/")
+    changed = False
+    for row in rows:
+        if str(row.get("scene_id", "")).strip() == str(scene_id):
+            row["custom_image_path"] = target_path
+            changed = True
+    if changed:
+        with storyboard_csv.open(mode="w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
 def generate_preview(ep_num, scene_id: int | None = None):
     print(f"\n🎞️ [Stage 5] 正在處理第 {ep_num:02d} 集的分鏡配圖與 FFmpeg 列表...")
     
-    target_folder = next(workspace_dir.glob(f"Ep{ep_num:02d}_*"), None)
+    target_folder = find_episode_folder(ep_num)
     if not target_folder:
         print(f"❌ 找不到第 {ep_num:02d} 集的資料夾。")
         return
 
-    storyboard_csv = target_folder / "03_storyboards" / "storyboard.csv"
-    ai_images_folder = target_folder / "04_images" / "ai_generated"
-    flashcards_folder = target_folder / "04_images" / "flashcards"
-    output_folder = target_folder / "05_output"
+    storyboard_csv = storyboard_csv_for_episode(target_folder)
+    ai_images_folder, _flashcards_folder, output_folder = image_dirs_for_episode(target_folder, storyboard_csv)
 
     if not storyboard_csv.exists():
         print(f"❌ 找不到分鏡表：{storyboard_csv}")
@@ -185,7 +343,8 @@ def generate_preview(ep_num, scene_id: int | None = None):
         if not target_row:
             print(f"❌ 找不到 scene_id={scene_id}")
             return None
-        img_path = generate_scene_image(target_folder, target_row, force_ai_regenerate=True)
+        img_path = generate_scene_image(target_folder, target_row, force_ai_regenerate=True, storyboard_csv=storyboard_csv)
+        set_scene_image_default(storyboard_csv, scene_id, img_path)
         print(f"✅ Scene {scene_id} 已完成單獨產圖：{img_path}")
         return img_path
 
@@ -201,7 +360,7 @@ def generate_preview(ep_num, scene_id: int | None = None):
             duration = end_time - cumulative_time
             if duration <= 0: duration = 2.0
 
-        img_path = generate_scene_image(target_folder, row, force_ai_regenerate=False)
+        img_path = generate_scene_image(target_folder, row, force_ai_regenerate=False, storyboard_csv=storyboard_csv)
 
         # 3. 寫入 FFmpeg inputs 列表
         rel_img_path = os.path.relpath(img_path, output_folder)

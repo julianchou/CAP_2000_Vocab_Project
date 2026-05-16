@@ -11,7 +11,7 @@ substeps:
     run:
       type: python
       script: scripts/generate_vocab_content.py
-      args: ["--ep", "{ep}"]
+      args: ["--ep", "{ep}", "--provider", "auto"]
 
   - no: "4"
     key: "step04_flashcards"
@@ -36,7 +36,7 @@ substeps:
     run:
       type: python
       script: scripts/generate_cloze_quiz.py
-      args: ["--ep", "{ep}"]
+      args: ["--ep", "{ep}", "--provider", "auto"]
 
   - no: "6"
     key: "step06_cloze_flashcards"
@@ -83,8 +83,8 @@ substeps:
       - pattern: "00_logs/step9_manual_done.txt"
 
   - no: "10"
-    key: "step10_audio_download"
-    name: "下載語音音訊"
+    key: "step10_audio_upload"
+    name: "上傳語音音訊"
     rule: any
     outputs:
       - pattern: "01_audio/notebooklm_audio.m4a"
@@ -126,7 +126,7 @@ substeps:
     run:
       type: python
       script: scripts/llm_subtitle_reviewer.py
-      args: ["--ep", "{ep}"]
+      args: ["--ep", "{ep}", "--provider", "openai"]
 
   - no: "13"
     key: "step13_subtitles_manual"
@@ -147,7 +147,7 @@ substeps:
     run:
       type: python
       script: scripts/llm_director.py
-      args: ["--ep", "{ep}"]
+      args: ["--ep", "{ep}", "--provider", "openai"]
 
   - no: "15"
     key: "step15_storyboard_manual"

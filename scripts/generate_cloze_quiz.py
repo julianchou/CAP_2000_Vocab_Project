@@ -11,15 +11,79 @@ from google import genai
 from google.genai import types
 
 from episode_range_utils import resolve_episode_range
+from llm_provider_utils import DEFAULT_NVIDIA_TEXT_MODEL, nvidia_chat_response
 
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options={"api_version": "v1beta"})
 MODEL_ID = os.getenv("CAP_CLOZE_MODEL", "gemini-2.5-flash")
 REVIEW_MODEL_ID = os.getenv("CAP_CLOZE_REVIEW_MODEL", "gemini-2.5-flash")
+OPENAI_MODEL_ID = os.getenv("CAP_CLOZE_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
+OPENAI_REVIEW_MODEL_ID = os.getenv("CAP_CLOZE_OPENAI_REVIEW_MODEL", OPENAI_MODEL_ID)
+NVIDIA_MODEL_ID = os.getenv("CAP_CLOZE_NVIDIA_MODEL", DEFAULT_NVIDIA_TEXT_MODEL)
+VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
 base_dir = Path(__file__).resolve().parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 OPTION_LABELS = ["A", "B", "C", "D"]
+
+
+def normalize_provider(value: str | None) -> str:
+    provider = str(value or os.getenv("CAP_CLOZE_LLM_PROVIDER") or "auto").strip().lower()
+    return provider if provider in VALID_PROVIDERS else "auto"
+
+
+def is_gemini_quota_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "spending cap" in text.lower() or "quota" in text.lower()
+
+
+def strip_json_fence(text: str) -> str:
+    text = str(text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def extract_json_text(text: str) -> str:
+    text = strip_json_fence(text)
+    if not text:
+        return text
+    if text[0] in "[{":
+        return text
+    match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def openai_json_response(prompt: str, model: str) -> str:
+    from openai import OpenAI
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    response = OpenAI().responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": "Return strict JSON only. Do not include Markdown fences or explanations outside JSON.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.output_text
+
+
+def nvidia_json_response(prompt: str, model: str) -> str:
+    return nvidia_chat_response(
+        prompt,
+        model=model,
+        system_prompt="Return strict JSON only. Do not include Markdown fences or explanations outside JSON.",
+        temperature=0.2,
+    )
 
 
 def detect_profile_id() -> str:
@@ -269,7 +333,7 @@ def render_prompt(template_text: str, ep_num: int, start_word: int, end_word: in
 
 
 def parse_ai_questions(text: str) -> list[dict]:
-    payload = json.loads(text)
+    payload = json.loads(extract_json_text(text))
     if isinstance(payload, dict):
         questions = payload.get("questions")
         if isinstance(questions, list):
@@ -279,7 +343,7 @@ def parse_ai_questions(text: str) -> list[dict]:
     raise ValueError("AI 回傳的 JSON 格式不正確，預期為陣列或含 questions 的物件。")
 
 
-def generate_questions_with_ai(rendered_prompt: str) -> list[dict]:
+def generate_questions_with_gemini(rendered_prompt: str) -> list[dict]:
     response = client.models.generate_content(
         model=MODEL_ID,
         contents=rendered_prompt,
@@ -289,6 +353,50 @@ def generate_questions_with_ai(rendered_prompt: str) -> list[dict]:
         ),
     )
     return parse_ai_questions(response.text)
+
+
+def generate_questions_with_openai(rendered_prompt: str) -> list[dict]:
+    return parse_ai_questions(openai_json_response(rendered_prompt, OPENAI_MODEL_ID))
+
+
+def generate_questions_with_nvidia(rendered_prompt: str) -> list[dict]:
+    return parse_ai_questions(nvidia_json_response(rendered_prompt, NVIDIA_MODEL_ID))
+
+
+def generate_questions_with_ai(rendered_prompt: str, provider: str) -> list[dict]:
+    provider = normalize_provider(provider)
+    errors = []
+    if provider in {"auto", "gemini"}:
+        try:
+            questions = generate_questions_with_gemini(rendered_prompt)
+            print(f"cloze_provider=gemini model={MODEL_ID} questions={len(questions)}")
+            return questions
+        except Exception as exc:
+            message = str(exc)
+            errors.append(f"Gemini: {message}")
+            if provider == "gemini":
+                raise
+            if is_gemini_quota_error(exc):
+                print("WARN Gemini quota/spending cap exhausted; switching cloze generation to OpenAI.", flush=True)
+            else:
+                print(f"WARN Gemini cloze generation failed; switching to OpenAI: {message}", flush=True)
+    if provider in {"auto", "openai"}:
+        try:
+            questions = generate_questions_with_openai(rendered_prompt)
+            print(f"cloze_provider=openai model={OPENAI_MODEL_ID} questions={len(questions)}")
+            return questions
+        except Exception as exc:
+            errors.append(f"OpenAI: {exc}")
+            print(f"ERROR OpenAI cloze generation failed: {exc}", flush=True)
+    if provider == "nvidia":
+        try:
+            questions = generate_questions_with_nvidia(rendered_prompt)
+            print(f"cloze_provider=nvidia model={NVIDIA_MODEL_ID} questions={len(questions)}")
+            return questions
+        except Exception as exc:
+            errors.append(f"NVIDIA: {exc}")
+            print(f"ERROR NVIDIA cloze generation failed: {exc}", flush=True)
+    raise RuntimeError("AI cloze generation failed: " + " | ".join(errors))
 
 
 def build_uniqueness_review_request(raw_item: dict, row: pd.Series) -> str:
@@ -332,49 +440,92 @@ Question info:
 """.strip()
 
 
-def review_question_uniqueness(raw_item: dict, row: pd.Series) -> dict:
+def parse_uniqueness_review_payload(text: str, correct_option: str) -> dict | None:
+    payload = json.loads(extract_json_text(text))
+    if not isinstance(payload, dict):
+        return None
+    verdict = str(payload.get("verdict", "")).strip().lower()
+    if verdict not in {"unique", "ambiguous", "invalid"}:
+        return None
+    plausible = payload.get("plausible_options") or []
+    plausible_labels = []
+    if isinstance(plausible, list):
+        plausible_labels = [
+            str(item).strip().upper()
+            for item in plausible
+            if str(item).strip().upper() in OPTION_LABELS
+        ]
+    if verdict == "unique" and plausible_labels != [correct_option]:
+        verdict = "ambiguous"
+    return {
+        "verdict": verdict,
+        "plausible_options": plausible_labels,
+        "reason": str(payload.get("reason", "")).strip() or "review_result",
+        "notes": str(payload.get("notes", "")).strip(),
+    }
+
+
+def review_question_uniqueness_with_gemini(raw_item: dict, row: pd.Series, correct_option: str) -> dict | None:
+    response = client.models.generate_content(
+        model=REVIEW_MODEL_ID,
+        contents=build_uniqueness_review_request(raw_item, row),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
+    return parse_uniqueness_review_payload((getattr(response, "text", "") or "").strip(), correct_option)
+
+
+def review_question_uniqueness_with_openai(raw_item: dict, row: pd.Series, correct_option: str) -> dict | None:
+    return parse_uniqueness_review_payload(
+        openai_json_response(build_uniqueness_review_request(raw_item, row), OPENAI_REVIEW_MODEL_ID),
+        correct_option,
+    )
+
+
+def review_question_uniqueness(raw_item: dict, row: pd.Series, provider: str) -> dict:
     correct_option = str(raw_item.get("correct_option", "")).strip().upper()
-    try:
-        response = client.models.generate_content(
-            model=REVIEW_MODEL_ID,
-            contents=build_uniqueness_review_request(raw_item, row),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0,
-            ),
-        )
-        payload = json.loads((getattr(response, "text", "") or "").strip())
-        if isinstance(payload, dict):
-            verdict = str(payload.get("verdict", "")).strip().lower()
-            if verdict in {"unique", "ambiguous", "invalid"}:
-                plausible = payload.get("plausible_options") or []
-                plausible_labels = []
-                if isinstance(plausible, list):
-                    plausible_labels = [
-                        str(item).strip().upper()
-                        for item in plausible
-                        if str(item).strip().upper() in OPTION_LABELS
-                    ]
-                if verdict == "unique" and plausible_labels != [correct_option]:
-                    verdict = "ambiguous"
+    provider = normalize_provider(provider)
+    errors = []
+    if provider in {"auto", "gemini"}:
+        try:
+            payload = review_question_uniqueness_with_gemini(raw_item, row, correct_option)
+            if payload:
+                return payload
+            errors.append("Gemini: review_parse_error")
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+            if provider == "gemini":
                 return {
-                    "verdict": verdict,
-                    "plausible_options": plausible_labels,
-                    "reason": str(payload.get("reason", "")).strip() or "review_result",
-                    "notes": str(payload.get("notes", "")).strip(),
+                    "verdict": "ambiguous",
+                    "plausible_options": [],
+                    "reason": "review_error",
+                    "notes": str(exc),
                 }
-    except Exception as e:
+            if is_gemini_quota_error(exc):
+                print("WARN Gemini review quota exhausted; switching to OpenAI review.", flush=True)
+            else:
+                print(f"WARN Gemini review failed; switching to OpenAI review: {exc}", flush=True)
+    if provider in {"auto", "openai"}:
+        try:
+            payload = review_question_uniqueness_with_openai(raw_item, row, correct_option)
+            if payload:
+                return payload
+            errors.append("OpenAI: review_parse_error")
+        except Exception as exc:
+            errors.append(f"OpenAI: {exc}")
         return {
             "verdict": "ambiguous",
             "plausible_options": [],
             "reason": "review_error",
-            "notes": str(e),
+            "notes": " | ".join(errors),
         }
     return {
         "verdict": "ambiguous",
         "plausible_options": [],
         "reason": "review_parse_error",
-        "notes": "",
+        "notes": " | ".join(errors),
     }
 
 
@@ -424,12 +575,12 @@ def validate_ai_question(raw_item: dict, fallback: dict, row: pd.Series) -> list
     return reasons
 
 
-def normalize_ai_question(ep_num: int, idx: int, row: pd.Series, df: pd.DataFrame, raw_item: dict | None) -> dict:
+def normalize_ai_question(ep_num: int, idx: int, row: pd.Series, df: pd.DataFrame, raw_item: dict | None, provider: str) -> dict:
     fallback = deterministic_fallback_question(ep_num, idx, row, df)
     raw_item = raw_item or {}
     reasons = validate_ai_question(raw_item, fallback, row) if raw_item else ["missing_ai_item"]
     if not reasons:
-        review = review_question_uniqueness(raw_item, row)
+        review = review_question_uniqueness(raw_item, row, provider)
         if review.get("verdict") != "unique":
             plausible = review.get("plausible_options") or []
             plausible_suffix = f"_{'-'.join(plausible)}" if plausible else ""
@@ -471,12 +622,12 @@ def normalize_ai_question(ep_num: int, idx: int, row: pd.Series, df: pd.DataFram
     }
 
 
-def build_question_rows(ep_num: int, df: pd.DataFrame, ai_questions: list[dict]) -> list[dict]:
+def build_question_rows(ep_num: int, df: pd.DataFrame, ai_questions: list[dict], provider: str) -> list[dict]:
     rows = []
     ai_questions = ai_questions or []
     for idx, (_, row) in enumerate(df.iterrows(), start=1):
         raw_item = ai_questions[idx - 1] if idx - 1 < len(ai_questions) else None
-        rows.append(normalize_ai_question(ep_num, idx, row, df, raw_item))
+        rows.append(normalize_ai_question(ep_num, idx, row, df, raw_item, provider))
     return rows
 
 
@@ -493,7 +644,14 @@ def save_questions(storyboard_dir: Path, questions: list[dict]):
 def main():
     parser = argparse.ArgumentParser(description="根據 vocab_data 與 shared prompt 產生克漏字題")
     parser.add_argument("--ep", type=int, required=True)
+    parser.add_argument(
+        "--provider",
+        choices=sorted(VALID_PROVIDERS),
+        default=os.getenv("CAP_CLOZE_LLM_PROVIDER", "auto"),
+        help="LLM provider: auto tries Gemini first, then falls back to OpenAI.",
+    )
     args = parser.parse_args()
+    provider = normalize_provider(args.provider)
 
     episode_folder, start_word, end_word = resolve_episode_range(workspace_dir, args.ep)
     storyboard_dir = episode_folder / "03_storyboards"
@@ -504,8 +662,15 @@ def main():
     prompt_path = ensure_prompt_file(storyboard_dir)
     prompt_template = prompt_path.read_text(encoding="utf-8")
     rendered_prompt = render_prompt(prompt_template, args.ep, start_word, end_word, vocab_df)
-    ai_questions = generate_questions_with_ai(rendered_prompt)
-    questions = build_question_rows(args.ep, vocab_df, ai_questions)
+    print(
+        f"cloze_llm_provider={provider} gemini_model={MODEL_ID} "
+        f"openai_model={OPENAI_MODEL_ID} nvidia_model={NVIDIA_MODEL_ID} "
+        f"review_gemini_model={REVIEW_MODEL_ID} "
+        f"review_openai_model={OPENAI_REVIEW_MODEL_ID}",
+        flush=True,
+    )
+    ai_questions = generate_questions_with_ai(rendered_prompt, provider)
+    questions = build_question_rows(args.ep, vocab_df, ai_questions, provider)
     save_questions(storyboard_dir, questions)
 
 

@@ -1,6 +1,7 @@
 # --- AI 與 API 串接 ---
 google-genai                 # Google 最新版 Gemini SDK (支援 2.0 Flash)
-openai                       # 用於 Whisper 字幕產生 (或 OpenAI API)
+openai                       # 用於 OpenAI API
+openai-whisper               # 用於本地端 Whisper 字幕產生
 python-dotenv                # 用於讀取 .env 檔案中的環境變數
 
 # --- Google Drive & YouTube API (Stage 7 發布流程) ---

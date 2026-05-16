@@ -1,0 +1,69 @@
+substeps:
+  - no: "1"
+    key: "short_title"
+    name: "設定標題"
+    rule: any
+    outputs:
+      - pattern: "short.json"
+        nonempty: true
+  - no: "2"
+    key: "short_audio_upload"
+    name: "上傳語音"
+    rule: any
+    outputs:
+      - pattern: "01_audio/*.*"
+  - no: "3"
+    key: "short_whisper_subtitles"
+    name: "Whisper產生字幕"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/whisper.srt"
+        nonempty: true
+  - no: "4"
+    key: "short_ai_subtitle_review"
+    name: "AI字幕校對"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/reviewed.srt"
+        nonempty: true
+  - no: "5"
+    key: "short_manual_subtitle_confirm"
+    name: "人工字幕確認"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/final.srt"
+        nonempty: true
+  - no: "6"
+    key: "short_storyboard_plan"
+    name: "AI 依語境分鏡規劃"
+    rule: any
+    outputs:
+      - pattern: "03_storyboards/storyboard.json"
+        nonempty: true
+  - no: "7"
+    key: "short_storyboard_images"
+    name: "AI 產生分鏡圖片"
+    rule: any
+    outputs:
+      - pattern: "04_images/*.*"
+  - no: "8"
+    key: "short_compose_list"
+    name: "產生合成清單"
+    rule: any
+    outputs:
+      - pattern: "05_output/compose_list.json"
+        nonempty: true
+  - no: "9"
+    key: "short_ffmpeg_render"
+    name: "FFmpeg 影片合成"
+    rule: any
+    outputs:
+      - pattern: "05_output/final_short.mp4"
+        nonempty: true
+  - no: "10"
+    key: "short_metadata"
+    name: "產生 Short metadata"
+    rule: any
+    outputs:
+      - pattern: "05_output/short_metadata.json"
+        nonempty: true

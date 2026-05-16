@@ -23,3 +23,15 @@
     stages: config/youtube_ai/stages.yaml
     substeps: config/youtube_ai/substeps.yaml
     costs: config/youtube_ai/costs.yaml
+  - id: episode_merge
+    name: 集數合併上傳模式
+    workspace: workspaces/episode_merge
+    stages: config/episode_merge/stages.yaml
+    substeps: config/episode_merge/substeps.yaml
+    costs: config/episode_merge/costs.yaml
+  - id: short_generator
+    name: Short生成器
+    workspace: workspaces/short_generator
+    stages: config/short_generator/stages.yaml
+    substeps: config/short_generator/substeps.yaml
+    costs: config/short_generator/costs.yaml

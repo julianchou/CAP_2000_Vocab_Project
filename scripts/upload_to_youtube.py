@@ -4,26 +4,50 @@ import json
 import pickle
 import argparse
 import mimetypes
+import http.client
+import random
+import ssl
+import time
 from datetime import datetime
 from pathlib import Path
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
+try:
+    import httplib2
+except Exception:
+    httplib2 = None
+
 # 權限範圍：上傳影片 / 設定字幕 / 設定封面 / 更新影片資訊 / 播放清單
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 base_dir = Path(__file__).parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 CLIENT_SECRETS_FILE = base_dir / "client_secret.json"
 TOKEN_FILE = base_dir / "token_youtube.pickle"
+DRIVE_TOKEN_FILE = base_dir / "token_drive.pickle"
 SCHEDULE_FILE = base_dir / "upload_schedule.csv"
+DRIVE_TARGET_FOLDER_ID = "1hB1HYVOlOyyBhD0kk_wf9lnav63wF9Kc"
+DRIVE_LINK_PLACEHOLDER = "{{DRIVE_LINK}}"
 
 DEFAULT_LANGUAGE = "zh-TW"
 DEFAULT_AUDIO_LANGUAGE = "zh-TW"
 YOUTUBE_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
+VIDEO_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+VIDEO_UPLOAD_MAX_RETRIES = 8
+RETRIABLE_STATUS_CODES = {500, 502, 503, 504}
+RETRIABLE_UPLOAD_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    ssl.SSLError,
+    http.client.HTTPException,
+)
 
 try:
     from PIL import Image
@@ -169,6 +193,124 @@ def get_authenticated_service():
             pickle.dump(creds, token)
 
     return build('youtube', 'v3', credentials=creds)
+
+
+def get_drive_service():
+    """取得 Google Drive API 服務。Drive 授權只在 Stage 6 發布流程使用。"""
+    creds = None
+
+    if DRIVE_TOKEN_FILE.exists():
+        try:
+            with open(DRIVE_TOKEN_FILE, "rb") as token:
+                creds = pickle.load(token)
+        except Exception as e:
+            print(f"⚠️ 讀取 Drive token 失敗，將重新授權：{e}")
+            creds = None
+
+    if not creds or not creds.valid:
+        need_new_login = False
+
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                print("🔄 Drive token 已過期，嘗試自動刷新...")
+                creds.refresh(Request())
+                print("✅ Drive token 刷新成功。")
+            except RefreshError as e:
+                print(f"⚠️ Drive token 刷新失敗，可能已失效或被撤銷：{e}")
+                need_new_login = True
+            except Exception as e:
+                print(f"⚠️ Drive token 刷新時發生未知錯誤：{e}")
+                need_new_login = True
+        else:
+            need_new_login = True
+
+        if need_new_login:
+            try:
+                if DRIVE_TOKEN_FILE.exists():
+                    DRIVE_TOKEN_FILE.unlink()
+                    print(f"🗑️ 已刪除失效 Drive token：{DRIVE_TOKEN_FILE.name}")
+            except Exception as e:
+                print(f"⚠️ 刪除舊 Drive token 失敗：{e}")
+
+            if not CLIENT_SECRETS_FILE.exists():
+                raise FileNotFoundError(f"找不到 client_secret.json：{CLIENT_SECRETS_FILE}")
+
+            print("🌐 開始進行 Drive OAuth 重新授權...")
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS_FILE), DRIVE_SCOPES)
+            creds = flow.run_local_server(port=0)
+            print("✅ Drive 重新授權成功。")
+
+        try:
+            with open(DRIVE_TOKEN_FILE, "wb") as token:
+                pickle.dump(creds, token)
+            print(f"💾 已儲存最新 Drive token：{DRIVE_TOKEN_FILE.name}")
+        except Exception as e:
+            print(f"⚠️ 儲存 Drive token 失敗：{e}")
+
+    return build("drive", "v3", credentials=creds)
+
+
+def upload_vocab_csv_to_drive(target_folder: Path, ep_num: int) -> str:
+    vocab_csv_path = target_folder / "03_storyboards" / "vocab_data.csv"
+    if not vocab_csv_path.exists():
+        print(f"⚠️ 找不到單字表，略過 Drive 上傳：{vocab_csv_path}")
+        return ""
+
+    try:
+        service = get_drive_service()
+        mime_type = mimetypes.guess_type(str(vocab_csv_path))[0] or "text/csv"
+        file_metadata = {
+            "name": f"會考英文隨身聽_Ep{ep_num:02d}_單字表.csv",
+            "parents": [DRIVE_TARGET_FOLDER_ID],
+        }
+        media = MediaFileUpload(str(vocab_csv_path), mimetype=mime_type)
+
+        created = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id",
+        ).execute()
+        file_id = created.get("id")
+
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+
+        result = service.files().get(fileId=file_id, fields="webViewLink").execute()
+        drive_link = result.get("webViewLink") or ""
+        if drive_link:
+            print(f"✅ 單字表已上傳 Drive：{drive_link}")
+        return drive_link
+    except Exception as e:
+        print(f"⚠️ Drive 上傳單字表失敗，將沿用原 metadata：{e}")
+        return ""
+
+
+def enrich_metadata_with_drive_link(meta_path: Path, meta_data: dict, target_folder: Path, ep_num: int) -> dict:
+    if str(meta_data.get("drive_link", "")).strip():
+        return meta_data
+
+    print("📤 正在上傳本集 vocab_data.csv 到 Google Drive...")
+    drive_link = upload_vocab_csv_to_drive(target_folder, ep_num)
+    if not drive_link:
+        return meta_data
+
+    description = str(meta_data.get("description", ""))
+    placeholder = str(meta_data.get("drive_link_placeholder", DRIVE_LINK_PLACEHOLDER))
+    if placeholder and placeholder in description:
+        description = description.replace(placeholder, drive_link)
+    else:
+        description = description.rstrip() + f"\n\n📥 本集單字表下載 (Google Drive)：\n{drive_link}"
+
+    meta_data["drive_link"] = drive_link
+    meta_data["description"] = description
+    try:
+        meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=4), encoding="utf-8")
+        print(f"💾 已更新 Drive 連結到 metadata：{meta_path.name}")
+    except Exception as e:
+        print(f"⚠️ 寫回 metadata 失敗，但本次上傳仍會使用 Drive 連結：{e}")
+    return meta_data
 
 
 def add_video_to_playlist(youtube, video_id, playlist_id):
@@ -380,6 +522,40 @@ def save_upload_record(target_path, record_data):
         print(f"❌ 儲存紀錄檔失敗: {e}")
 
 
+def is_retriable_upload_error(error: Exception) -> bool:
+    if isinstance(error, HttpError):
+        status = getattr(error.resp, "status", None)
+        return status in RETRIABLE_STATUS_CODES
+    if httplib2 is not None and isinstance(error, httplib2.HttpLib2Error):
+        return True
+    return isinstance(error, RETRIABLE_UPLOAD_EXCEPTIONS)
+
+
+def resumable_upload_with_retries(request, max_retries=VIDEO_UPLOAD_MAX_RETRIES):
+    response = None
+    retry_count = 0
+
+    while response is None:
+        try:
+            status, response = request.next_chunk()
+            retry_count = 0
+            if status:
+                print(f"   進度: {int(status.progress() * 100)}%")
+        except Exception as e:
+            if not is_retriable_upload_error(e) or retry_count >= max_retries:
+                raise
+
+            retry_count += 1
+            sleep_seconds = min((2 ** retry_count) + random.random(), 60)
+            print(
+                f"⚠️ 上傳連線暫時中斷，{sleep_seconds:.1f} 秒後重試 "
+                f"({retry_count}/{max_retries})：{e}"
+            )
+            time.sleep(sleep_seconds)
+
+    return response
+
+
 def write_success_marker(output_dir: Path):
     try:
         (output_dir / "upload.ok").write_text(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
@@ -443,6 +619,7 @@ def upload_episode(
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
+    meta_data = enrich_metadata_with_drive_link(meta_path, meta_data, target_folder, ep_num)
 
     record = {
         "episode": ep_num,
@@ -460,6 +637,8 @@ def upload_episode(
         "thumbnail_info": thumbnail_info,
         "default_language": DEFAULT_LANGUAGE,
         "default_audio_language": DEFAULT_AUDIO_LANGUAGE,
+        "video_upload_chunk_size": VIDEO_UPLOAD_CHUNK_SIZE,
+        "video_upload_max_retries": VIDEO_UPLOAD_MAX_RETRIES,
         "ab_test_candidates_found": [str(p) for p in ab_cover_candidates if p.exists()],
     }
 
@@ -493,18 +672,21 @@ def upload_episode(
 
     try:
         print("⏳ 正在上傳影片...")
-        media_body = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
+        print(f"   檔案大小: {video_path.stat().st_size:,} bytes")
+        print(f"   分段大小: {VIDEO_UPLOAD_CHUNK_SIZE // (1024 * 1024)} MB")
+        media_body = MediaFileUpload(
+            str(video_path),
+            mimetype=mimetypes.guess_type(str(video_path))[0] or "video/mp4",
+            chunksize=VIDEO_UPLOAD_CHUNK_SIZE,
+            resumable=True,
+        )
         request = youtube.videos().insert(
             part="snippet,status",
             body=body,
             media_body=media_body
         )
 
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                print(f"   進度: {int(status.progress() * 100)}%")
+        response = resumable_upload_with_retries(request)
 
         video_id = response["id"]
         record["video_id"] = video_id

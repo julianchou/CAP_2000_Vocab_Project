@@ -84,9 +84,60 @@ def read_json(path: Path) -> dict:
     return data
 
 
+def read_json_optional(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+CLEAN_STORYBOARD_PROMPT_TEMPLATE = """你是故事生成模式的分鏡導演。請依照故事字幕、No.3.1 角色人物塑造、No.3.2 場景塑造，以及 No.4.2 使用者預聽台詞/完整 TTS 台詞脈絡，規劃故事分鏡。
+
+重要原則：
+1. 這是故事生成模式，不是單字卡或詞彙模式。不要建立 FLASHCARD 分鏡，不要參考單字清單，不要輸出 flashcard_word。
+2. 每個分鏡都必須服務故事情節、角色行動、情緒變化與場景連續性。
+3. 每個分鏡長度不得超過 {{MAX_SECONDS}} 秒；時間必須連續覆蓋字幕時間軸，不可重疊。
+4. image_prompt 必須根據以下資訊產生：
+   - No.3.1 characters.json 的角色外觀、性格、服裝、聲音/語氣設定。
+   - No.3.2 locations.json 的場景設計、色彩、道具與段落連結。
+   - No.4.2 的預聽台詞 voice_preview_request.json，以及 tts_lines.json 的實際台詞、speaker、voice_hint。
+   - 目前分鏡所覆蓋的字幕內容與段落 paragraph_id。
+5. image_prompt 必須是英文，描述適合兒童故事影片的具體畫面，不要只重述字幕。
+6. image_prompt 必須包含角色名稱/外觀、場景名稱/視覺細節、當下動作或情緒，並包含 storybook illustration、child-friendly、warm、bright、aspect ratio 16:9, cinematic wide shot。
+7. 不要產生恐怖、暴力、危險、成人或不適合 10 歲以下兒童的畫面。
+
+請只輸出 JSON array，不要 Markdown，不要補充說明。每個 item 必須包含：
+- start_time
+- end_time
+- source_type：固定為 "AI"
+- paragraph_id
+- location_id
+- location_name
+- characters：角色名稱陣列
+- summary：此分鏡的故事畫面摘要
+- image_prompt：英文生圖 prompt
+- reason：簡短說明此分鏡如何對應字幕、角色與場景
+
+故事字幕 JSON：
+{{SUBTITLES_JSON}}
+
+No.3.1 角色人物塑造 characters.json：
+{{CHARACTERS_JSON}}
+
+No.3.2 場景塑造 locations.json：
+{{LOCATIONS_JSON}}
+
+No.4.1/4.2 完整 TTS 台詞 tts_lines.json：
+{{TTS_LINES_JSON}}
+
+No.4.2 使用者預聽台詞 voice_preview_request.json：
+{{VOICE_PREVIEW_JSON}}
+"""
 
 
 def prompt_template_path() -> Path:
@@ -95,9 +146,16 @@ def prompt_template_path() -> Path:
 
 def ensure_prompt_template() -> Path:
     path = prompt_template_path()
-    if not path.exists():
+    should_write = not path.exists()
+    if not should_write:
+        current = path.read_text(encoding="utf-8", errors="ignore")
+        should_write = any(
+            token in current
+            for token in ["{{WORD_LIST}}", "{{SRT_CONTENT}}", "{{CLOZE_CARD_RULES}}", "{{HOST_PROFILE_RULES}}"]
+        ) or "{{TTS_LINES_JSON}}" not in current
+    if should_write:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_PROMPT_TEMPLATE, encoding="utf-8")
+        path.write_text(CLEAN_STORYBOARD_PROMPT_TEMPLATE, encoding="utf-8")
     return path
 
 
@@ -133,6 +191,24 @@ def compact_subtitles(subtitles_data: dict) -> list[dict]:
                 "end": item.get("end", 0),
                 "paragraph_id": item.get("paragraph_id", ""),
                 "speaker": item.get("speaker", ""),
+                "text": item.get("text", ""),
+            }
+        )
+    return rows
+
+
+def compact_tts_lines(tts_data: dict) -> list[dict]:
+    rows = []
+    for item in tts_data.get("lines") or []:
+        rows.append(
+            {
+                "line_id": item.get("line_id", ""),
+                "sequence": item.get("sequence", ""),
+                "paragraph_id": item.get("paragraph_id", ""),
+                "line_type": item.get("line_type", ""),
+                "speaker": item.get("speaker", ""),
+                "voice_style": item.get("voice_style", ""),
+                "voice_hint": item.get("voice_hint", ""),
                 "text": item.get("text", ""),
             }
         )
@@ -181,11 +257,23 @@ def enforce_subtitle_max_duration(subtitles: list[dict], max_seconds: float) -> 
     return out
 
 
-def render_prompt(template: str, subtitles_data: dict, characters_data: dict, locations_data: dict, max_seconds: float) -> str:
+def render_prompt(
+    template: str,
+    subtitles_data: dict,
+    characters_data: dict,
+    locations_data: dict,
+    tts_lines_data: dict,
+    voice_preview_data: dict,
+    max_seconds: float,
+) -> str:
     subtitles_payload = {
         "story_title": subtitles_data.get("story_title", ""),
         "duration_seconds": subtitles_data.get("duration_seconds", 0),
         "subtitles": compact_subtitles(subtitles_data),
+    }
+    tts_payload = {
+        "story_title": tts_lines_data.get("story_title", ""),
+        "lines": compact_tts_lines(tts_lines_data),
     }
     return (
         template
@@ -193,6 +281,8 @@ def render_prompt(template: str, subtitles_data: dict, characters_data: dict, lo
         .replace("{{SUBTITLES_JSON}}", json.dumps(subtitles_payload, ensure_ascii=False, indent=2))
         .replace("{{CHARACTERS_JSON}}", json.dumps(characters_data, ensure_ascii=False, indent=2))
         .replace("{{LOCATIONS_JSON}}", json.dumps(locations_data, ensure_ascii=False, indent=2))
+        .replace("{{TTS_LINES_JSON}}", json.dumps(tts_payload, ensure_ascii=False, indent=2))
+        .replace("{{VOICE_PREVIEW_JSON}}", json.dumps(voice_preview_data, ensure_ascii=False, indent=2))
     )
 
 
@@ -344,7 +434,7 @@ def split_long_scene(scene: dict, max_seconds: float) -> list[dict]:
         part = dict(scene)
         part["start_time"] = round(cursor, 3)
         part["end_time"] = round(min(cursor + max_seconds, end_t), 3)
-        part["reason"] = (str(scene.get("reason", "")).strip() + "；因動畫長度限制拆分為 8 秒以內。").strip("；")
+        part["reason"] = (str(scene.get("reason", "")).strip() + "；因單一分鏡長度上限拆分。").strip("；")
         out.append(part)
         cursor = float(part["end_time"])
     return out
@@ -477,11 +567,21 @@ def generate_ai_storyboard(ep_path: Path, max_seconds: float) -> dict:
     subtitles_data = read_json(ep_path / "04_audio_subtitles" / "story_subtitles.json")
     characters_data = read_json(ep_path / "03_characters_scenes" / "characters.json")
     locations_data = read_json(ep_path / "03_characters_scenes" / "locations.json")
+    tts_lines_data = read_json_optional(ep_path / "04_audio_subtitles" / "tts_lines.json")
+    voice_preview_data = read_json_optional(ep_path / "04_audio_subtitles" / "voice_preview_request.json")
     if not subtitles_data.get("subtitles"):
         raise RuntimeError("story_subtitles.json has no subtitles. Run No.4.4 first.")
 
     template_path = ensure_prompt_template()
-    prompt = render_prompt(template_path.read_text(encoding="utf-8"), subtitles_data, characters_data, locations_data, max_seconds)
+    prompt = render_prompt(
+        template_path.read_text(encoding="utf-8"),
+        subtitles_data,
+        characters_data,
+        locations_data,
+        tts_lines_data,
+        voice_preview_data,
+        max_seconds,
+    )
     prompt_out = ep_path / "05_storyboards" / "storyboard_prompt.txt"
     prompt_out.parent.mkdir(parents=True, exist_ok=True)
     prompt_out.write_text(prompt, encoding="utf-8")

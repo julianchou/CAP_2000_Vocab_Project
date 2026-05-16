@@ -11,6 +11,10 @@ stages:
         type: python
         script: scripts/youtube_ai_sync_channels.py
         args: []
+      - name: "自動化指標抓取 Daily ETL"
+        type: python
+        script: scripts/youtube_ai_daily_etl.py
+        args: []
 
   - id: "2"
     key: "ai_insights"

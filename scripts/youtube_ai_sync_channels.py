@@ -29,6 +29,24 @@ def token_path(workspace: Path, account_label: str) -> Path:
     return workspace / "oauth_tokens" / f"token_youtube_ai_{safe}.pickle"
 
 
+def channel_token_label(channels: list[dict], fallback: str) -> str:
+    if fallback and fallback != "default":
+        return fallback
+    if channels:
+        item = channels[0]
+        handle = str(item.get("handle", "")).strip("@").strip()
+        channel_id = str(item.get("channel_id", "")).strip()
+        return handle or channel_id or fallback
+    return fallback or "default"
+
+
+def save_credentials(creds, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(creds, f)
+    return path
+
+
 def load_credentials(workspace: Path, account_label: str, force_reauth: bool):
     if not CLIENT_SECRETS_FILE.exists():
         raise FileNotFoundError(f"missing client_secret.json: {CLIENT_SECRETS_FILE}")
@@ -43,8 +61,7 @@ def load_credentials(workspace: Path, account_label: str, force_reauth: bool):
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS_FILE), SCOPES)
         creds = flow.run_local_server(port=0)
-    with path.open("wb") as f:
-        pickle.dump(creds, f)
+    save_credentials(creds, path)
     return creds, path
 
 
@@ -169,11 +186,15 @@ def main() -> int:
     workspace.mkdir(parents=True, exist_ok=True)
     creds, saved_token = load_credentials(workspace, args.account_label, args.force_reauth)
     incoming = fetch_mine_channels(creds)
+    final_label = channel_token_label(incoming, args.account_label)
+    final_token = save_credentials(creds, token_path(workspace, final_label))
     channels_path = workspace / "config" / "channels.json"
     merged = merge_channels(read_channels_file(channels_path), incoming)
     saved_channels = write_channels_file(workspace, merged)
-    sync_db(workspace, incoming, saved_token, args.account_label)
-    print(f"token={saved_token}")
+    sync_db(workspace, incoming, final_token, final_label)
+    print(f"token={final_token}")
+    if final_token != saved_token:
+        print(f"legacy_token={saved_token}")
     print(f"channels={saved_channels}")
     print(f"synced_channel_count={len(incoming)}")
     for item in incoming:

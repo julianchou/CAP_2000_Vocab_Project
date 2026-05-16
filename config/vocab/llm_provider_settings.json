@@ -1,0 +1,10 @@
+{
+  "vocab_text_llm_providers": {
+    "3": "auto",
+    "5": "nvidia",
+    "12": "gemini",
+    "14": "gemini",
+    "19": "nvidia"
+  },
+  "updated_at": "2026-05-16T12:12:30"
+}

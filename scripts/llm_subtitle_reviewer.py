@@ -6,17 +6,102 @@ import re
 
 import srt
 from dotenv import load_dotenv
-from google import genai
 
 from episode_range_utils import resolve_episode_range
+from llm_provider_utils import DEFAULT_NVIDIA_TEXT_MODEL, nvidia_chat_response
 
 
 load_dotenv()
-client = genai.Client()
 
 base_dir = Path(__file__).resolve().parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
-MODEL_NAME = "gemini-2.5-pro"
+GEMINI_MODEL_NAME = os.getenv("CAP_SUBTITLE_REVIEW_GEMINI_MODEL", os.getenv("CAP_TEXT_MODEL", "gemini-2.5-pro"))
+OPENAI_MODEL_NAME = os.getenv("CAP_SUBTITLE_REVIEW_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
+NVIDIA_MODEL_NAME = os.getenv("CAP_SUBTITLE_REVIEW_NVIDIA_MODEL", DEFAULT_NVIDIA_TEXT_MODEL)
+NVIDIA_FALLBACK_MODEL_NAME = os.getenv(
+    "CAP_SUBTITLE_REVIEW_NVIDIA_FALLBACK_MODEL",
+    os.getenv("CAP_STORYBOARD_NVIDIA_MODEL", "nvidia/nemotron-3-nano-30b-a3b"),
+)
+VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
+
+
+def normalize_provider(value: str | None) -> str:
+    provider = str(value or os.getenv("CAP_SUBTITLE_REVIEW_PROVIDER") or "openai").strip().lower()
+    return provider if provider in VALID_PROVIDERS else "openai"
+
+
+def is_gemini_quota_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "spending cap" in text.lower() or "quota" in text.lower()
+
+
+def is_nvidia_retryable_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "504" in text
+
+
+def strip_srt_fence(text: str) -> str:
+    return str(text or "").replace("```srt", "").replace("```", "").strip()
+
+
+def review_with_gemini(prompt: str) -> str:
+    from google import genai
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    print(f"Calling Gemini for subtitle review: {GEMINI_MODEL_NAME}")
+    response = client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
+    return strip_srt_fence(getattr(response, "text", "") or "")
+
+
+def review_with_openai(prompt: str) -> str:
+    from openai import OpenAI
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    print(f"Calling OpenAI/ChatGPT for subtitle review: {OPENAI_MODEL_NAME}")
+    response = OpenAI().responses.create(
+        model=OPENAI_MODEL_NAME,
+        input=[
+            {
+                "role": "system",
+                "content": "Return only valid SRT subtitle text. Do not include Markdown fences or explanations.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return strip_srt_fence(response.output_text)
+
+
+def review_with_nvidia(prompt: str) -> str:
+    print(f"Calling NVIDIA for subtitle review: {NVIDIA_MODEL_NAME}")
+    try:
+        raw = nvidia_chat_response(
+            prompt,
+            model=NVIDIA_MODEL_NAME,
+            system_prompt="Return only valid SRT subtitle text. Do not include Markdown fences or explanations.",
+            temperature=0.2,
+        )
+    except Exception as exc:
+        fallback_model = str(NVIDIA_FALLBACK_MODEL_NAME or "").strip()
+        if (
+            not fallback_model
+            or fallback_model == NVIDIA_MODEL_NAME
+            or not is_nvidia_retryable_timeout(exc)
+        ):
+            raise
+        print(
+            "NVIDIA subtitle review timed out; "
+            f"retrying with fallback model: {fallback_model}"
+        )
+        raw = nvidia_chat_response(
+            prompt,
+            model=fallback_model,
+            system_prompt="Return only valid SRT subtitle text. Do not include Markdown fences or explanations.",
+            temperature=0.2,
+        )
+    return strip_srt_fence(raw)
 
 def detect_profile_id() -> str:
     profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
@@ -224,14 +309,126 @@ def repair_timeline_overlaps(raw_srt_content: str, cleaned_srt: str) -> tuple[st
     return repaired_srt, f"repaired {repairs} overlapping timestamp boundary/boundaries"
 
 
-def review_subtitles_with_llm(ep_num: int):
+def repair_timestamps_from_raw_alignment(raw_srt_content: str, cleaned_srt: str) -> tuple[str, str | None]:
+    """Keep LLM text edits but restore timestamps when cue alignment is unchanged."""
+    try:
+        raw_items = parse_srt_or_raise(raw_srt_content)
+        cleaned_items = parse_srt_or_raise(cleaned_srt)
+    except Exception:
+        return cleaned_srt, None
+
+    if len(raw_items) != len(cleaned_items):
+        return cleaned_srt, None
+
+    changed_timestamps = 0
+    for raw_item, cleaned_item in zip(raw_items, cleaned_items):
+        if cleaned_item.start != raw_item.start or cleaned_item.end != raw_item.end:
+            changed_timestamps += 1
+        cleaned_item.index = raw_item.index
+        cleaned_item.start = raw_item.start
+        cleaned_item.end = raw_item.end
+
+    if changed_timestamps == 0:
+        return cleaned_srt, None
+
+    repaired_srt = srt.compose(cleaned_items)
+    return repaired_srt, f"restored timestamps for {changed_timestamps} aligned subtitle cue(s)"
+
+
+def fallback_to_raw_srt(raw_srt_content: str, _cleaned_srt: str) -> tuple[str, str | None]:
+    """Use the original SRT when the LLM changed cue structure too much to repair safely."""
+    ok, message = validate_cleaned_srt(raw_srt_content, raw_srt_content)
+    if not ok:
+        return _cleaned_srt, None
+    return raw_srt_content.strip(), "used original SRT as safe fallback after unrecoverable LLM timeline drift"
+
+
+def validate_or_repair_llm_srt(raw_srt_content: str, cleaned_srt: str, output_srt: Path) -> tuple[str, str]:
+    ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+    if not ok:
+        repaired_srt, repair_note = repair_short_video_hour_rollover(raw_srt_content, cleaned_srt)
+        if repair_note:
+            cleaned_srt = repaired_srt
+            ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+            if ok:
+                message = f"ok ({repair_note})"
+    if not ok:
+        repaired_srt, repair_note = repair_non_positive_durations(raw_srt_content, cleaned_srt)
+        if repair_note:
+            cleaned_srt = repaired_srt
+            ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+            if ok:
+                message = f"ok ({repair_note})"
+    if not ok:
+        repaired_srt, repair_note = repair_timeline_overlaps(raw_srt_content, cleaned_srt)
+        if repair_note:
+            cleaned_srt = repaired_srt
+            ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+            if ok:
+                message = f"ok ({repair_note})"
+    if not ok:
+        repaired_srt, repair_note = repair_timestamps_from_raw_alignment(raw_srt_content, cleaned_srt)
+        if repair_note:
+            cleaned_srt = repaired_srt
+            ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+            if ok:
+                message = f"ok ({repair_note})"
+    if not ok:
+        rejected_path = output_srt.with_suffix(".rejected.srt")
+        rejected_path.write_text(cleaned_srt, encoding="utf-8")
+        repaired_srt, repair_note = fallback_to_raw_srt(raw_srt_content, cleaned_srt)
+        if repair_note:
+            cleaned_srt = repaired_srt
+            ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
+            if ok:
+                message = f"ok ({repair_note}; rejected copy saved to {rejected_path})"
+        if not ok:
+            raise ValueError(
+                f"AI subtitle output rejected: {message}. rejected copy saved to {rejected_path}"
+            )
+    return cleaned_srt, message
+
+
+def call_subtitle_review_llm(prompt: str, provider: str) -> tuple[str, str]:
+    provider = normalize_provider(provider)
+    errors: list[str] = []
+    if provider in {"auto", "gemini"}:
+        try:
+            return review_with_gemini(prompt), f"gemini:{GEMINI_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+            if provider == "gemini":
+                raise
+            if is_gemini_quota_error(exc):
+                print("Gemini quota/spending cap reached; falling back to OpenAI/ChatGPT.")
+            else:
+                print(f"Gemini subtitle review failed; falling back to OpenAI/ChatGPT: {exc}")
+
+    if provider in {"auto", "openai"}:
+        try:
+            return review_with_openai(prompt), f"openai:{OPENAI_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"OpenAI: {exc}")
+            raise RuntimeError("Subtitle review failed: " + " | ".join(errors)) from exc
+
+    if provider == "nvidia":
+        try:
+            return review_with_nvidia(prompt), f"nvidia:{NVIDIA_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"NVIDIA: {exc}")
+            raise RuntimeError("Subtitle review failed: " + " | ".join(errors)) from exc
+
+    raise RuntimeError("Subtitle review failed: " + " | ".join(errors))
+
+
+def review_subtitles_with_llm(ep_num: int, provider: str = "openai") -> bool:
     target_folder, _start_word, _end_word = resolve_episode_range(workspace_dir, ep_num)
     input_srt = target_folder / "02_subtitles" / "notebooklm_audio.srt"
     output_srt = target_folder / "02_subtitles" / "notebooklm_audio_fixed.srt"
 
     if not input_srt.exists():
         print(f"Missing raw subtitle file: {input_srt}")
-        return
+        return False
 
     print(f"Reviewing subtitles for episode {ep_num}...")
     raw_srt_content = input_srt.read_text(encoding="utf-8")
@@ -239,47 +436,34 @@ def review_subtitles_with_llm(ep_num: int):
     prompt_template = prompt_template_path.read_text(encoding="utf-8")
     prompt = render_prompt(prompt_template, raw_srt_content)
 
-    print(f"Calling {MODEL_NAME} for subtitle review...")
+    provider = normalize_provider(provider)
+    print(
+        f"subtitle_review_provider={provider} "
+        f"gemini_model={GEMINI_MODEL_NAME} openai_model={OPENAI_MODEL_NAME} "
+        f"nvidia_model={NVIDIA_MODEL_NAME} "
+        f"nvidia_fallback_model={NVIDIA_FALLBACK_MODEL_NAME}"
+    )
     try:
-        response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-        cleaned_srt = response.text.replace("```srt", "").replace("```", "").strip()
-        ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
-        if not ok:
-            repaired_srt, repair_note = repair_short_video_hour_rollover(raw_srt_content, cleaned_srt)
-            if repair_note:
-                cleaned_srt = repaired_srt
-                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
-                if ok:
-                    message = f"ok ({repair_note})"
-        if not ok:
-            repaired_srt, repair_note = repair_non_positive_durations(raw_srt_content, cleaned_srt)
-            if repair_note:
-                cleaned_srt = repaired_srt
-                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
-                if ok:
-                    message = f"ok ({repair_note})"
-        if not ok:
-            repaired_srt, repair_note = repair_timeline_overlaps(raw_srt_content, cleaned_srt)
-            if repair_note:
-                cleaned_srt = repaired_srt
-                ok, message = validate_cleaned_srt(raw_srt_content, cleaned_srt)
-                if ok:
-                    message = f"ok ({repair_note})"
-        if not ok:
-            rejected_path = output_srt.with_suffix(".rejected.srt")
-            rejected_path.write_text(cleaned_srt, encoding="utf-8")
-            raise ValueError(
-                f"AI subtitle output rejected: {message}. rejected copy saved to {rejected_path}"
-            )
+        cleaned_srt, provider_used = call_subtitle_review_llm(prompt, provider)
+        cleaned_srt, message = validate_or_repair_llm_srt(raw_srt_content, cleaned_srt, output_srt)
         output_srt.write_text(cleaned_srt, encoding="utf-8")
+        print(f"Subtitle review provider used: {provider_used}")
         print(f"Subtitle review validation: {message}")
         print(f"Subtitle review completed: {output_srt}")
+        return True
     except Exception as e:
         print(f"Error: {e}")
+        return False
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep", type=int, required=True, help="Episode number")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(VALID_PROVIDERS),
+        default=os.getenv("CAP_SUBTITLE_REVIEW_PROVIDER", "openai"),
+        help="LLM provider for subtitle review. Use openai for ChatGPT.",
+    )
     args = parser.parse_args()
-    review_subtitles_with_llm(args.ep)
+    raise SystemExit(0 if review_subtitles_with_llm(args.ep, args.provider) else 1)

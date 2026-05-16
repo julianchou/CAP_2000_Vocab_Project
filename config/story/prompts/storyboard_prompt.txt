@@ -1,44 +1,41 @@
-你是一位專業的英語教學影片分鏡導演。以下是一份英語教學 Podcast 的 SRT 字幕檔。
-你的首要任務是：精準捕捉每一個「本集重點單字」出現的片段，並將畫面切換為對應圖卡；此外，也要處理節目開頭或結尾的克漏字卡片。
+你是故事生成模式的分鏡導演。請依照故事字幕、No.3.1 角色人物塑造、No.3.2 場景塑造，以及 No.4.2 使用者預聽台詞/完整 TTS 台詞脈絡，規劃故事分鏡。
 
-【本集重點單字清單】（請反覆核對字幕，絕不能漏掉任何一個字）
-{{WORD_LIST}}
+重要原則：
+1. 這是故事生成模式，不是單字卡或詞彙模式。不要建立 FLASHCARD 分鏡，不要參考單字清單，不要輸出 flashcard_word。
+2. 每個分鏡都必須服務故事情節、角色行動、情緒變化與場景連續性。
+3. 每個分鏡長度不得超過 {{MAX_SECONDS}} 秒；時間必須連續覆蓋字幕時間軸，不可重疊。
+4. image_prompt 必須根據以下資訊產生：
+   - No.3.1 characters.json 的角色外觀、性格、服裝、聲音/語氣設定。
+   - No.3.2 locations.json 的場景設計、色彩、道具與段落連結。
+   - No.4.2 的預聽台詞 voice_preview_request.json，以及 tts_lines.json 的實際台詞、speaker、voice_hint。
+   - 目前分鏡所覆蓋的字幕內容與段落 paragraph_id。
+5. image_prompt 必須是英文，描述適合兒童故事影片的具體畫面，不要只重述字幕。
+6. image_prompt 必須包含角色名稱/外觀、場景名稱/視覺細節、當下動作或情緒，並包含 storybook illustration、child-friendly、warm、bright、aspect ratio 16:9, cinematic wide shot。
+7. 不要產生恐怖、暴力、危險、成人或不適合 10 歲以下兒童的畫面。
 
-【圖卡與分鏡規劃規則】
-1. 最高優先級：閃卡切換（FLASHCARD）
-- 逐行檢查字幕。只要主持人在對話中提到、拼寫、解釋或舉例本集重點單字，就必須切出一個獨立分鏡。
-- 該分鏡的 source_type 必須是 "FLASHCARD"。
-- flashcard_word 必須精準填入清單中的單字拼法。
-- 這類分鏡的 image_prompt 留空。
-
-2. 克漏字題卡規則
-{{CLOZE_CARD_RULES}}
-- 只要有克漏字題卡需求，該題卡必須獨立成一個單獨分鏡，不可和一般 AI 串場畫面合併。
-- 題目卡與答案卡都視為 FLASHCARD 分鏡，不可寫成 AI 分鏡。
-- 主持人宣告「現在要出題」或「現在要公布答案」的串場，可以另外用 AI 分鏡；但真正顯示題卡的那一鏡一定要獨立。
-
-3. 串場與故事畫面（AI）
-- 只有在沒有講解重點單字，且也不是克漏字解題/出題段落時，才可設為 "AI"。
-- AI 分鏡盡量控制在 10 到 30 秒之間，過長請拆分，過短可適度合併。
-- AI 分鏡必須提供完整英文 image_prompt，並固定以 ", aspect ratio 16:9, cinematic wide shot" 作結。
-
-4. 人物一致性規則
-{{HOST_PROFILE_RULES}}
-
-5. 時間連續性
-- start_time 與 end_time 必須連續，不可留空隙，也不可重疊。
-- 必須完整覆蓋從 0 秒到影片結束的全部內容。
-- 每個分鏡都必須落在實際字幕時間範圍內，不可超出最後一筆字幕結束時間。
-
-【輸出格式】
-只輸出合法 JSON 陣列，不要輸出 Markdown 或任何說明文字。
-每個元素至少包含：
+請只輸出 JSON array，不要 Markdown，不要補充說明。每個 item 必須包含：
 - start_time
 - end_time
-- source_type
-- image_prompt
-- flashcard_word
-- reason
+- source_type：固定為 "AI"
+- paragraph_id
+- location_id
+- location_name
+- characters：角色名稱陣列
+- summary：此分鏡的故事畫面摘要
+- image_prompt：英文生圖 prompt
+- reason：簡短說明此分鏡如何對應字幕、角色與場景
 
-【字幕內容】
-{{SRT_CONTENT}}
+故事字幕 JSON：
+{{SUBTITLES_JSON}}
+
+No.3.1 角色人物塑造 characters.json：
+{{CHARACTERS_JSON}}
+
+No.3.2 場景塑造 locations.json：
+{{LOCATIONS_JSON}}
+
+No.4.1/4.2 完整 TTS 台詞 tts_lines.json：
+{{TTS_LINES_JSON}}
+
+No.4.2 使用者預聽台詞 voice_preview_request.json：
+{{VOICE_PREVIEW_JSON}}

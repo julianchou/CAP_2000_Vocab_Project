@@ -60,8 +60,31 @@ RISKY_TERMS = [
 ]
 
 
+def episode_search_roots() -> list[Path]:
+    roots = [WORKSPACE_DIR, BASE_DIR / "workspaces" / "story", BASE_DIR / "workspaces" / "vocab", BASE_DIR / "workspace"]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root.resolve())
+        if key not in seen:
+            out.append(root)
+            seen.add(key)
+    return out
+
+
 def find_episode_folder(ep_num: int) -> Path | None:
-    return next(WORKSPACE_DIR.glob(f"Ep{ep_num:02d}_*"), None)
+    for root in episode_search_roots():
+        target = next(root.glob(f"Ep{ep_num:02d}_*"), None) if root.exists() else None
+        if target:
+            return target
+    return None
+
+
+def storyboard_csv_for_episode(episode_folder: Path) -> Path:
+    story_path = episode_folder / "05_storyboards" / "storyboard.csv"
+    if story_path.exists():
+        return story_path
+    return episode_folder / "03_storyboards" / "storyboard.csv"
 
 
 def read_storyboard_rows(csv_path: Path) -> tuple[list[dict], list[str]]:
@@ -186,7 +209,7 @@ def generate_animation_prompt(ep_num: int, scene_id: str) -> None:
     if not episode_folder:
         raise FileNotFoundError(f"找不到第 {ep_num:02d} 集資料夾")
 
-    storyboard_csv = episode_folder / "03_storyboards" / "storyboard.csv"
+    storyboard_csv = storyboard_csv_for_episode(episode_folder)
     if not storyboard_csv.exists():
         raise FileNotFoundError(f"找不到 storyboard.csv: {storyboard_csv}")
 

@@ -6,7 +6,7 @@ stages:
       - name: "No.3 產生單字資料"
         type: python
         script: scripts/generate_vocab_content.py
-        args: ["--ep", "{ep}"]
+        args: ["--ep", "{ep}", "--provider", "auto"]
       - name: "No.4 產生單字卡"
         type: python
         script: scripts/generate_flashcards.py
@@ -14,7 +14,7 @@ stages:
       - name: "No.5 產生克漏字題"
         type: python
         script: scripts/generate_cloze_quiz.py
-        args: ["--ep", "{ep}"]
+        args: ["--ep", "{ep}", "--provider", "auto"]
       - name: "No.6 產生克漏字卡"
         type: python
         script: scripts/generate_cloze_flashcards.py
@@ -45,7 +45,7 @@ stages:
       - name: "No.12 AI 字幕校對"
         type: python
         script: scripts/llm_subtitle_reviewer.py
-        args: ["--ep", "{ep}"]
+        args: ["--ep", "{ep}", "--provider", "openai"]
 
   - id: "3"
     key: "stage3_storyboard"
@@ -54,7 +54,7 @@ stages:
       - name: "No.14 AI 依語境分鏡規劃"
         type: python
         script: scripts/llm_director.py
-        args: ["--ep", "{ep}"]
+        args: ["--ep", "{ep}", "--provider", "openai"]
 
   - id: "4"
     key: "stage4_images"

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
@@ -10,11 +11,50 @@ from dotenv import load_dotenv
 from episode_range_utils import find_episode_folder
 
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 load_dotenv()
 base_dir = Path(__file__).resolve().parent.parent
 core_assets_dir = base_dir / "core" / "assets"
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 TEMPLATE_FILENAME = "flashcard_template.png"
+
+
+def normalize_word_key(word: str) -> str:
+    return str(word or "").strip().lower()
+
+
+def safe_filename_token(value: str) -> str:
+    token = str(value or "").strip()
+    token = token.replace(" ", "_").replace("?", "")
+    token = token.replace("/", "_").replace("\\", "_")
+    token = "".join(ch for ch in token if ch.isalnum() or ch in {"_", "-", "."})
+    return token or "card"
+
+
+def safe_pos_token(value: str) -> str:
+    token = safe_filename_token(str(value or "").replace(".", ""))
+    return token or "pos"
+
+
+def flashcard_stems_for_df(df: pd.DataFrame) -> dict[int, str]:
+    word_counts = df["Word"].astype(str).str.strip().str.lower().value_counts().to_dict()
+    stems: dict[int, str] = {}
+    for row_number, (_idx, row) in enumerate(df.iterrows(), start=1):
+        word = str(row.get("Word", "")).strip()
+        if not word:
+            continue
+        base_stem = safe_filename_token(word)
+        if word_counts.get(normalize_word_key(word), 0) > 1:
+            pos_stem = safe_pos_token(row.get("POS", ""))
+            stems[row_number] = f"{base_stem}__{row_number:02d}_{pos_stem}"
+        else:
+            stems[row_number] = base_stem
+    return stems
 
 
 def find_font():
@@ -86,7 +126,8 @@ def process_episode(ep_num: int, filter_words=None):
     output_dir = target_folder / "04_images" / "flashcards"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for _, row in df.iterrows():
+    flashcard_stems = flashcard_stems_for_df(df)
+    for row_number, (_idx, row) in enumerate(df.iterrows(), start=1):
         word = str(row["Word"]).strip()
         if not word:
             continue
@@ -112,7 +153,7 @@ def process_episode(ep_num: int, filter_words=None):
         f_trans = get_font_to_fit(trans_text, font_path, max_text_width, 55)
         draw_text_centered(draw, trans_text, f_trans, "#BCBCBC", box_bottom + 145, center_x)
 
-        safe_name = word.replace(" ", "_").replace("?", "")
+        safe_name = flashcard_stems[row_number]
         img.save(output_dir / f"{safe_name}.png")
         img.close()
 

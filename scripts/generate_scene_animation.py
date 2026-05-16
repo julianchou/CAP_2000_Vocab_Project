@@ -268,8 +268,43 @@ def safer_retry_prompt(target_row: dict, current_prompt: str) -> str | None:
     return retry_prompt
 
 
+def episode_search_roots() -> list[Path]:
+    roots = [WORKSPACE_DIR, BASE_DIR / "workspaces" / "story", BASE_DIR / "workspaces" / "vocab", BASE_DIR / "workspace"]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root.resolve())
+        if key not in seen:
+            out.append(root)
+            seen.add(key)
+    return out
+
+
 def find_episode_folder(ep_num: int) -> Path | None:
-    return next(WORKSPACE_DIR.glob(f"Ep{ep_num:02d}_*"), None)
+    for root in episode_search_roots():
+        target = next(root.glob(f"Ep{ep_num:02d}_*"), None) if root.exists() else None
+        if target:
+            return target
+    return None
+
+
+def storyboard_csv_for_episode(episode_folder: Path) -> Path:
+    story_path = episode_folder / "05_storyboards" / "storyboard.csv"
+    if story_path.exists():
+        return story_path
+    return episode_folder / "03_storyboards" / "storyboard.csv"
+
+
+def ai_image_dir_for_episode(episode_folder: Path, storyboard_csv: Path) -> Path:
+    if "05_storyboards" in storyboard_csv.parts:
+        return episode_folder / "05_storyboards" / "images" / "ai_generated"
+    return episode_folder / "04_images" / "ai_generated"
+
+
+def animation_dir_for_episode(episode_folder: Path, storyboard_csv: Path) -> Path:
+    if "05_storyboards" in storyboard_csv.parts:
+        return episode_folder / "05_storyboards" / "animations"
+    return episode_folder / "04_images" / "animations"
 
 
 def read_storyboard_rows(csv_path: Path) -> tuple[list[dict], list[str]]:
@@ -297,13 +332,14 @@ def guess_mime_type(path: Path) -> str:
     return mimetypes.guess_type(str(path))[0] or "image/png"
 
 
-def scene_image_path(episode_folder: Path, row: dict) -> Path | None:
+def scene_image_path(episode_folder: Path, row: dict, storyboard_csv: Path | None = None) -> Path | None:
     custom_image_path = str(row.get("custom_image_path", "")).strip()
     if custom_image_path and Path(custom_image_path).exists():
         return Path(custom_image_path)
 
     start_token = str(row.get("start_time", "")).strip()
-    ai_image_path = episode_folder / "04_images" / "ai_generated" / f"img_{start_token}.png"
+    storyboard_csv = storyboard_csv or storyboard_csv_for_episode(episode_folder)
+    ai_image_path = ai_image_dir_for_episode(episode_folder, storyboard_csv) / f"img_{start_token}.png"
     return ai_image_path if ai_image_path.exists() else None
 
 
@@ -357,7 +393,7 @@ def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: st
     if not episode_folder:
         raise FileNotFoundError(f"找不到第 {ep_num:02d} 集資料夾")
 
-    storyboard_csv = episode_folder / "03_storyboards" / "storyboard.csv"
+    storyboard_csv = storyboard_csv_for_episode(episode_folder)
     if not storyboard_csv.exists():
         raise FileNotFoundError(f"找不到 storyboard.csv: {storyboard_csv}")
 
@@ -371,11 +407,11 @@ def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: st
         raise ValueError("animation_prompt 為空，請先產生或編輯動畫 Prompt")
 
     explicit_image_path = Path(str(image_path_override or "").strip()) if str(image_path_override or "").strip() else None
-    image_path = explicit_image_path if explicit_image_path else scene_image_path(episode_folder, target_row)
+    image_path = explicit_image_path if explicit_image_path else scene_image_path(episode_folder, target_row, storyboard_csv=storyboard_csv)
     if not image_path or not image_path.exists():
         raise FileNotFoundError("找不到這個 scene 對應圖片，請先確認 AI 圖片或自訂圖片來源")
 
-    animation_dir = episode_folder / "04_images" / "animations"
+    animation_dir = animation_dir_for_episode(episode_folder, storyboard_csv)
     animation_dir.mkdir(parents=True, exist_ok=True)
     output_path = next_animation_variant_path(animation_dir, scene_id)
 

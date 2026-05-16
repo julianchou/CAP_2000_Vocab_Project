@@ -11,9 +11,11 @@ if str(BASE_DIR) not in sys.path:
 from generate_animation_prompt import generate_animation_prompt
 from generate_scene_animation import (
     SceneAnimationError,
+    animation_dir_for_episode,
     find_episode_folder,
     generate_scene_animation,
     read_storyboard_rows,
+    storyboard_csv_for_episode,
 )
 from app_utils.asset_tags import tag_asset_from_row
 
@@ -33,7 +35,7 @@ def write_storyboard_rows(csv_path: Path, rows: list[dict], fieldnames: list[str
 def scene_animation_candidate_paths(episode_folder: Path, row: dict) -> list[Path]:
     scene_id = str(row.get("scene_id", "")).strip()
     start_token = str(row.get("start_time", "")).strip()
-    animation_dir = episode_folder / "04_images" / "animations"
+    animation_dir = animation_dir_for_episode(episode_folder, storyboard_csv_for_episode(episode_folder))
 
     custom_animation_path = str(row.get("animation_video_path", "")).strip()
     candidates: list[Path] = []
@@ -100,7 +102,7 @@ def collect_ai_scene_rows(ep_num: int) -> tuple[Path, Path, list[dict]]:
     if not episode_folder:
         raise FileNotFoundError(f"episode folder not found for ep {ep_num:02d}")
 
-    storyboard_csv = episode_folder / "03_storyboards" / "storyboard.csv"
+    storyboard_csv = storyboard_csv_for_episode(episode_folder)
     if not storyboard_csv.exists():
         raise FileNotFoundError(f"missing storyboard.csv: {storyboard_csv}")
 

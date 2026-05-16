@@ -25,7 +25,7 @@ def read_json(path: Path) -> dict:
 def clean_title(text: str) -> str:
     text = str(text or "").strip()
     text = re.sub(r"^Ep\s*\d+\s*", "", text, flags=re.IGNORECASE)
-    return text or "童話故事"
+    return text or "children story"
 
 
 def location_id(index: int, name: str) -> str:
@@ -42,53 +42,119 @@ def character_names(characters_data: dict) -> list[str]:
     return names
 
 
-def prompt_for_location(name: str, purpose: str, visual_keywords: list[str], story_title: str, characters: list[str]) -> str:
-    character_text = ", ".join(characters[:4]) if characters else "cute fairy-tale characters"
-    keyword_text = ", ".join(visual_keywords)
+def paragraph_text(paragraph: dict) -> str:
+    parts = [
+        paragraph.get("title", ""),
+        paragraph.get("source_plot", ""),
+        paragraph.get("storybook_text", ""),
+        " ".join(paragraph.get("narration") or []),
+    ]
+    return " ".join(str(part or "") for part in parts)
+
+
+def default_location_blueprint(index: int, story_setting: str, paragraph: dict) -> dict:
+    text = paragraph_text(paragraph)
+    if index == 1:
+        return {
+            "name": story_setting or "會發光的餅乾森林、柔軟草地、銀色月光小路",
+            "visual_anchor": "glowing cookie forest, soft grass, silver moonlit path, cozy rabbit home nearby",
+            "layout": "wide readable forest establishing shot with a clear path leading from the rabbit home into the glowing cookie trees",
+            "key_props": ["glowing cookie trees", "soft green grass", "silver moonlit path", "cozy round rabbit home", "gentle morning light"],
+            "palette": ["warm cream", "soft green", "moonlight silver", "pastel yellow"],
+            "mood": "warm, magical, safe, inviting",
+        }
+    if index == 2:
+        return {
+            "name": "圓圓大樹與低垂小花的線索小路",
+            "visual_anchor": "round tree, drooping flowers, dim glowing pebbles, gentle mystery path",
+            "layout": "characters walk along a curved path toward a large round tree; clues are visible but not scary",
+            "key_props": ["round tree", "drooping flowers", "dim glowing pebbles", "small safe clues", "soft bushes"],
+            "palette": ["moss green", "warm brown", "soft beige", "gentle yellow"],
+            "mood": "curious, gentle mystery, child-safe",
+        }
+    if index == 3:
+        return {
+            "name": "分享月亮餅乾的朋友空地",
+            "visual_anchor": "friendly clearing, teamwork space, cookie table or basket, hopeful light",
+            "layout": "open clearing with enough space for characters to gather, share, and solve the problem together",
+            "key_props": ["friendly clearing", "small cookie basket", "sparkling pebbles", "teamwork space", "hopeful light"],
+            "palette": ["pastel yellow", "soft orange", "warm cream", "gentle blue"],
+            "mood": "cooperative, hopeful, warm",
+        }
+    return {
+        "name": "溫柔回家路與重新發光的森林",
+        "visual_anchor": "glowing corners, honey sunset, peaceful path home, tiny star-like lights",
+        "layout": "wide peaceful ending shot with the path returning home and the forest glow restored",
+        "key_props": ["honey sunset", "glowing cookie trees", "peaceful path home", "tiny star-like lights", "soft flowers"],
+        "palette": ["honey gold", "moonlight yellow", "soft green", "warm cream"],
+        "mood": "relieved, grateful, peaceful",
+    }
+
+
+def prompt_for_location(location: dict, story_title: str, characters: list[str]) -> str:
+    character_text = ", ".join(characters[:5]) if characters else "cute fairy-tale characters"
+    props = ", ".join(location["key_props"])
+    palette = ", ".join(location["palette"])
     return (
-        f"Child-safe fairy-tale background scene for the story '{story_title}'. "
-        f"Location: {name}. Purpose: {purpose}. "
-        f"Visual elements: {keyword_text}. "
-        f"Designed for characters: {character_text}. "
-        "Warm bright picture-book style, cute 3D storybook animation look, soft rounded shapes, "
-        "pastel colors, gentle lighting, simple readable composition, no scary elements, "
-        "suitable for children under 10, cinematic 16:9 wide shot."
+        f"Fixed background reference for the story '{story_title}'. "
+        f"Location name: {location['name']}. "
+        f"Visual anchor that must stay consistent: {location['visual_anchor']}. "
+        f"Stable layout: {location['layout']}. "
+        f"Key props that should recur when this location appears: {props}. "
+        f"Fixed color palette: {palette}. "
+        f"Mood: {location['mood']}. "
+        f"Designed to host these characters without redesigning them: {character_text}. "
+        "Warm bright children picture-book style, cute 3D storybook animation look, soft rounded shapes, "
+        "gentle lighting, simple readable composition, cinematic 16:9 wide shot. "
+        "No scary elements, no violence, no danger, no clutter, no dark realism, suitable for children under 10."
     )
 
 
-def build_location(index: int, name: str, paragraph: dict, story: dict, characters: list[str], visual_keywords: list[str]) -> dict:
+def build_location(index: int, paragraph: dict, story: dict, characters: list[str]) -> dict:
     story_title = clean_title(story.get("title", ""))
-    purpose = paragraph.get("purpose") or paragraph.get("title") or "童話故事場景"
+    story_setting = str(story.get("setting") or "").strip()
+    blueprint = default_location_blueprint(index, story_setting, paragraph)
+    purpose = paragraph.get("purpose") or paragraph.get("title") or f"story paragraph {index}"
     return {
-        "location_id": location_id(index, name),
-        "name": name,
+        "location_id": location_id(index, blueprint["name"]),
+        "name": blueprint["name"],
         "story_role": purpose,
-        "target_age_suitability": "10歲以下",
+        "target_age_suitability": "under 10",
         "linked_paragraph_ids": [str(paragraph.get("paragraph_id") or index)],
         "linked_characters": characters,
         "visual_design": {
-            "style": "兒童繪本 / 可愛 3D 童話動畫背景",
-            "mood": "溫暖、明亮、安心、可愛",
-            "time_of_day": "soft storybook daylight or gentle sunset",
-            "color_palette": ["pastel yellow", "soft green", "warm cream", "gentle blue"],
-            "shape_language": "圓潤、柔和、沒有尖銳壓迫感",
-            "key_props": visual_keywords,
-            "composition_notes": "保持畫面乾淨，中央保留角色活動空間，背景細節可愛但不要過度擁擠。",
+            "style": "children picture-book / cute 3D fairy-tale animation background",
+            "visual_anchor": blueprint["visual_anchor"],
+            "stable_layout": blueprint["layout"],
+            "mood": blueprint["mood"],
+            "time_of_day": "soft storybook daylight, moonlight glow, or honey sunset depending on scene timing",
+            "color_palette": blueprint["palette"],
+            "shape_language": "rounded, soft, readable, welcoming; no sharp threatening silhouettes",
+            "key_props": blueprint["key_props"],
+            "composition_notes": (
+                "Keep a clear foreground/midground/background. Leave open space for characters. "
+                "Do not overcrowd the frame. Maintain the same landmark shapes and color palette when reused."
+            ),
             "continuity_tags": [
-                "same fairy-tale world",
+                f"same location {blueprint['name']}",
+                blueprint["visual_anchor"],
                 "child-safe background",
                 "soft pastel storybook style",
                 "warm gentle lighting",
+                "cinematic 16:9 wide composition",
             ],
         },
         "image_generation": {
-            "prompt_en": prompt_for_location(name, purpose, visual_keywords, story_title, characters),
+            "prompt_en": prompt_for_location(blueprint, story_title, characters),
             "negative_prompt_en": (
-                "scary, horror, violence, danger, dark realism, gloomy, weapon, monster, "
-                "sharp threatening shapes, cluttered composition, photorealistic adult style, low quality"
+                "different location design, changed landmark layout, scary, horror, violence, danger, dark realism, "
+                "gloomy, weapon, monster, sharp threatening shapes, cluttered composition, photorealistic adult style, low quality"
             ),
             "recommended_aspect_ratio": "16:9",
-            "reference_usage": "Use this JSON as the scene/location identity source for storyboard image prompts.",
+            "reference_usage": (
+                "Use prompt_en and visual_design as the location identity source for storyboard image prompts. "
+                "Scene prompts may change camera angle, character action, and lighting intensity, but should preserve landmarks, palette, and layout."
+            ),
         },
     }
 
@@ -99,34 +165,27 @@ def build_locations(ep_path: Path) -> dict:
     characters_path = ep_path / "03_characters_scenes" / "characters.json"
     characters_data = read_json(characters_path) if characters_path.exists() else {}
     names = character_names(characters_data)
-
-    base_setting = str(story.get("setting") or "明亮的童話世界")
     paragraphs = outline.get("paragraphs") or []
-    defaults = [
-        ("童話世界入口", ["soft morning light", "welcoming path", "cute flowers", "gentle magical glow"]),
-        ("小困難發生的地方", ["round tree", "small clues", "drooping flowers", "safe gentle mystery"]),
-        ("朋友合作的小路", ["friendly path", "teamwork space", "sparkling pebbles", "hopeful light"]),
-        ("溫暖圓滿的回家路", ["honey sunset", "glowing corners", "peaceful path home", "tiny star-like lights"]),
-    ]
+    if not paragraphs:
+        paragraphs = [{"paragraph_id": str(i), "title": f"story segment {i}"} for i in range(1, 5)]
 
-    locations = []
-    for idx, paragraph in enumerate(paragraphs[:4], start=1):
-        default_name, keywords = defaults[idx - 1]
-        if idx == 1:
-            name = base_setting
-        else:
-            name = default_name
-        locations.append(build_location(idx, name, paragraph, story, names, keywords))
+    locations = [
+        build_location(idx, paragraph, story, names)
+        for idx, paragraph in enumerate(paragraphs[:4], start=1)
+    ]
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "source_story_id": story.get("id", ""),
         "story_title": story.get("title", ""),
-        "target_age": story.get("target_age", "10歲以下"),
+        "target_age": story.get("target_age", "under 10"),
         "scene_world": {
-            "global_style": "溫暖明亮的兒童童話繪本，可愛 3D 動畫背景",
-            "safety": "場景不可恐怖、不可陰暗壓迫、不可有危險或暴力元素，適合 10 歲以下小朋友。",
-            "continuity_rule": "後續分鏡產圖時，必須沿用 location_id、visual_design、continuity_tags，並搭配 characters.json 的角色設定。",
+            "global_style": "children picture-book, cute 3D fairy-tale animation, warm, bright, rounded, child-safe",
+            "safety": "no horror, no violence, no weapons, no danger, no dark realism, suitable for children under 10",
+            "continuity_rule": (
+                "Every scene image prompt should preserve location_id, name, visual_anchor, stable_layout, key_props, "
+                "color_palette, and continuity_tags. Only camera framing, character action, and moment-specific lighting may change."
+            ),
         },
         "locations": locations,
     }

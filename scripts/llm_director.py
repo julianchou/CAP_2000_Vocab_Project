@@ -8,18 +8,130 @@ from pathlib import Path
 import pandas as pd
 import srt
 from dotenv import load_dotenv
-from google import genai
 
 from episode_range_utils import resolve_episode_range
+from llm_provider_utils import DEFAULT_NVIDIA_TEXT_MODEL, nvidia_chat_response
 
 
 load_dotenv()
-client = genai.Client()
 
 base_dir = Path(__file__).parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
-MODEL_NAME = "gemini-2.5-pro"
+GEMINI_MODEL_NAME = os.getenv("CAP_STORYBOARD_GEMINI_MODEL", os.getenv("CAP_TEXT_MODEL", "gemini-2.5-pro"))
+OPENAI_MODEL_NAME = os.getenv("CAP_STORYBOARD_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
+NVIDIA_MODEL_NAME = os.getenv(
+    "CAP_STORYBOARD_NVIDIA_MODEL",
+    os.getenv("NVIDIA_STORYBOARD_MODEL", "nvidia/nemotron-3-nano-30b-a3b"),
+)
+VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
 HOST_PROFILE_PATH = base_dir / "core" / "assets" / "host_profiles.json"
+
+
+def normalize_provider(value: str | None) -> str:
+    provider = str(value or os.getenv("CAP_STORYBOARD_PROVIDER") or "openai").strip().lower()
+    return provider if provider in VALID_PROVIDERS else "openai"
+
+
+def is_gemini_quota_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "spending cap" in text.lower() or "quota" in text.lower()
+
+
+def strip_json_fence(text: str) -> str:
+    text = str(text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def extract_json_text(text: str) -> str:
+    text = strip_json_fence(text)
+    if not text:
+        return text
+    if text[0] in "[{":
+        return text
+    match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def generate_storyboard_json_with_gemini(prompt: str) -> str:
+    from google import genai
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    print(f"Calling Gemini to generate storyboard scenes: {GEMINI_MODEL_NAME}")
+    response = client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
+    return getattr(response, "text", "") or ""
+
+
+def generate_storyboard_json_with_openai(prompt: str) -> str:
+    from openai import OpenAI
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    print(f"Calling OpenAI/ChatGPT to generate storyboard scenes: {OPENAI_MODEL_NAME}")
+    response = OpenAI().responses.create(
+        model=OPENAI_MODEL_NAME,
+        input=[
+            {
+                "role": "system",
+                "content": "Return strict JSON only. The response must be a JSON array and must not include Markdown fences or explanations.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return str(response.output_text or "")
+
+
+def generate_storyboard_json_with_nvidia(prompt: str) -> str:
+    print(f"Calling NVIDIA to generate storyboard scenes: {NVIDIA_MODEL_NAME}")
+    return nvidia_chat_response(
+        prompt,
+        model=NVIDIA_MODEL_NAME,
+        system_prompt="Return strict JSON only. The response must be a JSON array and must not include Markdown fences or explanations.",
+        temperature=0.2,
+    )
+
+
+def generate_storyboard_json(prompt: str, provider: str) -> tuple[list[dict], str]:
+    provider = normalize_provider(provider)
+    errors: list[str] = []
+    if provider in {"auto", "gemini"}:
+        try:
+            raw = generate_storyboard_json_with_gemini(prompt)
+            return json.loads(extract_json_text(raw)), f"gemini:{GEMINI_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+            if provider == "gemini":
+                raise
+            if is_gemini_quota_error(exc):
+                print("Gemini quota/spending cap reached; falling back to OpenAI/ChatGPT.")
+            else:
+                print(f"Gemini storyboard generation failed; falling back to OpenAI/ChatGPT: {exc}")
+
+    if provider in {"auto", "openai"}:
+        try:
+            raw = generate_storyboard_json_with_openai(prompt)
+            return json.loads(extract_json_text(raw)), f"openai:{OPENAI_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"OpenAI: {exc}")
+            raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
+
+    if provider == "nvidia":
+        try:
+            raw = generate_storyboard_json_with_nvidia(prompt)
+            return json.loads(extract_json_text(raw)), f"nvidia:{NVIDIA_MODEL_NAME}"
+        except Exception as exc:
+            errors.append(f"NVIDIA: {exc}")
+            raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
+
+    raise RuntimeError("Storyboard generation failed: " + " | ".join(errors))
 
 def detect_profile_id() -> str:
     profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
@@ -213,6 +325,47 @@ def build_cloze_card_rules(ep_num: int, target_folder: Path) -> tuple[str, dict[
     return "\n".join(rules), asset_map
 
 
+def normalize_word_key(word: str) -> str:
+    return str(word or "").strip().lower()
+
+
+def safe_filename_token(value: str) -> str:
+    token = str(value or "").strip()
+    token = token.replace(" ", "_").replace("?", "")
+    token = token.replace("/", "_").replace("\\", "_")
+    token = "".join(ch for ch in token if ch.isalnum() or ch in {"_", "-", "."})
+    return token or "card"
+
+
+def safe_pos_token(value: str) -> str:
+    token = safe_filename_token(str(value or "").replace(".", ""))
+    return token or "pos"
+
+
+def flashcard_stems_for_vocab_df(df_vocab: pd.DataFrame) -> list[tuple[str, str]]:
+    word_counts = df_vocab["Word"].astype(str).str.strip().str.lower().value_counts().to_dict()
+    stems: list[tuple[str, str]] = []
+    for row_number, (_idx, row) in enumerate(df_vocab.iterrows(), start=1):
+        word = str(row.get("Word", "")).strip()
+        if not word:
+            continue
+        base_stem = safe_filename_token(word)
+        if word_counts.get(normalize_word_key(word), 0) > 1:
+            pos_stem = safe_pos_token(row.get("POS", ""))
+            stem = f"{base_stem}__{row_number:02d}_{pos_stem}"
+        else:
+            stem = base_stem
+        stems.append((normalize_word_key(word), stem))
+    return stems
+
+
+def build_flashcard_asset_queues(df_vocab: pd.DataFrame) -> dict[str, list[str]]:
+    queues: dict[str, list[str]] = {}
+    for word_key, stem in flashcard_stems_for_vocab_df(df_vocab):
+        queues.setdefault(word_key, []).append(stem)
+    return queues
+
+
 def render_prompt(
     template_text: str,
     word_list: list[str],
@@ -240,11 +393,18 @@ def render_prompt(
     return rendered
 
 
-def resolve_flashcard_image_path(images_folder: Path, flashcard_word: str, special_asset_map: dict[str, str]) -> str:
+def resolve_flashcard_image_path(
+    images_folder: Path,
+    flashcard_word: str,
+    special_asset_map: dict[str, str],
+    flashcard_asset_queues: dict[str, list[str]],
+) -> str:
     token = str(flashcard_word or "").strip()
     if token in special_asset_map:
         return special_asset_map[token]
-    safe_word = token.replace(" ", "_").replace("?", "")
+    word_key = normalize_word_key(token)
+    stems = flashcard_asset_queues.get(word_key) or []
+    safe_word = stems.pop(0) if stems else safe_filename_token(token)
     flashcard_path = images_folder / "flashcards" / f"{safe_word}.png"
     return str(flashcard_path.resolve()).replace("\\", "/")
 
@@ -412,7 +572,7 @@ def collect_scene_subtitles(subs: list, start_t: float, end_t: float) -> str:
     return " | ".join(scene_details)
 
 
-def generate_storyboard(ep_num: int):
+def generate_storyboard(ep_num: int, provider: str = "openai") -> bool:
     target_folder, _start_word, _end_word = resolve_episode_range(workspace_dir, ep_num)
     srt_folder = target_folder / "02_subtitles"
     storyboard_folder = target_folder / "03_storyboards"
@@ -423,19 +583,20 @@ def generate_storyboard(ep_num: int):
 
     if not srt_file:
         print(f"Missing SRT file in: {srt_folder}")
-        return
+        return False
     if not vocab_csv.exists():
         print(f"Missing vocab_data.csv: {vocab_csv}")
-        return
+        return False
 
     print("Loading vocab data and subtitle file...")
     df_vocab = pd.read_csv(vocab_csv).fillna("")
     word_list = df_vocab["Word"].astype(str).str.strip().tolist()
+    flashcard_asset_queues = build_flashcard_asset_queues(df_vocab)
     srt_text = srt_file.read_text(encoding="utf-8")
     subs = list(srt.parse(srt_text))
     if not subs:
         print(f"SRT file has no subtitle entries: {srt_file}")
-        return
+        return False
     timeline_end = max(sub.end.total_seconds() for sub in subs)
     cloze_card_rules, special_asset_map = build_cloze_card_rules(ep_num, target_folder)
     host_profiles = load_host_profiles()
@@ -445,11 +606,17 @@ def generate_storyboard(ep_num: int):
     prompt_template = prompt_template_path.read_text(encoding="utf-8")
     prompt = render_prompt(prompt_template, word_list, srt_text, cloze_card_rules, host_profile_rules)
 
-    print(f"Calling {MODEL_NAME} to generate storyboard scenes...")
+    provider = normalize_provider(provider)
+    print(
+        f"storyboard_provider={provider} "
+        f"gemini_model={GEMINI_MODEL_NAME} openai_model={OPENAI_MODEL_NAME} "
+        f"nvidia_model={NVIDIA_MODEL_NAME}"
+    )
     try:
-        response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-        cleaned_json_str = response.text.replace("```json", "").replace("```", "").strip()
-        storyboard_data = json.loads(cleaned_json_str)
+        storyboard_data, provider_used = generate_storyboard_json(prompt, provider)
+        if not isinstance(storyboard_data, list):
+            raise ValueError("model response must be a JSON array")
+        print(f"Storyboard provider used: {provider_used}")
 
         previous_end = 0.0
         normalized_scenes = []
@@ -473,6 +640,7 @@ def generate_storyboard(ep_num: int):
                     images_folder,
                     scene["flashcard_word"],
                     special_asset_map,
+                    flashcard_asset_queues,
                 )
                 scene["image_prompt"] = ""
                 scene["source_type"] = "FLASHCARD"
@@ -515,13 +683,21 @@ def generate_storyboard(ep_num: int):
             print("Special flashcard assets:")
             for token, path in special_asset_map.items():
                 print(f"- {token}: {path}")
+        return True
     except Exception as e:
         print(f"Error: {e}")
+        return False
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep", type=int, required=True, help="Episode number")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(VALID_PROVIDERS),
+        default=os.getenv("CAP_STORYBOARD_PROVIDER", "openai"),
+        help="LLM provider for storyboard generation. Use openai for ChatGPT.",
+    )
     args = parser.parse_args()
-    generate_storyboard(args.ep)
+    raise SystemExit(0 if generate_storyboard(args.ep, args.provider) else 1)
 

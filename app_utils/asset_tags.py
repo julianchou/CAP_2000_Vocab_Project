@@ -72,6 +72,8 @@ def episode_path_for_asset(asset_path: Path) -> Path | None:
         info = parse_episode_info(parent)
         if info.get("ep") is not None:
             return parent
+        if re.match(r"^Ep\d+$", parent.name):
+            return parent
     return None
 
 
