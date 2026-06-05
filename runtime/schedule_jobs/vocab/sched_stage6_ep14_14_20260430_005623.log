@@ -1,7 +1,0 @@
-
-==== REGISTER schedule:sched_stage6_ep14_14_20260430_005623 | 排程執行 Stage 6 上傳 YouTube | 2026-04-30 00:56:43 ====: CAP2000_Schedule_sched_stage6_ep14_14_20260430_005623 @ 2026-04-30T04:00:00 | mode=interactive | wake_to_run=true | note=registered with interactive token
-
-==== RUN schedule:sched_stage6_ep14_14_20260430_005623 | stage 6 | 2026-04-30 08:12:03 ====: episodes=[14] scheduled_at=2026-04-30 04:00
-[power] Preventing system sleep: Scheduled stage 6 (sched_stage6_ep14_14_20260430_005623)
-[schedule] starting queued stage run
-[schedule] start episode 14 (1/1) stage 6

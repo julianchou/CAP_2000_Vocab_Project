@@ -17,6 +17,7 @@ client_secret*.json
 
 # Workspace outputs (episodes)
 workspaces/
+runtime/
 app_assets/substeps_snapshot_*.json
 upload_schedule.csv
 

@@ -1,8 +1,0 @@
-
-==== REGISTER schedule:sched_stage5_ep13_14_20260426_145110 | 排程執行 Stage 5 影片合成 | 2026-04-26 14:51:12 ====: CAP2000_Schedule_sched_stage5_ep13_14_20260426_145110 @ 2026-04-27T01:00:00 | mode=interactive | wake_to_run=true | note=registered with interactive token
-
-==== RUN schedule:sched_stage5_ep13_14_20260426_145110 | stage 5 | 2026-04-27 03:00:46 ====: episodes=[13, 14] scheduled_at=2026-04-27 01:00
-[power] Preventing system sleep: Scheduled stage 5 (sched_stage5_ep13_14_20260426_145110)
-[schedule] starting queued stage run
-[schedule] start episode 13 (1/2) stage 5
-[power] Restored normal sleep policy: Scheduled stage 5 (sched_stage5_ep13_14_20260426_145110)==== END schedule:sched_stage5_ep13_14_20260426_145110 | schedule:sched_stage5_ep13_14_20260426_145110 | 2026-04-27 07:22:45 ===
