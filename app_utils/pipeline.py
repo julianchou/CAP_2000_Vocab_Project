@@ -1,6 +1,7 @@
 import json
 import locale
 import os
+import re
 import subprocess
 import sys
 import time
@@ -10,6 +11,64 @@ from typing import Dict, List, Tuple
 import yaml
 
 from .filesystem import read_status, write_status, log_file_for_stage
+
+
+VOCAB_TEXT_LLM_SCRIPT_STEPS = {
+    "scripts/generate_vocab_content.py": "3",
+    "scripts/generate_cloze_quiz.py": "5",
+    "scripts/llm_subtitle_reviewer.py": "12",
+    "scripts/llm_director.py": "14",
+    "scripts/generate_youtube_meta.py": "20",
+}
+VOCAB_TEXT_LLM_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
+VOCAB_TEXT_LLM_MODEL_ENV_KEYS = {
+    "3": {
+        "gemini": "CAP_VOCAB_GEMINI_MODEL",
+        "openai": "CAP_VOCAB_OPENAI_MODEL",
+        "nvidia": "CAP_VOCAB_NVIDIA_MODEL",
+    },
+    "5": {
+        "gemini": "CAP_CLOZE_MODEL",
+        "openai": "CAP_CLOZE_OPENAI_MODEL",
+        "nvidia": "CAP_CLOZE_NVIDIA_MODEL",
+    },
+    "12": {
+        "gemini": "CAP_SUBTITLE_REVIEW_GEMINI_MODEL",
+        "openai": "CAP_SUBTITLE_REVIEW_OPENAI_MODEL",
+        "nvidia": "CAP_SUBTITLE_REVIEW_NVIDIA_MODEL",
+    },
+    "14": {
+        "gemini": "CAP_STORYBOARD_GEMINI_MODEL",
+        "openai": "CAP_STORYBOARD_OPENAI_MODEL",
+        "nvidia": "CAP_STORYBOARD_NVIDIA_MODEL",
+    },
+    "20": {
+        "gemini": "CAP_YOUTUBE_META_GEMINI_MODEL",
+        "openai": "CAP_YOUTUBE_META_OPENAI_MODEL",
+        "nvidia": "CAP_YOUTUBE_META_NVIDIA_MODEL",
+    },
+}
+VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS = {
+    "12_nvidia_fallback": {
+        "nvidia": "CAP_SUBTITLE_REVIEW_NVIDIA_FALLBACK_MODEL",
+    },
+    "5_review": {
+        "gemini": "CAP_CLOZE_REVIEW_MODEL",
+        "openai": "CAP_CLOZE_OPENAI_REVIEW_MODEL",
+    },
+}
+VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS = {
+    "5_review": "CAP_CLOZE_REVIEW_PROVIDER",
+}
+VOCAB_IMAGE_SCRIPT_STEPS = {
+    "scripts/gen_matched_preview_v4.py": {"16", "18"},
+}
+VOCAB_IMAGE_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
+VOCAB_IMAGE_MODEL_ENV_KEYS = {
+    "gemini": "CAP_STORYBOARD_GEMINI_IMAGE_MODEL",
+    "openai": "CAP_STORYBOARD_OPENAI_IMAGE_MODEL",
+    "nvidia": "CAP_STORYBOARD_NVIDIA_IMAGE_MODEL",
+}
 
 
 def load_stage_config(root: Path, path_override: Path | None = None) -> Dict:
@@ -43,7 +102,122 @@ class StageRunner:
     def _script_exists(self, script_rel: str) -> bool:
         return (self.root / script_rel).exists()
 
+    def _profile_settings_path(self) -> Path:
+        return self.root / "config" / str(self.profile_id or "vocab") / "llm_provider_settings.json"
+
+    def _load_profile_settings(self) -> dict:
+        if self.profile_id != "vocab":
+            return {}
+        path = self._profile_settings_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _set_arg_value(self, args: list[str], flag: str, value: str) -> list[str]:
+        updated = list(args)
+        if flag in updated:
+            idx = updated.index(flag)
+            if idx + 1 < len(updated):
+                updated[idx + 1] = value
+            else:
+                updated.append(value)
+        else:
+            updated.extend([flag, value])
+        return updated
+
+    def _detect_step_no(self, step: Dict, script_rel: str) -> str:
+        explicit = str(step.get("_sub_no") or "").strip()
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", explicit):
+            return explicit
+        match = re.search(r"No\.\s*([0-9]+(?:\.[0-9]+)?)", str(step.get("name") or ""))
+        if match:
+            return match.group(1)
+        return VOCAB_TEXT_LLM_SCRIPT_STEPS.get(script_rel, "")
+
+    def _apply_profile_runtime_settings(self, step: Dict) -> Dict:
+        script_rel = str(step.get("script") or "").replace("\\", "/")
+        step_no = self._detect_step_no(step, script_rel)
+        if not step_no:
+            return step
+
+        settings = self._load_profile_settings()
+        updated = dict(step)
+        env = dict(updated.get("env") or {})
+
+        if script_rel in VOCAB_TEXT_LLM_SCRIPT_STEPS:
+            providers = settings.get("vocab_text_llm_providers")
+            provider = ""
+            if isinstance(providers, dict):
+                provider = str(providers.get(step_no) or "").strip().lower()
+            if provider in VOCAB_TEXT_LLM_PROVIDERS:
+                updated["args"] = self._set_arg_value(list(updated.get("args") or []), "--provider", provider)
+
+            models = settings.get("vocab_text_llm_models")
+            step_models = models.get(step_no) if isinstance(models, dict) else {}
+            if not isinstance(step_models, dict):
+                step_models = {}
+            for model_provider, env_key in VOCAB_TEXT_LLM_MODEL_ENV_KEYS.get(step_no, {}).items():
+                model_name = str(step_models.get(model_provider) or "").strip()
+                if model_name:
+                    env[env_key] = model_name
+
+            extra_models = settings.get("vocab_text_llm_extra_models")
+            extra_providers = settings.get("vocab_text_llm_extra_providers")
+            if isinstance(extra_models, dict):
+                for call_id, model_env_keys in VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS.items():
+                    if not call_id.startswith(f"{step_no}_"):
+                        continue
+                    if isinstance(extra_providers, dict) and call_id in VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS:
+                        provider_name = str(extra_providers.get(call_id) or "").strip().lower()
+                        if provider_name:
+                            env[VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS[call_id]] = provider_name
+                    call_models = extra_models.get(call_id)
+                    if not isinstance(call_models, dict):
+                        continue
+                    for model_provider, env_key in model_env_keys.items():
+                        model_name = str(call_models.get(model_provider) or "").strip()
+                        if model_name:
+                            env[env_key] = model_name
+
+            legacy_openai_models = settings.get("vocab_text_llm_openai_models")
+            legacy_openai_model = ""
+            if isinstance(legacy_openai_models, dict):
+                legacy_openai_model = str(legacy_openai_models.get(step_no) or "").strip()
+            if step_no == "14" and legacy_openai_model and "CAP_STORYBOARD_OPENAI_MODEL" not in env:
+                env["CAP_STORYBOARD_OPENAI_MODEL"] = legacy_openai_model
+
+        if step_no in VOCAB_IMAGE_SCRIPT_STEPS.get(script_rel, set()):
+            image_providers = settings.get("vocab_image_providers")
+            image_provider = ""
+            if isinstance(image_providers, dict):
+                image_provider = str(image_providers.get(step_no) or "").strip().lower()
+            if image_provider in VOCAB_IMAGE_PROVIDERS:
+                updated["args"] = self._set_arg_value(list(updated.get("args") or []), "--provider", image_provider)
+
+            image_models_by_step = settings.get("vocab_image_models_by_step")
+            image_models = image_models_by_step.get(step_no) if isinstance(image_models_by_step, dict) else {}
+            if not isinstance(image_models, dict):
+                image_models = {}
+            legacy_image_models = settings.get("vocab_image_models")
+            if isinstance(legacy_image_models, dict):
+                merged = dict(legacy_image_models)
+                merged.update({k: v for k, v in image_models.items() if str(v or "").strip()})
+                image_models = merged
+            for model_provider, env_key in VOCAB_IMAGE_MODEL_ENV_KEYS.items():
+                model_name = str(image_models.get(model_provider) or "").strip()
+                if model_name:
+                    env[env_key] = model_name
+
+        if env:
+            updated["env"] = env
+        return updated
+
     def _prepare_step(self, ep_info: Dict, step: Dict) -> Tuple[str, str, list[str], dict[str, str]]:
+        step = self._apply_profile_runtime_settings(step)
         step_name = step.get("name", "step")
         step_type = step.get("type", "python")
         script_rel = step.get("script")
@@ -66,6 +240,12 @@ class StageRunner:
 
         env = dict(os.environ)
         env["CAP_WORKSPACE_ROOT"] = str(self.workspace_root)
+        step_env = step.get("env") or {}
+        if isinstance(step_env, dict):
+            for key, value in step_env.items():
+                clean_key = str(key or "").strip()
+                if clean_key:
+                    env[clean_key] = str(value)
         if self.profile_id:
             env["CAP_PROFILE_ID"] = self.profile_id
         if step_type == "python":
@@ -217,6 +397,8 @@ class StageRunner:
             return {"ok": True, "started": False, "message": "already running", "log": str(log_path)}
 
         try:
+            step = dict(step)
+            step["_sub_no"] = str(sub_no)
             step_name, _step_type, cmd, env = self._prepare_step(ep_info, step)
         except Exception as e:
             with open(log_path, "a", encoding="utf-8") as lf:

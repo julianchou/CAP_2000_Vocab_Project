@@ -63,21 +63,21 @@ stages:
       - name: "No.16 AI 產生分鏡圖片"
         type: python
         script: scripts/gen_matched_preview_v4.py
-        args: ["--ep", "{ep}"]
+        args: ["--ep", "{ep}", "--provider", "nvidia"]
 
   - id: "5"
     key: "stage5_render"
     name: "影片合成"
     steps:
-      - name: "No.17 產生合成清單"
+      - name: "No.18 產生合成清單"
         type: python
         script: scripts/gen_matched_preview_v4.py
         args: ["--ep", "{ep}"]
-      - name: "No.18 FFmpeg 影片合成"
+      - name: "No.19 FFmpeg 影片合成"
         type: python
         script: run_stage6_render.py
         args: ["--ep", "{ep}"]
-      - name: "No.19 產生 Youtube metadata"
+      - name: "No.20 產生 Youtube metadata"
         type: python
         script: scripts/generate_youtube_meta.py
         args: ["--ep", "{ep}"]
@@ -86,7 +86,7 @@ stages:
     key: "stage6_publish"
     name: "上傳 YouTube"
     steps:
-      - name: "No.20 上傳 Youtube"
+      - name: "No.21 上傳 Youtube"
         type: python
         script: scripts/upload_to_youtube.py
         args: ["--ep", "{ep}"]

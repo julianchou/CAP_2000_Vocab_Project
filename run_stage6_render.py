@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from app_utils.power import keep_system_awake
 VIDEO_FPS = 30
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".m4v"}
 
 
 def get_workspace_dir() -> Path:
@@ -35,6 +38,21 @@ def scene_duration(row: dict) -> float:
         return duration if duration > 0 else 0.5
     except Exception:
         return 0.5
+
+
+def scene_duration_from_rows(rows: list[dict], index: int) -> float:
+    row = rows[index]
+    try:
+        start_time = float(row.get("start_time", 0) or 0)
+        if index < len(rows) - 1:
+            next_start = float(rows[index + 1].get("start_time", 0) or 0)
+            duration = next_start - start_time
+        else:
+            end_time = float(row.get("end_time", 0) or 0)
+            duration = end_time - start_time
+        return duration if duration > 0 else scene_duration(row)
+    except Exception:
+        return scene_duration(row)
 
 
 def scene_image_path(target_folder: Path, row: dict) -> Path | None:
@@ -79,6 +97,50 @@ def ffmpeg_visual_filter() -> str:
 def run_cmd(cmd: list[str], cwd: Path) -> None:
     print("$", " ".join(cmd))
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def load_outro_settings(target_folder: Path) -> dict | None:
+    config_path = target_folder / "05_output" / "outro" / "outro_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        import json
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"片尾設定讀取失敗，略過片尾：{exc}")
+        return None
+
+    media_rel = str(config.get("media_path") or "").strip()
+    if not media_rel:
+        return None
+    media_path = target_folder / media_rel
+    if not media_path.exists():
+        print(f"片尾媒體不存在，略過片尾：{media_path}")
+        return None
+    media_suffix = media_path.suffix.lower()
+    if media_suffix not in IMAGE_SUFFIXES and media_suffix not in VIDEO_SUFFIXES:
+        print(f"片尾媒體格式不支援，略過片尾：{media_path}")
+        return None
+
+    audio_path = None
+    audio_rel = str(config.get("audio_path") or "").strip()
+    if audio_rel:
+        candidate_audio = target_folder / audio_rel
+        if candidate_audio.exists():
+            audio_path = candidate_audio
+        else:
+            print(f"片尾音效不存在，將使用靜音片尾：{candidate_audio}")
+
+    try:
+        duration = float(config.get("duration_seconds") or 0)
+    except Exception:
+        duration = 0
+    if duration <= 0:
+        print("片尾長度未設定或小於等於 0，略過片尾。")
+        return None
+
+    return {"media_path": media_path, "audio_path": audio_path, "duration": duration}
 
 
 def build_segment_from_image(target_folder: Path, image_path: Path, output_path: Path, duration: float) -> None:
@@ -133,6 +195,65 @@ def build_segment_from_animation(target_folder: Path, animation_path: Path, outp
     )
 
 
+def build_outro_segment(
+    target_folder: Path,
+    media_path: Path,
+    audio_path: Path | None,
+    output_path: Path,
+    duration: float,
+) -> None:
+    media_suffix = media_path.suffix.lower()
+    if media_suffix in IMAGE_SUFFIXES:
+        media_args = ["-loop", "1", "-i", rel_posix(media_path, target_folder)]
+    else:
+        media_args = ["-stream_loop", "-1", "-i", rel_posix(media_path, target_folder)]
+
+    if audio_path:
+        audio_args = ["-i", rel_posix(audio_path, target_folder)]
+        audio_filter_args = ["-af", "apad"]
+    else:
+        audio_args = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        audio_filter_args = []
+
+    run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            *media_args,
+            *audio_args,
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            ffmpeg_visual_filter(),
+            *audio_filter_args,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            rel_posix(output_path, target_folder),
+        ],
+        cwd=target_folder,
+    )
+
+
 def render_final_video(ep_num: int, workspace_dir: Path) -> None:
     print(f"\n[Stage 6] 開始處理第 {ep_num:02d} 集影片合成...")
 
@@ -146,6 +267,8 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
     subtitle_file = target_folder / "02_subtitles" / "notebooklm_audio_fixed.srt"
     output_dir = target_folder / "05_output"
     output_file = output_dir / "final_video.mp4"
+    no_outro_output_file = output_dir / "final_video_no_outro.mp4"
+    with_outro_output_file = output_dir / "final_video_with_outro.mp4"
     segments_dir = output_dir / "render_segments"
     concat_list = output_dir / "segments.txt"
 
@@ -171,7 +294,7 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
         segment_lines: list[str] = []
 
         for idx, row in enumerate(rows, start=1):
-            duration = scene_duration(row)
+            duration = scene_duration_from_rows(rows, idx - 1)
             segment_path = segments_dir / f"seg_{idx:03d}.mp4"
             animation_path = scene_animation_path(target_folder, row)
             image_path = scene_image_path(target_folder, row)
@@ -196,6 +319,8 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
         print(f"已建立 concat 清單：{concat_list}")
 
         subtitle_rel = rel_posix(subtitle_file, target_folder)
+        outro_settings = load_outro_settings(target_folder)
+        main_output_file = no_outro_output_file
 
         run_cmd(
             [
@@ -231,15 +356,83 @@ def render_final_video(ep_num: int, workspace_dir: Path) -> None:
                 "23",
                 "-c:a",
                 "aac",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
                 "-b:a",
                 "192k",
                 "-shortest",
-                rel_posix(output_file, target_folder),
+                rel_posix(main_output_file, target_folder),
             ],
             cwd=target_folder,
         )
+        print(f"已輸出無片尾版：{no_outro_output_file}")
+
+        if outro_settings:
+            outro_segment = segments_dir / "outro.mp4"
+            build_outro_segment(
+                target_folder,
+                Path(outro_settings["media_path"]),
+                outro_settings.get("audio_path"),
+                outro_segment,
+                float(outro_settings["duration"]),
+            )
+            final_concat = output_dir / "final_with_outro_segments.txt"
+            final_concat.write_text(
+                "\n".join(
+                    [
+                        f"file '{rel_posix(main_output_file, output_dir)}'",
+                        f"file '{rel_posix(outro_segment, output_dir)}'",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"已加入片尾：{outro_segment} ({float(outro_settings['duration']):.3f}s)")
+            run_cmd(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    rel_posix(final_concat, target_folder),
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-b:a",
+                    "192k",
+                    "-movflags",
+                    "+faststart",
+                    rel_posix(output_file, target_folder),
+                ],
+                cwd=target_folder,
+            )
+            shutil.copyfile(output_file, with_outro_output_file)
+            print(f"已輸出含片尾版：{with_outro_output_file}")
+        else:
+            shutil.copyfile(no_outro_output_file, output_file)
+            if with_outro_output_file.exists():
+                with_outro_output_file.unlink()
 
     print(f"第 {ep_num:02d} 集 final_video.mp4 已輸出：{output_file}")
+    print(f"第 {ep_num:02d} 集無片尾版：{no_outro_output_file}")
+    if with_outro_output_file.exists():
+        print(f"第 {ep_num:02d} 集含片尾版：{with_outro_output_file}")
 
 
 def main() -> None:

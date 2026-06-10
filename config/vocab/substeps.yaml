@@ -168,10 +168,20 @@ substeps:
     run:
       type: python
       script: scripts/gen_matched_preview_v4.py
-      args: ["--ep", "{ep}"]
+      args: ["--ep", "{ep}", "--provider", "nvidia"]
 
   - no: "17"
-    key: "step17_inputs_list"
+    key: "step17_outro"
+    name: "片尾製作"
+    rule: all
+    outputs:
+      - pattern: "05_output/outro/outro_config.json"
+        nonempty: true
+      - pattern: "05_output/outro/outro_media.*"
+        nonempty: true
+
+  - no: "18"
+    key: "step18_inputs_list"
     name: "產生合成清單"
     rule: any
     outputs:
@@ -182,8 +192,8 @@ substeps:
       script: scripts/gen_matched_preview_v4.py
       args: ["--ep", "{ep}"]
 
-  - no: "18"
-    key: "step18_render"
+  - no: "19"
+    key: "step19_render"
     name: "FFmpeg 影片合成"
     rule: any
     outputs:
@@ -194,8 +204,8 @@ substeps:
       script: run_stage6_render.py
       args: ["--ep", "{ep}"]
 
-  - no: "19"
-    key: "step19_youtube_meta"
+  - no: "20"
+    key: "step20_youtube_meta"
     name: "產生 Youtube metadata"
     rule: any
     outputs:
@@ -206,8 +216,8 @@ substeps:
       script: scripts/generate_youtube_meta.py
       args: ["--ep", "{ep}"]
 
-  - no: "20"
-    key: "step20_upload_youtube"
+  - no: "21"
+    key: "step21_upload_youtube"
     name: "上傳 Youtube"
     rule: any
     outputs:

@@ -7,12 +7,16 @@ from pathlib import Path
 import srt
 from dotenv import load_dotenv
 
-from llm_provider_utils import DEFAULT_NVIDIA_TEXT_MODEL, nvidia_chat_response
+from llm_provider_utils import nvidia_chat_response
 
 VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
 GEMINI_MODEL = os.getenv("CAP_SHORT_STORYBOARD_GEMINI_MODEL", os.getenv("CAP_TEXT_MODEL", "gemini-2.5-pro"))
 OPENAI_MODEL = os.getenv("CAP_SHORT_STORYBOARD_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
-NVIDIA_MODEL = os.getenv("CAP_SHORT_STORYBOARD_NVIDIA_MODEL", DEFAULT_NVIDIA_TEXT_MODEL)
+NVIDIA_MODEL = os.getenv("CAP_SHORT_STORYBOARD_NVIDIA_MODEL", "deepseek-ai/deepseek-v4-flash")
+NVIDIA_FALLBACK_MODEL = os.getenv(
+    "CAP_SHORT_STORYBOARD_NVIDIA_FALLBACK_MODEL",
+    os.getenv("CAP_SUBTITLE_REVIEW_NVIDIA_FALLBACK_MODEL", "nvidia/llama-3.1-nemotron-nano-8b-v1"),
+)
 
 
 def normalize_provider(value: str | None) -> str:
@@ -68,6 +72,107 @@ def parse_json_array(text: str) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError("model response must be a JSON array or object with scenes array")
     return [item for item in data if isinstance(item, dict)]
+
+
+def read_existing_storyboard(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    if isinstance(data, dict) and isinstance(data.get("scenes"), list):
+        data = data["scenes"]
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def resolve_asset_path(ep_dir: Path, value: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.is_absolute() else ep_dir / path
+
+
+def scene_number(row: dict, fallback: int) -> int:
+    try:
+        return int(row.get("scene", row.get("scene_id", fallback)) or fallback)
+    except Exception:
+        return fallback
+
+
+def row_seconds(row: dict, start_key: str, fallback: float) -> float:
+    try:
+        value = row.get(start_key)
+        if value is None and start_key == "start_seconds":
+            value = row.get("start_time")
+        if value is None and start_key == "end_seconds":
+            value = row.get("end_time")
+        return float(value if value is not None else fallback)
+    except Exception:
+        return fallback
+
+
+def is_standard_scene_asset(path: Path, scene_no: int) -> bool:
+    stem = path.stem.lower()
+    return stem in {f"scene_{scene_no:03d}", f"scene_{scene_no}"}
+
+
+def is_manual_asset_value(ep_dir: Path, row: dict, key: str, scene_no: int) -> bool:
+    path = resolve_asset_path(ep_dir, str(row.get(key, "") or ""))
+    if not path or not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    if "_upload_" in path.name.lower():
+        return True
+    return not is_standard_scene_asset(path, scene_no)
+
+
+def preserved_asset_fields(ep_dir: Path, row: dict, scene_no: int) -> dict:
+    preserved = {}
+    for key in ("asset", "image_asset", "animation_asset", "animation_video_path"):
+        if is_manual_asset_value(ep_dir, row, key, scene_no):
+            preserved[key] = str(row.get(key, "") or "").strip()
+    return preserved
+
+
+def overlap_seconds(left: dict, right: dict) -> float:
+    left_start = row_seconds(left, "start_seconds", 0.0)
+    left_end = row_seconds(left, "end_seconds", left_start)
+    right_start = row_seconds(right, "start_seconds", 0.0)
+    right_end = row_seconds(right, "end_seconds", right_start)
+    return max(0.0, min(left_end, right_end) - max(left_start, right_start))
+
+
+def carry_manual_assets(existing_rows: list[dict], scenes: list[dict], output_json: Path) -> int:
+    ep_dir = output_json.parent.parent
+    candidates = []
+    for idx, row in enumerate(existing_rows, 1):
+        no = scene_number(row, idx)
+        fields = preserved_asset_fields(ep_dir, row, no)
+        if fields:
+            candidates.append({"idx": idx, "scene_no": no, "row": row, "fields": fields})
+
+    used = set()
+    preserved_count = 0
+    for idx, scene in enumerate(scenes, 1):
+        scene_no = scene_number(scene, idx)
+        match = next((item for item in candidates if item["idx"] not in used and item["scene_no"] == scene_no), None)
+        if not match:
+            scored = [
+                (overlap_seconds(scene, item["row"]), item)
+                for item in candidates
+                if item["idx"] not in used
+            ]
+            scored = [item for item in scored if item[0] > 0]
+            match = max(scored, key=lambda item: item[0])[1] if scored else None
+        if not match:
+            continue
+        scene.update(match["fields"])
+        used.add(match["idx"])
+        preserved_count += 1
+    return preserved_count
 
 
 def scene_subtitle_reference(entries: list[dict], start: float, end: float) -> str:
@@ -229,13 +334,31 @@ def review_with_openai(prompt: str) -> str:
     return str(response.output_text or "")
 
 
-def review_with_nvidia(prompt: str) -> str:
-    print(f"[INFO] provider=nvidia model={NVIDIA_MODEL}", flush=True)
+def review_with_nvidia(prompt: str, model: str | None = None) -> str:
+    selected_model = model or NVIDIA_MODEL
+    print(f"[INFO] provider=nvidia model={selected_model}", flush=True)
     return nvidia_chat_response(
         prompt,
-        model=NVIDIA_MODEL,
+        model=selected_model,
         system_prompt="You plan short video storyboards and output JSON arrays only.",
     )
+
+
+def review_with_nvidia_fallback(prompt: str) -> str:
+    models = [NVIDIA_MODEL]
+    if NVIDIA_FALLBACK_MODEL and NVIDIA_FALLBACK_MODEL not in models:
+        models.append(NVIDIA_FALLBACK_MODEL)
+
+    errors = []
+    for index, model in enumerate(models):
+        try:
+            return review_with_nvidia(prompt, model=model)
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+            if index + 1 < len(models):
+                print(f"[WARN] NVIDIA storyboard planning failed; trying fallback model: {exc}", flush=True)
+
+    raise RuntimeError("; ".join(errors))
 
 
 def is_gemini_quota_error(exc: Exception) -> bool:
@@ -246,6 +369,7 @@ def is_gemini_quota_error(exc: Exception) -> bool:
 def plan_storyboard(input_srt: Path, output_json: Path, provider: str, max_seconds: float) -> Path:
     load_dotenv()
     entries = read_srt_entries(input_srt)
+    existing_scenes = read_existing_storyboard(output_json)
     prompt = build_prompt(entries, max_seconds=max_seconds)
     prompt_path = output_json.with_name("storyboard_prompt.txt")
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,11 +403,11 @@ def plan_storyboard(input_srt: Path, output_json: Path, provider: str, max_secon
 
     if not raw_text and provider == "nvidia":
         try:
-            raw_text = review_with_nvidia(prompt)
+            raw_text = review_with_nvidia_fallback(prompt)
             provider_used = "nvidia"
         except Exception as exc:
             errors.append(f"NVIDIA: {exc}")
-            raise RuntimeError("; ".join(errors)) from exc
+            print(f"[WARN] NVIDIA storyboard planning failed; using local fallback scenes: {exc}", flush=True)
 
     raw_path = output_json.with_name("storyboard_ai_response.txt")
     if raw_text:
@@ -303,6 +427,8 @@ def plan_storyboard(input_srt: Path, output_json: Path, provider: str, max_secon
         scenes = fallback_scenes(entries, max_seconds=max_seconds, reason="local fallback because no normalized scenes were produced")
         provider_used = provider_used or "fallback"
 
+    preserved_asset_count = carry_manual_assets(existing_scenes, scenes, output_json)
+
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(scenes, ensure_ascii=False, indent=2), encoding="utf-8")
     meta = {
@@ -313,10 +439,13 @@ def plan_storyboard(input_srt: Path, output_json: Path, provider: str, max_secon
         "output_json": str(output_json),
         "prompt_path": str(prompt_path),
         "raw_response_path": str(raw_path) if raw_text else "",
+        "errors": errors,
+        "preserved_manual_asset_count": preserved_asset_count,
     }
     output_json.with_name("storyboard_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[INFO] provider_used={provider_used}", flush=True)
     print(f"[INFO] scene_count={len(scenes)}", flush=True)
+    print(f"[INFO] preserved_manual_asset_count={preserved_asset_count}", flush=True)
     print(f"[INFO] output_json={output_json}", flush=True)
     return output_json
 

@@ -157,9 +157,9 @@ def expand_batch_with_ai(word_list: list[str], provider: str) -> list[dict[str, 
                 print(f"❌ Gemini 產生單字內容失敗：{message}", flush=True)
                 return []
             if is_gemini_quota_error(exc):
-                print("⚠️ Gemini 額度或 spending cap 已耗盡，改用 OpenAI。", flush=True)
+                print("⚠️ Gemini 額度或 spending cap 已耗盡，改用 OpenAI，若 OpenAI 也失敗則改用 NVIDIA。", flush=True)
             else:
-                print(f"⚠️ Gemini 產生失敗，改用 OpenAI：{message}", flush=True)
+                print(f"⚠️ Gemini 產生失敗，改用 OpenAI，若 OpenAI 也失敗則改用 NVIDIA：{message}", flush=True)
 
     if provider in {"auto", "openai"}:
         try:
@@ -171,7 +171,7 @@ def expand_batch_with_ai(word_list: list[str], provider: str) -> list[dict[str, 
             errors.append(f"OpenAI: {message}")
             print(f"❌ OpenAI 產生單字內容失敗：{message}", flush=True)
 
-    if provider == "nvidia":
+    if provider in {"auto", "nvidia"}:
         try:
             rows = expand_batch_with_nvidia(word_list)
             print(f"   provider=nvidia model={NVIDIA_MODEL_ID} rows={len(rows)}", flush=True)
@@ -242,7 +242,7 @@ if __name__ == "__main__":
         "--provider",
         choices=sorted(VALID_PROVIDERS),
         default=os.getenv("CAP_VOCAB_LLM_PROVIDER", "auto"),
-        help="LLM provider: auto 會先用 Gemini，失敗後改用 OpenAI。",
+        help="LLM provider: auto 會先用 Gemini，失敗後改用 OpenAI，再失敗改用 NVIDIA。",
     )
     args = parser.parse_args()
 

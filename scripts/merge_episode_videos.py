@@ -120,11 +120,22 @@ def compose_srt(entries: list[dict]) -> str:
     return "\n\n".join(blocks).strip() + ("\n" if blocks else "")
 
 
+def selected_merge_video_path(item: dict) -> Path:
+    explicit = str(item.get("merge_video_path") or "").strip()
+    if explicit:
+        return Path(explicit).resolve()
+    if bool(item.get("include_outro")) and str(item.get("video_path_with_outro") or "").strip():
+        return Path(str(item.get("video_path_with_outro"))).resolve()
+    if not bool(item.get("include_outro")) and str(item.get("video_path_no_outro") or "").strip():
+        return Path(str(item.get("video_path_no_outro"))).resolve()
+    return Path(item["video_path"]).resolve()
+
+
 def concat_videos(items: list[dict], output_dir: Path) -> Path:
     concat_path = output_dir / "concat_list.txt"
     lines = []
     for item in items:
-        video_path = Path(item["video_path"]).resolve()
+        video_path = selected_merge_video_path(item)
         escaped = str(video_path).replace("\\", "/").replace("'", "'\\''")
         lines.append(f"file '{escaped}'")
     concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -162,7 +173,7 @@ def merge_subtitles(items: list[dict], output_dir: Path) -> Path:
     merged: list[dict] = []
     offset = 0.0
     for item in items:
-        video_path = Path(item["video_path"])
+        video_path = selected_merge_video_path(item)
         subtitle_path = Path(str(item.get("subtitle_path") or ""))
         duration = ffprobe_duration(video_path)
         entries = parse_srt(subtitle_path) if subtitle_path.exists() else []
@@ -232,9 +243,10 @@ def main() -> int:
             print(f"[merge] title={job.get('title', '')}", flush=True)
             print(f"[merge] output_dir={output_dir}", flush=True)
             for idx, item in enumerate(items, start=1):
+                video_path = selected_merge_video_path(item)
                 print(
                     f"[merge] item {idx}: {item.get('profile_name')} Ep{int(item.get('ep', 0)):02d} "
-                    f"video={item.get('video_path')}",
+                    f"outro={'yes' if item.get('include_outro') else 'no'} video={video_path}",
                     flush=True,
                 )
 

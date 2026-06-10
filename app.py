@@ -8,12 +8,13 @@ import base64
 import mimetypes
 import subprocess
 from io import BytesIO
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 from PIL import Image, ImageFile
+from dotenv import load_dotenv
 
 from app_utils.filesystem import (
     episode_dir_name,
@@ -23,6 +24,7 @@ from app_utils.filesystem import (
     read_status,
     write_status,
     video_output_path,
+    subtitles_raw_path,
     subtitles_fixed_path,
     audio_merged_path,
     images_dir,
@@ -70,8 +72,65 @@ from app_utils.schedules import (
     stop_schedule_job,
     write_schedule_job,
 )
+from app_utils.power import wake_timer_policy
+from app_sections.youtube_ai import (
+    configure_youtube_ai,
+    render_youtube_ai_dashboard,
+    render_youtube_ai_pipeline_manager,
+    render_youtube_ai_settings,
+)
+from app_sections.episode_merge import (
+    configure_episode_merge,
+    render_episode_merge_workspace,
+)
+from app_sections.short_generator import (
+    configure_short_generator,
+    render_short_factory,
+    render_short_management,
+)
+from app_sections.story import (
+    configure_story_section,
+    STORY_OPENAI_TTS_VOICES,
+    story_outline_options_path,
+    story_selected_json_path,
+    story_selected_md_path,
+    story_outline_json_path,
+    story_outline_md_path,
+    story_script_json_path,
+    story_script_md_path,
+    story_tts_text_path,
+    story_characters_json_path,
+    story_locations_json_path,
+    story_tts_lines_json_path,
+    story_tts_lines_csv_path,
+    story_voice_cast_json_path,
+    story_voice_segments_dir,
+    story_voice_previews_dir,
+    story_merged_audio_path,
+    story_subtitles_srt_path,
+    story_subtitles_json_path,
+    story_storyboard_csv_path,
+    story_storyboard_json_path,
+    default_story_voice_cast,
+    load_story_outline_options,
+    render_story_summary,
+    render_story_outline_result,
+    render_story_script_result,
+    render_story_characters_result,
+    render_story_locations_result,
+    render_story_tts_lines_result,
+    has_openai_api_key_configured,
+    render_story_voice_workspace,
+    render_story_subtitles_result,
+    render_story_storyboard_result,
+    render_story_selection_confirm,
+    render_story_inline_confirm_if_needed,
+    run_story_outline_selection,
+    render_story_outline_selection_panel,
+)
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 PROFILES_CFG = ROOT / "config" / "profiles.yaml"
@@ -98,11 +157,28 @@ PROFILE_SECTION_OPTIONS = {
     ],
 }
 
-def load_profiles():
-    if PROFILES_CFG.exists():
-        data = yaml.safe_load(PROFILES_CFG.read_text(encoding="utf-8")) or {}
+def file_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except FileNotFoundError:
+        return 0, 0
+
+
+@st.cache_data(show_spinner=False)
+def _load_profiles_cached(config_path: str, signature: tuple[int, int]) -> list[dict]:
+    _ = signature
+    path = Path(config_path)
+    if path.exists():
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return data.get("profiles", [])
     return []
+
+
+def load_profiles():
+    if PROFILES_CFG.exists():
+        return _load_profiles_cached(str(PROFILES_CFG), file_signature(PROFILES_CFG))
+    return _load_profiles_cached(str(PROFILES_CFG), (0, 0))
 
 def get_profile_map():
     profs = load_profiles()
@@ -183,6 +259,7 @@ PATH_SUBSTEPS = profile.get("substeps")
 PATH_COSTS = profile.get("costs")
 stage_cfg = load_stage_config(ROOT, PATH_STAGES)
 runner = StageRunner(ROOT, PATH_STAGES, (ROOT / WS_ROOT), profile_id=st.session_state["profile_id"])
+configure_youtube_ai(ROOT, WS_ROOT, runner)
 cost_model = load_cost_model(ROOT, PATH_COSTS)
 substeps_map = load_substeps_config(ROOT, PATH_SUBSTEPS)
 
@@ -308,21 +385,44 @@ DEFAULT_COVER_IMAGE_PROMPT_TEMPLATE = """請為《會考英文隨身聽》設計
 """
 DEFAULT_SUBTITLE_REVIEW_PROMPT_TEMPLATE = """你是一位專業的影片字幕校對專家。請針對以下 SRT 內容進行修正，並務必遵守下列規則：
 
+0. 參考資料：
+- 「No.8 產生語音摘要 Prompt」是本集 NotebookLM 語音內容的規劃與重點摘要，可用來判斷主題、單字、例句、段落順序與中英文脈絡。
+- 參考資料只用於校對文字，不可把未出現在字幕音訊中的內容新增進 SRT。
+- 若原始字幕與參考資料衝突，優先保留原始字幕的實際口語內容與時間軸。
+
 1. 單字修復與局部合併：
-- 僅在單字被切斷時合併，例如同一個英文單字被拆成兩個字幕序號。
+- 不要合併、刪除、拆分或重排任何字幕 cue。
+- No.12 的 LLM 只負責校正每個 cue 內的文字；英文斷句合併會由系統後處理完成。
 - 嚴禁因語意相近就合併不同序號。
 - 嚴禁跨句、跨段任意合併。
 
-2. 全面校對：
+2. 時間軸保護：
+- 必須保留每一筆原始字幕的序號、開始時間與結束時間。
+- 輸出 cue 數量必須與原始 SRT 完全相同。
+- 不可任意改動分鐘、秒數或順序。
+- 不可讓字幕突然跳到很後面的時間。
+- 不可遺漏大段中間字幕內容。
+
+3. 全面校對：
 - 修正英文拼字錯誤。
 - 根據上下文修正常見音近誤辨。
 - 關鍵單字可視情況加上引號，但不要破壞 SRT 結構。
+- 英文句尾不可使用中文句號「。」；請改成英文句號「.」。
 
-3. 時間軸與格式：
+4. 中文斷句與空格：
+- 修正中文被不自然拆字、斷詞或插入空格的情況，例如「這 是 一 個」應校正為「這是一個」。
+- 中文標點前不可有空格，中文標點後通常不需要空格。
+- 可依中文語意補上逗號、句號、問號或驚嘆號，讓句子更自然，但不可改寫成不同意思。
+- 不要把英文單字與中文強行黏在一起；中英混排可保留必要空格。
+
+5. 時間軸與格式：
 - 保持標準 SRT 格式。
-- 若因修復切字而局部合併，請重新整理序號。
+- 每一個字幕 cue 必須固定為：序號一行、時間軸一行、字幕文字一到多行、空白行。時間軸那一行只能有時間，不可把字幕文字接在時間軸後面。
 - 盡量讓相鄰字幕保留極短空隙。
 - 只輸出純 SRT，不要輸出 Markdown、解說或任何額外文字。
+
+【No.8 產生語音摘要 Prompt 參考】
+{{NOTEBOOKLM_PROMPT}}
 
 【原始字幕內容】
 {{SRT_CONTENT}}
@@ -349,7 +449,7 @@ DEFAULT_STORYBOARD_PROMPT_TEMPLATE = """你是一位專業的英語教學影片�
 3. 串場與故事畫面（AI）
 - 只有在沒有講解重點單字，且也不是克漏字解題/出題段落時，才可設為 "AI"。
 - AI 分鏡盡量控制在 10 到 30 秒之間，過長請拆分，過短可適度合併。
-- AI 分鏡必須提供完整英文 image_prompt，並固定以 ", aspect ratio 16:9, cinematic wide shot" 作結。
+- 你可以閱讀並使用中文字幕脈絡來理解畫面；但輸出的 image_prompt 必須是完整英文，不可直接保留中文、日文、韓文或非英文字幕原文。請把中文脈絡轉寫成英文畫面描述，並固定以 ", aspect ratio 16:9, cinematic wide shot" 作結。
 
 4. 人物一致性規則
 {{HOST_PROFILE_RULES}}
@@ -530,876 +630,6 @@ def story_generation_plan_table(plans: list[Dict]) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-def youtube_ai_workspace_path() -> Path:
-    return ROOT / WS_ROOT
-
-def youtube_ai_db_path() -> Path:
-    env_path = os.environ.get("YOUTUBE_AI_SQLITE_PATH", "workspaces/youtube_ai/youtube_ai.db")
-    path = Path(env_path)
-    return path if path.is_absolute() else ROOT / path
-
-def youtube_ai_channels_path() -> Path:
-    return youtube_ai_workspace_path() / "config" / "channels.json"
-
-def youtube_ai_settings_path() -> Path:
-    return youtube_ai_workspace_path() / "config" / "settings.json"
-
-def default_youtube_ai_settings() -> dict:
-    return {
-        "etl_days": 32,
-        "comments_per_video": 10,
-        "etl_log_auto_refresh": True,
-        "updated_at": "",
-    }
-
-def read_youtube_ai_settings() -> dict:
-    settings = default_youtube_ai_settings()
-    payload = read_json_file(youtube_ai_settings_path()) or {}
-    if isinstance(payload, dict):
-        settings.update({k: v for k, v in payload.items() if k in settings})
-    return settings
-
-def write_youtube_ai_settings(settings: dict) -> Path:
-    path = youtube_ai_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = default_youtube_ai_settings()
-    payload.update(settings)
-    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
-
-def read_youtube_ai_channels() -> list[dict]:
-    payload = read_json_file(youtube_ai_channels_path()) or {}
-    channels = payload.get("channels") if isinstance(payload, dict) else []
-    return channels if isinstance(channels, list) else []
-
-def write_youtube_ai_channels(channels: list[dict]) -> Path:
-    path = youtube_ai_channels_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"channels": channels, "updated_at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return path
-
-def sync_youtube_ai_channels_to_db(channels: list[dict]) -> None:
-    import sqlite3
-
-    db_path = youtube_ai_db_path()
-    if not db_path.exists():
-        return
-    conn = sqlite3.connect(db_path)
-    try:
-        now = datetime.now().isoformat(timespec="seconds")
-        for item in channels:
-            channel_id = str(item.get("channel_id", "")).strip()
-            if not channel_id:
-                continue
-            conn.execute(
-                """
-                INSERT INTO channels(channel_id, title, handle, status, sync_enabled, timezone, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET
-                    title=excluded.title,
-                    handle=excluded.handle,
-                    status=excluded.status,
-                    sync_enabled=excluded.sync_enabled,
-                    timezone=excluded.timezone,
-                    notes=excluded.notes,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    channel_id,
-                    str(item.get("title", "")).strip() or channel_id,
-                    str(item.get("handle", "")).strip(),
-                    str(item.get("status", "active")).strip() or "active",
-                    1 if item.get("sync_enabled", True) else 0,
-                    str(item.get("timezone", "Asia/Taipei")).strip() or "Asia/Taipei",
-                    str(item.get("notes", "")).strip(),
-                    now,
-                    now,
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-def youtube_ai_db_table_counts(db_path: Path) -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        tables = pd.read_sql_query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            conn,
-        )["name"].tolist()
-        rows = []
-        for table in tables:
-            count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-            rows.append({"資料表": table, "筆數": count})
-        return pd.DataFrame(rows)
-    finally:
-        conn.close()
-
-def youtube_ai_recent_etl_runs(db_path: Path, limit: int = 5) -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        return pd.read_sql_query(
-            """
-            SELECT id, run_type, started_at, ended_at, status, rows_written, error
-            FROM etl_runs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            conn,
-            params=(limit,),
-        ).fillna("")
-    finally:
-        conn.close()
-
-def youtube_ai_select_channel(channels: list[dict], key: str = "youtube_ai_selected_channel_id") -> tuple[str, list[dict]]:
-    options = [("全部頻道", "")]
-    for channel in channels:
-        channel_id = str(channel.get("channel_id", "")).strip()
-        if not channel_id:
-            continue
-        title = str(channel.get("title", "")).strip() or channel_id
-        handle = str(channel.get("handle", "")).strip()
-        label = f"{title} ({handle})" if handle else title
-        options.append((label, channel_id))
-
-    current = st.session_state.get(key, "")
-    ids = [item[1] for item in options]
-    index = ids.index(current) if current in ids else 0
-    selected_label = st.selectbox("Channel", [item[0] for item in options], index=index, key=f"{key}_label")
-    selected_id = dict(options).get(selected_label, "")
-    st.session_state[key] = selected_id
-    if selected_id:
-        return selected_id, [channel for channel in channels if str(channel.get("channel_id", "")).strip() == selected_id]
-    return "", channels
-
-def youtube_ai_channel_metrics_summary(db_path: Path, channel_id: str = "") -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        params = []
-        where = ""
-        if channel_id:
-            where = "WHERE v.channel_id = ?"
-            params.append(channel_id)
-        query = f"""
-            SELECT
-                COUNT(DISTINCT v.video_id) AS videos,
-                COALESCE(SUM(latest.views), 0) AS latest_views,
-                COALESCE(SUM(latest.likes), 0) AS latest_likes,
-                COALESCE(SUM(latest.comments), 0) AS latest_comments,
-                MAX(latest.metric_date) AS latest_metric_date
-            FROM videos v
-            LEFT JOIN (
-                SELECT m.*
-                FROM video_daily_metrics m
-                JOIN (
-                    SELECT video_id, MAX(metric_date) AS metric_date
-                    FROM video_daily_metrics
-                    GROUP BY video_id
-                ) lm
-                  ON lm.video_id = m.video_id
-                 AND lm.metric_date = m.metric_date
-            ) latest
-              ON latest.video_id = v.video_id
-            {where}
-        """
-        return pd.read_sql_query(query, conn, params=params).fillna("")
-    finally:
-        conn.close()
-
-def youtube_ai_video_performance(db_path: Path, channel_id: str = "") -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        params = []
-        where = ""
-        if channel_id:
-            where = "WHERE v.channel_id = ?"
-            params.append(channel_id)
-        query = f"""
-            SELECT
-                c.title AS channel_title,
-                v.channel_id,
-                v.video_id,
-                v.title,
-                v.published_at,
-                v.thumbnail_url,
-                m.metric_date,
-                COALESCE(m.views, 0) AS views,
-                COALESCE(m.impressions, 0) AS impressions,
-                COALESCE(m.ctr, 0) AS ctr,
-                COALESCE(m.likes, 0) AS likes,
-                COALESCE(m.comments, 0) AS comments,
-                COALESCE(m.shares, 0) AS shares,
-                COALESCE(m.average_view_duration_seconds, 0) AS average_view_duration_seconds,
-                COALESCE(m.average_view_percentage, 0) AS average_view_percentage,
-                COALESCE(m.subscribers_gained, 0) AS subscribers_gained,
-                COALESCE(m.subscribers_lost, 0) AS subscribers_lost,
-                COALESCE(m.lifetime_subscribers_gained, m.subscribers_gained, 0) AS lifetime_subscribers_gained,
-                COALESCE(m.lifetime_subscribers_lost, m.subscribers_lost, 0) AS lifetime_subscribers_lost,
-                COALESCE(m.raw_json, '') AS raw_json
-            FROM videos v
-            LEFT JOIN channels c ON c.channel_id = v.channel_id
-            LEFT JOIN video_daily_metrics m ON m.video_id = v.video_id
-            {where}
-            ORDER BY v.channel_id, v.video_id, m.metric_date
-        """
-        df = pd.read_sql_query(query, conn, params=params).fillna("")
-    finally:
-        conn.close()
-
-    if df.empty:
-        return df
-    df["metric_date"] = df["metric_date"].astype(str)
-    for col in [
-        "views",
-        "impressions",
-        "ctr",
-        "likes",
-        "comments",
-        "shares",
-        "average_view_duration_seconds",
-        "average_view_percentage",
-        "subscribers_gained",
-        "subscribers_lost",
-        "lifetime_subscribers_gained",
-        "lifetime_subscribers_lost",
-    ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df = df[df["metric_date"].str.len() > 0].copy()
-    if df.empty:
-        return df
-    latest = df.sort_values(["video_id", "metric_date"]).groupby("video_id", as_index=False).tail(1).copy()
-    latest["interactions"] = latest["likes"] + latest["comments"] + latest["shares"]
-    latest["影片連結"] = latest["video_id"].astype(str).apply(lambda video_id: f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
-    def estimated_minutes(row: pd.Series) -> float:
-        try:
-            raw = json.loads(str(row.get("raw_json") or "{}"))
-            value = raw.get("estimatedMinutesWatched")
-            if value not in (None, ""):
-                return float(value)
-        except Exception:
-            pass
-        return float(row.get("views", 0) or 0) * float(row.get("average_view_duration_seconds", 0) or 0) / 60.0
-    latest["estimated_minutes_watched"] = latest.apply(estimated_minutes, axis=1)
-    latest["watch_hours"] = latest["estimated_minutes_watched"] / 60.0
-    latest["views_from_impressions"] = latest.apply(
-        lambda row: int(round(float(row["impressions"]) * float(row["ctr"]) / 100.0)) if float(row["impressions"]) > 0 else 0,
-        axis=1,
-    )
-    latest["watch_hours_from_impressions"] = latest.apply(
-        lambda row: float(row["views_from_impressions"]) * float(row["average_view_duration_seconds"]) / 3600.0,
-        axis=1,
-    )
-    latest["engagement_rate"] = latest.apply(
-        lambda row: round((float(row["interactions"]) / float(row["views"]) * 100), 2) if float(row["views"]) > 0 else 0,
-        axis=1,
-    )
-    latest["net_subscribers"] = latest["subscribers_gained"] - latest["subscribers_lost"]
-    latest["lifetime_net_subscribers"] = latest["lifetime_subscribers_gained"] - latest["lifetime_subscribers_lost"]
-    latest = latest.sort_values(["views", "interactions"], ascending=[False, False])
-    return latest.reset_index(drop=True)
-
-YOUTUBE_TRAFFIC_SOURCE_LABELS = {
-    "ADVERTISING": "廣告",
-    "ANNOTATION": "註解",
-    "CAMPAIGN_CARD": "資訊卡",
-    "END_SCREEN": "片尾畫面",
-    "EXT_URL": "外部連結",
-    "HASHTAGS": "Hashtags",
-    "NO_LINK_OTHER": "其他 YouTube 功能",
-    "NO_LINK_EMBEDDED": "嵌入播放器",
-    "NO_LINK_YT_OTHER": "其他 YouTube 來源",
-    "NOTIFICATION": "通知",
-    "PLAYLIST": "播放清單",
-    "PROMOTED": "付費推廣",
-    "RELATED_VIDEO": "推薦影片",
-    "SHORTS": "Shorts",
-    "SOUND_PAGE": "音效頁",
-    "SUBSCRIBER": "訂閱內容",
-    "YT_CHANNEL": "頻道頁",
-    "YT_SEARCH": "YouTube 搜尋",
-    "YT_OTHER_PAGE": "其他 YouTube 頁面",
-}
-
-def youtube_ai_traffic_sources(db_path: Path, channel_id: str = "", scope: str = "channel", video_id: str = "") -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        params = [scope]
-        where = "WHERE scope = ?"
-        if channel_id:
-            where += " AND channel_id = ?"
-            params.append(channel_id)
-        if video_id:
-            where += " AND video_id = ?"
-            params.append(video_id)
-        query = f"""
-            SELECT
-                source_type,
-                SUM(views) AS views,
-                SUM(watch_time_minutes) AS watch_time_minutes,
-                AVG(average_view_duration_seconds) AS average_view_duration_seconds,
-                MAX(metric_date) AS metric_date
-            FROM traffic_sources
-            {where}
-            GROUP BY source_type
-            ORDER BY views DESC
-        """
-        df = pd.read_sql_query(query, conn, params=params).fillna("")
-    finally:
-        conn.close()
-    if df.empty:
-        return df
-    for col in ["views", "watch_time_minutes", "average_view_duration_seconds"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    total_views = float(df["views"].sum())
-    total_watch = float(df["watch_time_minutes"].sum())
-    df["source_label"] = df["source_type"].map(YOUTUBE_TRAFFIC_SOURCE_LABELS).fillna(df["source_type"])
-    df["views_share"] = df["views"].apply(lambda value: round(float(value) / total_views * 100, 2) if total_views else 0)
-    df["watch_time_hours"] = df["watch_time_minutes"] / 60.0
-    df["watch_time_share"] = df["watch_time_minutes"].apply(lambda value: round(float(value) / total_watch * 100, 2) if total_watch else 0)
-    return df
-
-def youtube_ai_video_top_traffic_sources(db_path: Path, channel_id: str = "") -> pd.DataFrame:
-    import sqlite3
-
-    if not db_path.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(db_path)
-    try:
-        params = []
-        where = "WHERE scope = 'video'"
-        if channel_id:
-            where += " AND channel_id = ?"
-            params.append(channel_id)
-        query = f"""
-            SELECT video_id, source_type, SUM(views) AS views
-            FROM traffic_sources
-            {where}
-            GROUP BY video_id, source_type
-            ORDER BY video_id, views DESC
-        """
-        df = pd.read_sql_query(query, conn, params=params).fillna("")
-    finally:
-        conn.close()
-    if df.empty:
-        return df
-    df["views"] = pd.to_numeric(df["views"], errors="coerce").fillna(0)
-    top = df.sort_values(["video_id", "views"], ascending=[True, False]).groupby("video_id", as_index=False).head(1).copy()
-    top["主要流量來源"] = top["source_type"].map(YOUTUBE_TRAFFIC_SOURCE_LABELS).fillna(top["source_type"])
-    top["主要來源 Views"] = top["views"].astype(int)
-    return top[["video_id", "主要流量來源", "主要來源 Views"]]
-
-def render_youtube_ai_reports(db_path: Path, channel_id: str, visible_channels: list[dict]) -> None:
-    st.markdown("**頻道健康總覽**")
-    performance = youtube_ai_video_performance(db_path, channel_id)
-    if performance.empty:
-        st.info("尚未有可用的影片指標。請先在 Pipeline Manager 執行 Daily ETL。")
-        return
-
-    total_subscribers = sum(int(channel.get("subscriber_count", 0) or 0) for channel in visible_channels)
-    total_views = int(performance["views"].sum())
-    total_watch_hours = float(performance["watch_hours"].sum())
-    total_interactions = int(performance["interactions"].sum())
-    avg_duration = float(performance["average_view_duration_seconds"].mean())
-    avg_percentage = float(performance["average_view_percentage"].mean())
-    health_rows = [
-        {"指標": "目前訂閱數", "數值": f"{total_subscribers:,}", "說明": "來自 Channel 同步資料"},
-        {"指標": "累積觀看時數", "數值": f"{total_watch_hours:,.1f}", "說明": "本次 ETL 區間內每支影片最新指標彙總"},
-        {"指標": "觀看數", "數值": f"{total_views:,}", "說明": "本次 ETL 區間彙總"},
-        {"指標": "互動數", "數值": f"{total_interactions:,}", "說明": "按讚 + 留言 + 分享"},
-        {"指標": "平均觀看秒數", "數值": f"{avg_duration:.1f}", "說明": "影片平均"},
-        {"指標": "平均觀看比例", "數值": f"{avg_percentage:.1f}%", "說明": "影片平均"},
-    ]
-    st.dataframe(pd.DataFrame(health_rows), use_container_width=True, hide_index=True)
-
-    st.caption("健康總覽使用每支影片最新一筆 ETL 指標彙總，適合快速判斷目前頻道內容池的整體狀態。")
-
-    st.markdown("**流量來源輪廓**")
-    traffic_df = youtube_ai_traffic_sources(db_path, channel_id, scope="channel")
-    if traffic_df.empty:
-        st.info("尚未有流量來源資料。請重新執行 Daily ETL 以同步 insightTrafficSourceType。")
-    else:
-        traffic_table = traffic_df[
-            ["source_label", "views", "views_share", "watch_time_hours", "watch_time_share", "average_view_duration_seconds"]
-        ].rename(
-            columns={
-                "source_label": "流量來源",
-                "views": "Views",
-                "views_share": "Views 佔比%",
-                "watch_time_hours": "Watch time hours",
-                "watch_time_share": "Watch time 佔比%",
-                "average_view_duration_seconds": "Average view duration",
-            }
-        )
-        traffic_table["Watch time hours"] = pd.to_numeric(traffic_table["Watch time hours"], errors="coerce").fillna(0).round(1)
-        traffic_table["Average view duration"] = pd.to_numeric(traffic_table["Average view duration"], errors="coerce").fillna(0).round(1)
-        st.dataframe(traffic_table, use_container_width=True, hide_index=True)
-        chart_df = traffic_table.set_index("流量來源")[["Views"]]
-        st.bar_chart(chart_df)
-
-    st.markdown("**Impressions 漏斗**")
-    total_impressions = int(performance["impressions"].sum())
-    total_views_from_impressions = int(performance["views_from_impressions"].sum())
-    total_watch_hours_from_impressions = float(performance["watch_hours_from_impressions"].sum())
-    overall_ctr = (total_views_from_impressions / total_impressions * 100.0) if total_impressions else 0.0
-    funnel_rows = [
-        {"階段": "Impressions", "數值": f"{total_impressions:,}" if total_impressions else "尚未由 API 提供", "轉換率": "100%" if total_impressions else "—"},
-        {"階段": "Click-through rate", "數值": f"{overall_ctr:.2f}%" if total_impressions else "尚未由 API 提供", "轉換率": f"{overall_ctr:.2f}%" if total_impressions else "—"},
-        {"階段": "Views from impressions", "數值": f"{total_views_from_impressions:,}" if total_impressions else "尚未由 API 提供", "轉換率": f"{overall_ctr:.2f}%" if total_impressions else "—"},
-        {"階段": "Watch time from impressions (hours)", "數值": f"{total_watch_hours_from_impressions:,.1f}" if total_impressions else "尚未由 API 提供", "轉換率": "—"},
-    ]
-    st.dataframe(pd.DataFrame(funnel_rows), use_container_width=True, hide_index=True)
-    if total_impressions:
-        st.progress(min(max(overall_ctr / 100.0, 0.0), 1.0), text=f"Impressions → Views CTR {overall_ctr:.2f}%")
-    else:
-        st.caption("YouTube Analytics API 目前未回傳 YouTube Studio 的 Impressions / CTR 漏斗指標；欄位保留，待後續資料源支援後會自動呈現。")
-
-    st.markdown("**影片表現排行**")
-    with st.expander("欄位說明", expanded=False):
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {"欄位": "Channel", "說明": "影片所屬的 YouTube 頻道。"},
-                    {"欄位": "影片標題", "說明": "目前同步到資料庫的影片標題。"},
-                    {"欄位": "影片連結", "說明": "可直接開啟 YouTube 影片頁面的連結。"},
-                    {"欄位": "上架日期", "說明": "影片發布到 YouTube 的時間。"},
-                    {"欄位": "指標日期", "說明": "這筆排行資料使用的 ETL 指標日期。"},
-                    {"欄位": "觀看數", "說明": "該影片在目前同步指標中的觀看數。"},
-                    {"欄位": "Impressions", "說明": "YouTube 顯示影片縮圖的次數；目前官方 Analytics API 未回傳時會顯示 0。"},
-                    {"欄位": "Click-through rate", "說明": "從 Impressions 點進觀看的比例。"},
-                    {"欄位": "Views from impressions", "說明": "由 Impressions 估算或資料源回傳的觀看數。"},
-                    {"欄位": "Watch time from impressions (hours)", "說明": "由 Impressions 帶來的觀看時數。"},
-                    {"欄位": "按讚 / 留言 / 分享", "說明": "該影片的互動資料。"},
-                    {"欄位": "互動率%", "說明": "(按讚 + 留言 + 分享) / 觀看數 * 100。"},
-                    {"欄位": "平均觀看秒數", "說明": "觀眾平均觀看此影片的秒數。"},
-                    {"欄位": "平均觀看比例%", "說明": "觀眾平均看完影片長度的百分比。"},
-                    {"欄位": "累積訂閱增加", "說明": "此影片自上架以來帶來的新訂閱數。"},
-                    {"欄位": "累積訂閱流失", "說明": "此影片自上架以來造成的取消訂閱數。"},
-                    {"欄位": "累積淨訂閱", "說明": "累積訂閱增加 - 累積訂閱流失。"},
-                    {"欄位": "觀看時數", "說明": "此影片在 ETL 區間內累積的觀看時數。"},
-                    {"欄位": "主要流量來源", "說明": "該影片觀看數最高的 insightTrafficSourceType。"},
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-    rank_cols = st.columns([1, 1, 1, 1])
-    rank_mode = rank_cols[0].selectbox("排行指標", ["觀看數", "累積訂閱增加", "累積淨訂閱", "互動率", "平均觀看比例", "平均觀看秒數"], key="youtube_ai_rank_metric")
-    rank_direction = rank_cols[1].selectbox("排行方向", ["Top", "Bottom"], key="youtube_ai_rank_direction")
-    limit = int(rank_cols[2].slider("顯示影片數", min_value=5, max_value=50, value=10, step=5, key="youtube_ai_rank_limit"))
-    freeze_view = rank_cols[3].toggle("凍結識別欄", value=True, key="youtube_ai_rank_freeze_view")
-
-    metric_map = {
-        "觀看數": "views",
-        "累積訂閱增加": "lifetime_subscribers_gained",
-        "累積淨訂閱": "lifetime_net_subscribers",
-        "互動率": "engagement_rate",
-        "平均觀看比例": "average_view_percentage",
-        "平均觀看秒數": "average_view_duration_seconds",
-    }
-    sort_col = metric_map[rank_mode]
-    ranked = performance.sort_values(sort_col, ascending=(rank_direction == "Bottom")).head(limit).copy()
-    top_sources = youtube_ai_video_top_traffic_sources(db_path, channel_id)
-    if not top_sources.empty:
-        ranked = ranked.merge(top_sources, on="video_id", how="left")
-    else:
-        ranked["主要流量來源"] = ""
-        ranked["主要來源 Views"] = 0
-    table = ranked[
-        [
-            "channel_title",
-            "title",
-            "影片連結",
-            "published_at",
-            "metric_date",
-            "views",
-            "impressions",
-            "ctr",
-            "views_from_impressions",
-            "watch_hours_from_impressions",
-            "likes",
-            "comments",
-            "shares",
-            "engagement_rate",
-            "average_view_duration_seconds",
-            "average_view_percentage",
-            "lifetime_subscribers_gained",
-            "lifetime_subscribers_lost",
-            "lifetime_net_subscribers",
-            "watch_hours",
-            "主要流量來源",
-            "主要來源 Views",
-        ]
-    ].rename(
-        columns={
-            "channel_title": "Channel",
-            "title": "影片標題",
-            "published_at": "上架日期",
-            "metric_date": "指標日期",
-            "views": "觀看數",
-            "impressions": "Impressions",
-            "ctr": "Click-through rate",
-            "views_from_impressions": "Views from impressions",
-            "watch_hours_from_impressions": "Watch time from impressions (hours)",
-            "likes": "按讚",
-            "comments": "留言",
-            "shares": "分享",
-            "engagement_rate": "互動率%",
-            "average_view_duration_seconds": "平均觀看秒數",
-            "average_view_percentage": "平均觀看比例%",
-            "lifetime_subscribers_gained": "累積訂閱增加",
-            "lifetime_subscribers_lost": "累積訂閱流失",
-            "lifetime_net_subscribers": "累積淨訂閱",
-            "watch_hours": "觀看時數",
-        }
-    )
-    table["上架日期"] = pd.to_datetime(table["上架日期"], errors="coerce").dt.strftime("%Y-%m-%d")
-    table["上架日期"] = table["上架日期"].fillna("")
-    table["觀看時數"] = pd.to_numeric(table["觀看時數"], errors="coerce").fillna(0).round(1)
-    table["Click-through rate"] = pd.to_numeric(table["Click-through rate"], errors="coerce").fillna(0).round(2)
-    table["Watch time from impressions (hours)"] = pd.to_numeric(table["Watch time from impressions (hours)"], errors="coerce").fillna(0).round(1)
-    link_config = {"影片連結": st.column_config.LinkColumn("影片連結", display_text="開啟影片")}
-    if freeze_view:
-        st.caption("凍結識別欄視圖：左側保留 Channel / 影片 / 連結 / 上架日期，右側顯示可橫向瀏覽的數據欄位。")
-        left_cols = ["Channel", "影片標題", "影片連結", "上架日期"]
-        metric_cols = [col for col in table.columns if col not in left_cols]
-        left_panel, right_panel = st.columns([1.35, 2.65])
-        with left_panel:
-            st.dataframe(table[left_cols], use_container_width=True, hide_index=True, height=420, column_config=link_config)
-        with right_panel:
-            st.dataframe(table[metric_cols], use_container_width=True, hide_index=True, height=420)
-    else:
-        st.dataframe(
-            table,
-            use_container_width=True,
-            hide_index=True,
-            column_config=link_config,
-        )
-
-    chart_df = ranked[["title", sort_col]].copy()
-    chart_df["title"] = chart_df["title"].astype(str).str.slice(0, 40)
-    chart_df = chart_df.rename(columns={"title": "影片", sort_col: rank_mode}).set_index("影片")
-    st.bar_chart(chart_df)
-
-def render_youtube_ai_dashboard() -> None:
-    st.subheader("YouTube AI 增長專家系統")
-    st.caption("頻道健康狀態、最近同步結果與後續 AI 診斷摘要。")
-
-    workspace = youtube_ai_workspace_path()
-    db_path = youtube_ai_db_path()
-    channels = read_youtube_ai_channels()
-    selected_channel_id, visible_channels = youtube_ai_select_channel(channels)
-    recent_runs = youtube_ai_recent_etl_runs(db_path)
-    summary_df = youtube_ai_channel_metrics_summary(db_path, selected_channel_id)
-    summary = summary_df.iloc[0].to_dict() if not summary_df.empty else {}
-    latest_status = "尚無紀錄"
-    latest_ended = "—"
-    if not recent_runs.empty:
-        latest_status = str(recent_runs.iloc[0].get("status") or "—")
-        latest_ended = str(recent_runs.iloc[0].get("ended_at") or "—")
-
-    status_rows = [
-        {"項目": "已同步 Channel", "值": len(visible_channels)},
-        {"項目": "影片數", "值": int(summary.get("videos") or 0)},
-        {"項目": "最近 ETL", "值": latest_status},
-        {"項目": "完成時間", "值": latest_ended},
-        {"項目": "指標日期", "值": str(summary.get("latest_metric_date") or "—")},
-    ]
-    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
-
-    if visible_channels:
-        st.markdown("**已同步 Channel**")
-        df = pd.DataFrame(visible_channels)
-        display_cols = [c for c in ["title", "handle", "channel_id", "subscriber_count", "video_count", "view_count", "updated_at"] if c in df.columns]
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("尚未同步 Channel。請到 Settings 進行 OAuth 授權與 Channel 同步。")
-
-    if not recent_runs.empty:
-        st.markdown("**最近 ETL 執行紀錄**")
-        st.dataframe(recent_runs, use_container_width=True, hide_index=True)
-    else:
-        st.caption("尚無 ETL 執行紀錄。")
-
-    if db_path.exists():
-        with st.expander("資料庫摘要", expanded=False):
-            st.dataframe(youtube_ai_db_table_counts(db_path), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("**報表開發區**")
-    render_youtube_ai_reports(db_path, selected_channel_id, visible_channels)
-
-def render_youtube_ai_settings() -> None:
-    st.subheader("YouTube AI Settings")
-    st.caption("資料庫、OAuth、Channel 同步與 Daily ETL 預設參數。")
-
-    workspace = youtube_ai_workspace_path()
-    db_path = youtube_ai_db_path()
-    channels_path = youtube_ai_channels_path()
-    settings = read_youtube_ai_settings()
-
-    cols = st.columns(4)
-    cols[0].metric("DB Provider", os.environ.get("YOUTUBE_AI_DB_PROVIDER", "sqlite"))
-    cols[1].metric("Project", os.environ.get("YOUTUBE_AI_PROJECT_NAME", "YoutubeAnalysis"))
-    cols[2].metric("Settings", "已建立" if youtube_ai_settings_path().exists() else "尚未建立")
-    cols[3].metric("Channels", len(read_youtube_ai_channels()))
-
-    st.markdown("**資料庫資訊**")
-    info_rows = [
-        {"項目": "Workspace", "值": str(workspace)},
-        {"項目": "SQLite DB", "值": str(db_path)},
-        {"項目": "Schema SQL", "值": str(workspace / "youtube_ai_schema.sql")},
-        {"項目": "Channels Config", "值": str(channels_path)},
-        {"項目": "Settings Config", "值": str(youtube_ai_settings_path())},
-        {"項目": "Supabase URL", "值": os.environ.get("YOUTUBE_AI_SUPABASE_URL", "") or "尚未設定"},
-    ]
-    st.dataframe(pd.DataFrame(info_rows), use_container_width=True, hide_index=True)
-
-    init_step = {"name": "初始化 YouTube AI 資料庫", "type": "python", "script": "scripts/youtube_ai_init_db.py", "args": []}
-    init_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_init")
-    if st.button("建立 / 更新資料庫", disabled=bool(init_state.get("running")), key="youtube_ai_init_db"):
-        workspace.mkdir(parents=True, exist_ok=True)
-        res = runner.start_substep({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_init", init_step)
-        if res.get("ok"):
-            st.success(f"已啟動資料庫初始化：{res.get('log')}")
-        else:
-            st.error(f"初始化失敗：{res.get('message')}")
-    if init_state.get("running"):
-        st.info(f"資料庫初始化執行中，PID {init_state.get('pid')}")
-
-    st.divider()
-    st.markdown("**OAuth 授權與 Channel 同步**")
-    client_secret_path = ROOT / "client_secret.json"
-    oauth_cols = st.columns(4)
-    oauth_cols[0].metric("client_secret.json", "已找到" if client_secret_path.exists() else "缺少")
-    oauth_cols[1].metric("OAuth Tokens", len(list((workspace / "oauth_tokens").glob("token_youtube_ai_*.pickle"))) if (workspace / "oauth_tokens").exists() else 0)
-    oauth_cols[2].metric("已同步 Channel", len(read_youtube_ai_channels()))
-    oauth_cols[3].metric("Scopes", "YouTube + Analytics")
-    if not client_secret_path.exists():
-        st.warning(f"找不到 OAuth client_secret.json：{client_secret_path}。請先放入 Google OAuth Desktop Client 設定檔。")
-    st.caption("新增監控頻道會透過 OAuth 2.0 授權後呼叫 YouTube API 自動取得。不同 Google 帳號請使用不同授權標籤，避免 token 互相覆蓋。")
-
-    oauth_label = st.text_input(
-        "授權標籤",
-        value="capital_currents",
-        key="youtube_ai_oauth_account_label",
-        help="建議使用頻道或帳號易懂代號，例如 capital_currents、digital_10。不同頻道請使用不同標籤。",
-    )
-    oauth_args = ["--account-label", oauth_label.strip() or "default"]
-
-    sync_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_oauth_sync")
-    oc1, oc2 = st.columns([1, 1])
-    with oc1:
-        if st.button("新增 / 同步監控頻道", disabled=bool(sync_state.get("running")) or not client_secret_path.exists(), key="youtube_ai_oauth_sync"):
-            workspace.mkdir(parents=True, exist_ok=True)
-            res = runner.start_substep(
-                {"path": workspace, "ep": 0, "start": 0, "end": 0},
-                "yt_oauth_sync",
-                {"name": "新增 / 同步監控頻道", "type": "python", "script": "scripts/youtube_ai_sync_channels.py", "args": oauth_args},
-            )
-            if res.get("ok"):
-                st.success(f"已啟動監控頻道同步：{res.get('log')}")
-            else:
-                st.error(f"監控頻道同步啟動失敗：{res.get('message')}")
-    with oc2:
-        if st.button("新增其他 Google 帳號 / 重新授權", disabled=bool(sync_state.get("running")) or not client_secret_path.exists(), key="youtube_ai_oauth_reauth"):
-            res = runner.start_substep(
-                {"path": workspace, "ep": 0, "start": 0, "end": 0},
-                "yt_oauth_sync",
-                {"name": "新增其他 Google 帳號 / 重新授權", "type": "python", "script": "scripts/youtube_ai_sync_channels.py", "args": oauth_args + ["--force-reauth"]},
-            )
-            if res.get("ok"):
-                st.success(f"已啟動重新授權：{res.get('log')}")
-            else:
-                st.error(f"重新授權啟動失敗：{res.get('message')}")
-    if sync_state.get("running"):
-        st.info(f"OAuth 同步執行中，PID {sync_state.get('pid')}。若瀏覽器授權視窗未自動開啟，請查看執行環境。")
-
-    st.markdown("**已授權 / 已同步 Channel**")
-    channels = read_youtube_ai_channels()
-    if channels:
-        df = pd.DataFrame(channels)
-        display_cols = [c for c in ["channel_id", "title", "handle", "subscriber_count", "video_count", "view_count", "status", "updated_at"] if c in df.columns]
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("尚未同步 Channel。請按「OAuth 授權並同步 Channel」。")
-
-    st.divider()
-    st.markdown("**Daily ETL 預設參數**")
-    with st.form("youtube_ai_settings_form"):
-        c1, c2, c3 = st.columns(3)
-        etl_days = int(c1.number_input("預設同步天數", min_value=1, max_value=90, value=int(settings.get("etl_days", 32)), step=1))
-        comments_per_video = int(c2.number_input("每支影片留言數", min_value=0, max_value=100, value=int(settings.get("comments_per_video", 10)), step=5))
-        etl_log_auto_refresh = c3.checkbox("ETL Log 預設自動刷新", value=bool(settings.get("etl_log_auto_refresh", True)))
-        submitted = st.form_submit_button("儲存 Settings")
-    if submitted:
-        saved_path = write_youtube_ai_settings(
-            {
-                "etl_days": etl_days,
-                "comments_per_video": comments_per_video,
-                "etl_log_auto_refresh": etl_log_auto_refresh,
-            }
-        )
-        st.success(f"已儲存 Settings：{saved_path}")
-
-def render_youtube_ai_pipeline_manager() -> None:
-    st.subheader("YouTube AI Pipeline Manager")
-    st.caption("人工執行資料同步、查看 log 與最近執行紀錄。")
-
-    workspace = youtube_ai_workspace_path()
-    db_path = youtube_ai_db_path()
-    settings = read_youtube_ai_settings()
-    etl_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_daily_etl")
-    etl_log_path = Path(etl_state.get("log") or log_file_for_stage(workspace, "subyt_daily_etl"))
-
-    with st.expander("Daily ETL 指標同步", expanded=False):
-        st.caption("同步 views、watch time、traffic source、訂閱歸因、影片 metadata 與留言。")
-        e1, e2, e3 = st.columns([1, 1, 2])
-        with e1:
-            etl_days = int(st.number_input("同步天數", min_value=1, max_value=90, value=int(settings.get("etl_days", 32)), step=1, key="youtube_ai_etl_days"))
-        with e2:
-            comments_per_video = int(st.number_input("每支影片留言數", min_value=0, max_value=100, value=int(settings.get("comments_per_video", 10)), step=5, key="youtube_ai_comments_per_video"))
-        with e3:
-            st.write("")
-            st.write("")
-            if st.button("執行 Daily ETL", disabled=bool(etl_state.get("running")), key="youtube_ai_run_daily_etl"):
-                res = runner.start_substep(
-                    {"path": workspace, "ep": 0, "start": 0, "end": 0},
-                    "yt_daily_etl",
-                    {
-                        "name": "自動化指標抓取 Daily ETL",
-                        "type": "python",
-                        "script": "scripts/youtube_ai_daily_etl.py",
-                        "args": ["--days", str(etl_days), "--comments-per-video", str(comments_per_video)],
-                    },
-                )
-                if res.get("ok"):
-                    st.success(f"已啟動 Daily ETL：{res.get('log')}")
-                else:
-                    st.error(f"Daily ETL 啟動失敗：{res.get('message')}")
-        if etl_state.get("running"):
-            st.info(f"Daily ETL 執行中，PID {etl_state.get('pid')}。")
-
-        auto_refresh_etl = st.toggle(
-            "自動刷新 Daily ETL Log",
-            value=bool(etl_state.get("running")) or bool(settings.get("etl_log_auto_refresh", True)),
-            key="youtube_ai_etl_auto_refresh",
-            help="Daily ETL 執行中時，每 2 秒刷新狀態與最近 log。",
-        )
-        etl_refresh_interval = 2 if (auto_refresh_etl and bool(etl_state.get("running"))) else None
-
-        @st.fragment(run_every=etl_refresh_interval)
-        def render_youtube_ai_etl_log():
-            latest_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_daily_etl")
-            latest_log_path = Path(latest_state.get("log") or log_file_for_stage(workspace, "subyt_daily_etl"))
-            c1, c2, c3 = st.columns(3)
-            c1.metric("ETL 狀態", "執行中" if latest_state.get("running") else "閒置")
-            c2.metric("PID", latest_state.get("pid") or "—")
-            c3.metric("Log", latest_log_path.name)
-            if latest_log_path.exists():
-                try:
-                    log_text = latest_log_path.read_text(encoding="utf-8", errors="ignore")
-                except Exception as exc:
-                    st.error(f"讀取 log 失敗：{exc}")
-                    return
-                st.download_button(
-                    "下載 Daily ETL Log",
-                    data=log_text.encode("utf-8"),
-                    file_name=latest_log_path.name,
-                    key="youtube_ai_download_etl_log",
-                )
-                st.code(log_text[-8000:] if log_text else "Log 目前是空的。", language="text")
-            else:
-                st.caption(f"尚未建立 Daily ETL log：{latest_log_path}")
-
-        with st.expander("Daily ETL Log", expanded=False):
-            render_youtube_ai_etl_log()
-
-    with st.expander("Reporting API Reach Reports", expanded=False):
-        st.caption("預計同步 YouTube Reporting API bulk CSV 的 video_thumbnail_impressions 與 video_thumbnail_impressions_ctr。")
-        st.info("Reporting API 是非同步批次報告。第一次建立 job 後通常需要等待 YouTube 產生日報，Impressions / CTR 也可能有 2–3 天延遲。")
-        reach_job_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_reach_jobs")
-        reach_import_state = runner.get_substep_state({"path": workspace, "ep": 0, "start": 0, "end": 0}, "yt_reach_import")
-        r1, r2 = st.columns(2)
-        with r1:
-            if st.button("建立 / 確認 Reach Report Job", disabled=bool(reach_job_state.get("running")), key="youtube_ai_reach_job"):
-                res = runner.start_substep(
-                    {"path": workspace, "ep": 0, "start": 0, "end": 0},
-                    "yt_reach_jobs",
-                    {
-                        "name": "建立 / 確認 Reach Report Job",
-                        "type": "python",
-                        "script": "scripts/youtube_ai_reporting_reach_jobs.py",
-                        "args": [],
-                    },
-                )
-                if res.get("ok"):
-                    st.success(f"已啟動 Reach Report Job 檢查：{res.get('log')}")
-                else:
-                    st.error(f"啟動失敗：{res.get('message')}")
-        with r2:
-            if st.button("下載 / 匯入 Reach Reports", disabled=bool(reach_import_state.get("running")), key="youtube_ai_reach_import"):
-                res = runner.start_substep(
-                    {"path": workspace, "ep": 0, "start": 0, "end": 0},
-                    "yt_reach_import",
-                    {
-                        "name": "下載 / 匯入 Reach Reports",
-                        "type": "python",
-                        "script": "scripts/youtube_ai_reporting_reach_import.py",
-                        "args": [],
-                    },
-                )
-                if res.get("ok"):
-                    st.success(f"已啟動 Reach Reports 匯入：{res.get('log')}")
-                else:
-                    st.error(f"啟動失敗：{res.get('message')}")
-        if reach_job_state.get("running"):
-            st.info(f"Reach Report Job 檢查執行中，PID {reach_job_state.get('pid')}。")
-        if reach_import_state.get("running"):
-            st.info(f"Reach Reports 匯入執行中，PID {reach_import_state.get('pid')}。")
-
-        reach_logs = [
-            ("Reach Job Log", Path(reach_job_state.get("log") or log_file_for_stage(workspace, "subyt_reach_jobs"))),
-            ("Reach Import Log", Path(reach_import_state.get("log") or log_file_for_stage(workspace, "subyt_reach_import"))),
-        ]
-        for label, log_path in reach_logs:
-            with st.expander(label, expanded=False):
-                if log_path.exists():
-                    log_text = log_path.read_text(encoding="utf-8", errors="ignore")
-                    st.code(log_text[-8000:] if log_text else "Log 目前是空的。", language="text")
-                else:
-                    st.caption(f"尚未建立 log：{log_path}")
-
-    with st.expander("最近執行紀錄", expanded=False):
-        recent_runs = youtube_ai_recent_etl_runs(db_path)
-        if not recent_runs.empty:
-            st.dataframe(recent_runs, use_container_width=True, hide_index=True)
-        else:
-            st.caption("尚無 ETL 執行紀錄。")
-
 def get_pipeline_mapping(profile_id: str):
     if profile_id == "vocab":
         mapping = {
@@ -1407,15 +637,15 @@ def get_pipeline_mapping(profile_id: str):
             "2": ["10.5", "11", "12", "13"],
             "3": ["14", "15"],
             "4": ["16"],
-            "5": ["17", "18", "19"],
-            "6": ["20"],
+            "5": ["17", "18", "19", "20"],
+            "6": ["21"],
         }
         manual_labels = {
             "9": "Step 9 完成 (NotebookLM)",
             "13": "Step 13 完成 (人工字幕)",
             "15": "Step 15 完成 (人工微調)",
         }
-        publish_substep = "20"
+        publish_substep = "21"
         storyboard_manual_substep = "15"
     elif profile_id == "story":
         mapping = {
@@ -1499,6 +729,14 @@ def scan_episodes():
             "_raw": info,
         })
     return eps
+
+def next_episode_number_default(min_ep: int = 1) -> int:
+    eps = [
+        int(parse_episode_info(p).get("ep") or 0)
+        for p in list_episode_dirs(ROOT, WS_ROOT)
+    ]
+    current_max = max(eps or [min_ep - 1])
+    return max(min_ep, current_max + 1)
 
 def infer_stage_statuses_for_profile(ep_path: Path, profile_id: str, prev: Dict | None = None) -> Dict:
     if profile_id == "story":
@@ -1665,15 +903,146 @@ def read_json_file(path: Path | None):
 VOCAB_TEXT_LLM_STEP_DEFAULTS = {
     "3": "auto",
     "5": "auto",
-    "12": "openai",
-    "14": "openai",
-    "19": "auto",
+    "12": "auto",
+    "14": "auto",
+    "20": "auto",
 }
 VOCAB_TEXT_LLM_PROVIDER_LABELS = {
-    "auto": "自動：Gemini 失敗改用 OpenAI",
+    "auto": "自動",
     "openai": "OpenAI / ChatGPT",
     "gemini": "Gemini",
     "nvidia": "NVIDIA",
+}
+VOCAB_TEXT_LLM_STEP_PROVIDER_LABELS = {
+    "12": {
+        "auto": "自動：NVIDIA → OpenAI → Gemini",
+    },
+    "14": {
+        "auto": "自動：NVIDIA → OpenAI → Gemini",
+    },
+}
+VOCAB_IMAGE_PROVIDER_LABELS = {
+    "auto": "自動：Gemini → OpenAI → NVIDIA",
+    "gemini": "Gemini / Imagen",
+    "openai": "OpenAI / ChatGPT",
+    "nvidia": "NVIDIA NIM",
+}
+VOCAB_IMAGE_MODEL_OPTIONS = {
+    "gemini": ["imagen-4.0-generate-001"],
+    "openai": ["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"],
+    "nvidia": ["black-forest-labs/flux.2-klein-4b", "flux.2-klein-4b"],
+}
+VOCAB_ANIMATION_PROVIDER_LABELS = {
+    "gemini": "Gemini / Veo",
+    "openai": "OpenAI / Sora",
+}
+VOCAB_ANIMATION_MODEL_OPTIONS = {
+    "gemini": ["veo-2.0-generate-001"],
+    "openai": ["sora-2", "sora-2-pro"],
+}
+VOCAB_TEXT_LLM_OPENAI_MODEL_DEFAULTS = {
+    "14": "gpt-5.2",
+}
+VOCAB_TEXT_LLM_MODEL_DEFAULTS = {
+    "3": {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4o-mini",
+        "nvidia": "nvidia/nemotron-3-super-120b-a12b",
+    },
+    "5": {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4o-mini",
+        "nvidia": "nvidia/nemotron-3-super-120b-a12b",
+    },
+    "12": {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-4o-mini",
+        "nvidia": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    },
+    "14": {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-5.2",
+        "nvidia": "stepfun-ai/step-3-5-flash",
+    },
+    "20": {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-4o-mini",
+        "nvidia": "meta/llama-3.3-70b-instruct",
+    },
+}
+VOCAB_TEXT_LLM_MODEL_ENV_KEYS = {
+    "3": {
+        "gemini": "CAP_VOCAB_GEMINI_MODEL",
+        "openai": "CAP_VOCAB_OPENAI_MODEL",
+        "nvidia": "CAP_VOCAB_NVIDIA_MODEL",
+    },
+    "5": {
+        "gemini": "CAP_CLOZE_MODEL",
+        "openai": "CAP_CLOZE_OPENAI_MODEL",
+        "nvidia": "CAP_CLOZE_NVIDIA_MODEL",
+    },
+    "12": {
+        "gemini": "CAP_SUBTITLE_REVIEW_GEMINI_MODEL",
+        "openai": "CAP_SUBTITLE_REVIEW_OPENAI_MODEL",
+        "nvidia": "CAP_SUBTITLE_REVIEW_NVIDIA_MODEL",
+    },
+    "14": {
+        "gemini": "CAP_STORYBOARD_GEMINI_MODEL",
+        "openai": "CAP_STORYBOARD_OPENAI_MODEL",
+        "nvidia": "CAP_STORYBOARD_NVIDIA_MODEL",
+    },
+    "20": {
+        "gemini": "CAP_YOUTUBE_META_GEMINI_MODEL",
+        "openai": "CAP_YOUTUBE_META_OPENAI_MODEL",
+        "nvidia": "CAP_YOUTUBE_META_NVIDIA_MODEL",
+    },
+}
+VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS = {
+    "12_nvidia_fallback": {
+        "nvidia": "nvidia/llama-3.3-nemotron-super-49b-v1,nvidia/llama-3.1-nemotron-nano-8b-v1",
+    },
+    "5_review": {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4o-mini",
+    },
+}
+VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS = {
+    "5_review": "auto",
+}
+VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS = {
+    "auto": "Auto",
+    "gemini": "Gemini",
+    "openai": "OpenAI / ChatGPT",
+}
+VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS = {
+    "5_review": "CAP_CLOZE_REVIEW_PROVIDER",
+}
+VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS = {
+    "12_nvidia_fallback": {
+        "nvidia": "CAP_SUBTITLE_REVIEW_NVIDIA_FALLBACK_MODEL",
+    },
+    "5_review": {
+        "gemini": "CAP_CLOZE_REVIEW_MODEL",
+        "openai": "CAP_CLOZE_OPENAI_REVIEW_MODEL",
+    },
+}
+VOCAB_IMAGE_PROVIDER_DEFAULTS = {
+    "16": "auto",
+    "18": "auto",
+}
+VOCAB_IMAGE_MODEL_DEFAULTS = {
+    "gemini": "imagen-4.0-generate-001",
+    "openai": "gpt-image-1.5",
+    "nvidia": "black-forest-labs/flux.2-klein-4b",
+}
+VOCAB_IMAGE_MODEL_STEP_DEFAULTS = {
+    "16": dict(VOCAB_IMAGE_MODEL_DEFAULTS),
+    "18": dict(VOCAB_IMAGE_MODEL_DEFAULTS),
+}
+VOCAB_ANIMATION_PROVIDER_DEFAULT = "gemini"
+VOCAB_ANIMATION_MODEL_DEFAULTS = {
+    "gemini": "veo-2.0-generate-001",
+    "openai": "sora-2",
 }
 
 
@@ -1695,18 +1064,405 @@ def load_profile_llm_provider_settings(profile_id: str) -> dict:
     return settings
 
 
-def save_profile_llm_provider_settings(profile_id: str, settings: dict) -> Path:
+def default_vocab_text_llm_model_settings() -> dict:
+    return {
+        step_no: dict(provider_models)
+        for step_no, provider_models in VOCAB_TEXT_LLM_MODEL_DEFAULTS.items()
+    }
+
+
+def default_vocab_text_llm_extra_model_settings() -> dict:
+    return {
+        call_id: dict(provider_models)
+        for call_id, provider_models in VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS.items()
+    }
+
+
+def default_vocab_text_llm_extra_provider_settings() -> dict:
+    return dict(VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS)
+
+
+def vocab_text_model_for_step(model_settings: dict | None, step_no: str, provider: str) -> str:
+    step_key = str(step_no)
+    provider_key = str(provider or "").strip().lower()
+    if provider_key == "auto":
+        provider_key = "nvidia" if step_key in {"12", "14"} else "gemini"
+    step_models = (model_settings or {}).get(step_key, {})
+    if not isinstance(step_models, dict):
+        step_models = {}
+    default_models = VOCAB_TEXT_LLM_MODEL_DEFAULTS.get(step_key, {})
+    return str(step_models.get(provider_key) or default_models.get(provider_key) or "").strip()
+
+
+def vocab_text_extra_model_for_call(model_settings: dict | None, call_id: str, provider: str) -> str:
+    call_key = str(call_id)
+    provider_key = str(provider or "").strip().lower()
+    call_models = (model_settings or {}).get(call_key, {})
+    if not isinstance(call_models, dict):
+        call_models = {}
+    default_models = VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS.get(call_key, {})
+    return str(call_models.get(provider_key) or default_models.get(provider_key) or "").strip()
+
+
+def vocab_text_model_summary(model_settings: dict | None, step_no: str, provider: str) -> str:
+    step_key = str(step_no)
+    provider_key = str(provider or "").strip().lower()
+    if provider_key == "auto":
+        fallback_order = ("nvidia", "openai", "gemini") if step_key in {"12", "14"} else ("gemini", "openai", "nvidia")
+        parts = [
+            f"{p}: {vocab_text_model_for_step(model_settings, step_no, p)}"
+            for p in fallback_order
+        ]
+        return "auto fallback: " + " → ".join(parts)
+    return f"{provider_key}: {vocab_text_model_for_step(model_settings, step_no, provider_key)}"
+
+
+def vocab_text_provider_label(value: str, step_no: str | None = None) -> str:
+    step_labels = VOCAB_TEXT_LLM_STEP_PROVIDER_LABELS.get(str(step_no or ""), {})
+    return step_labels.get(value) or VOCAB_TEXT_LLM_PROVIDER_LABELS.get(value, value)
+
+
+def load_profile_llm_extra_model_settings(profile_id: str) -> dict:
+    settings = default_vocab_text_llm_extra_model_settings()
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        models = payload.get("vocab_text_llm_extra_models", {})
+        if isinstance(models, dict):
+            for call_id, provider_models in models.items():
+                call_key = str(call_id)
+                if call_key not in settings or not isinstance(provider_models, dict):
+                    continue
+                for provider, model in provider_models.items():
+                    provider_key = str(provider or "").strip().lower()
+                    model_name = str(model or "").strip()
+                    if provider_key in settings[call_key] and model_name:
+                        settings[call_key][provider_key] = model_name
+    return settings
+
+
+def load_profile_llm_extra_provider_settings(profile_id: str) -> dict:
+    settings = default_vocab_text_llm_extra_provider_settings()
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        providers = payload.get("vocab_text_llm_extra_providers", {})
+        if isinstance(providers, dict):
+            for call_id, provider in providers.items():
+                call_key = str(call_id)
+                provider_key = str(provider or "").strip().lower()
+                if call_key in settings and provider_key in VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS:
+                    settings[call_key] = provider_key
+    return settings
+
+
+def load_profile_llm_model_settings(profile_id: str) -> dict:
+    settings = default_vocab_text_llm_model_settings()
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        models = payload.get("vocab_text_llm_models", {})
+        if isinstance(models, dict):
+            for step_no, provider_models in models.items():
+                step_key = str(step_no)
+                if step_key not in settings or not isinstance(provider_models, dict):
+                    continue
+                for provider, model in provider_models.items():
+                    provider_key = str(provider or "").strip().lower()
+                    model_name = str(model or "").strip()
+                    if provider_key in settings[step_key] and model_name:
+                        settings[step_key][provider_key] = model_name
+        legacy_openai_models = payload.get("vocab_text_llm_openai_models", {})
+        if isinstance(legacy_openai_models, dict):
+            for step_no, model in legacy_openai_models.items():
+                step_key = str(step_no)
+                model_name = str(model or "").strip()
+                if step_key in settings and model_name:
+                    settings[step_key]["openai"] = model_name
+    return settings
+
+
+def load_profile_image_provider_settings(profile_id: str) -> dict:
+    settings = dict(VOCAB_IMAGE_PROVIDER_DEFAULTS)
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        providers = payload.get("vocab_image_providers", {})
+        if isinstance(providers, dict):
+            for step_no, provider in providers.items():
+                step_key = str(step_no)
+                provider_key = str(provider or "").strip().lower()
+                if step_key in settings and provider_key in VOCAB_IMAGE_PROVIDER_LABELS:
+                    settings[step_key] = provider_key
+    return settings
+
+
+def load_profile_image_model_settings(profile_id: str) -> dict:
+    settings = dict(VOCAB_IMAGE_MODEL_DEFAULTS)
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        models = payload.get("vocab_image_models", {})
+        if isinstance(models, dict):
+            for provider, model in models.items():
+                provider_key = str(provider or "").strip().lower()
+                model_name = str(model or "").strip()
+                if provider_key in settings and model_name:
+                    settings[provider_key] = model_name
+    return settings
+
+
+def default_vocab_image_model_step_settings() -> dict:
+    return {
+        step_no: dict(provider_models)
+        for step_no, provider_models in VOCAB_IMAGE_MODEL_STEP_DEFAULTS.items()
+    }
+
+
+def load_profile_image_model_step_settings(profile_id: str) -> dict:
+    settings = default_vocab_image_model_step_settings()
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    legacy_models = load_profile_image_model_settings(profile_id)
+    for step_models in settings.values():
+        for provider, model in legacy_models.items():
+            provider_key = str(provider or "").strip().lower()
+            model_name = str(model or "").strip()
+            if provider_key in step_models and model_name:
+                step_models[provider_key] = model_name
+    if isinstance(payload, dict):
+        by_step = payload.get("vocab_image_models_by_step", {})
+        if isinstance(by_step, dict):
+            for step_no, provider_models in by_step.items():
+                step_key = str(step_no)
+                if step_key not in settings or not isinstance(provider_models, dict):
+                    continue
+                for provider, model in provider_models.items():
+                    provider_key = str(provider or "").strip().lower()
+                    model_name = str(model or "").strip()
+                    if provider_key in settings[step_key] and model_name:
+                        settings[step_key][provider_key] = model_name
+    return settings
+
+
+def vocab_image_model_for_step(model_settings_by_step: dict | None, step_no: str, provider: str) -> str:
+    step_key = str(step_no)
+    provider_key = str(provider or "").strip().lower()
+    step_models = (model_settings_by_step or {}).get(step_key, {})
+    if not isinstance(step_models, dict):
+        step_models = {}
+    default_models = VOCAB_IMAGE_MODEL_STEP_DEFAULTS.get(step_key, VOCAB_IMAGE_MODEL_DEFAULTS)
+    return str(step_models.get(provider_key) or default_models.get(provider_key) or "").strip()
+
+
+def vocab_image_model_summary(image_model_settings: dict | None, provider: str) -> str:
+    image_model_settings = image_model_settings or {}
+    models = {
+        provider_key: str(image_model_settings.get(provider_key) or default_model)
+        for provider_key, default_model in VOCAB_IMAGE_MODEL_DEFAULTS.items()
+    }
+    provider_key = str(provider or "").strip().lower()
+    if provider_key == "auto":
+        return "auto fallback: gemini: {gemini} → openai: {openai} → nvidia: {nvidia}".format(**models)
+    if provider_key in models:
+        return f"{provider_key}: {models[provider_key]}"
+    return " / ".join(f"{key}: {value}" for key, value in models.items())
+
+
+def load_profile_animation_provider_settings(profile_id: str) -> dict:
+    settings = {
+        "provider": VOCAB_ANIMATION_PROVIDER_DEFAULT,
+        "models": dict(VOCAB_ANIMATION_MODEL_DEFAULTS),
+    }
+    payload = read_json_file(profile_llm_provider_settings_path(profile_id)) or {}
+    if isinstance(payload, dict):
+        provider = str(payload.get("vocab_animation_provider") or "").strip().lower()
+        if provider in VOCAB_ANIMATION_PROVIDER_LABELS:
+            settings["provider"] = provider
+        models = payload.get("vocab_animation_models", {})
+        if isinstance(models, dict):
+            for provider_key, model in models.items():
+                provider_key = str(provider_key or "").strip().lower()
+                model_name = str(model or "").strip()
+                if provider_key in settings["models"] and model_name:
+                    settings["models"][provider_key] = model_name
+    return settings
+
+
+def save_profile_llm_provider_settings(
+    profile_id: str,
+    settings: dict,
+    model_settings: dict | None = None,
+    image_provider_settings: dict | None = None,
+    image_model_settings: dict | None = None,
+    animation_settings: dict | None = None,
+    extra_model_settings: dict | None = None,
+    extra_provider_settings: dict | None = None,
+    image_model_step_settings: dict | None = None,
+) -> Path:
     path = profile_llm_provider_settings_path(profile_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing = read_json_file(path) or {}
+    if model_settings is None and isinstance(existing, dict):
+        model_settings = existing.get("vocab_text_llm_models", existing.get("vocab_text_llm_openai_models", {}))
+    if extra_model_settings is None and isinstance(existing, dict):
+        extra_model_settings = existing.get("vocab_text_llm_extra_models", {})
+    if extra_provider_settings is None and isinstance(existing, dict):
+        extra_provider_settings = existing.get("vocab_text_llm_extra_providers", {})
+    if image_provider_settings is None and isinstance(existing, dict):
+        image_provider_settings = existing.get("vocab_image_providers", {})
+    if image_model_settings is None and isinstance(existing, dict):
+        image_model_settings = existing.get("vocab_image_models", {})
+    if image_model_step_settings is None and isinstance(existing, dict):
+        image_model_step_settings = existing.get("vocab_image_models_by_step", {})
+    if animation_settings is None and isinstance(existing, dict):
+        animation_settings = {
+            "provider": existing.get("vocab_animation_provider", VOCAB_ANIMATION_PROVIDER_DEFAULT),
+            "models": existing.get("vocab_animation_models", {}),
+        }
+    model_settings = model_settings or {}
+    extra_model_settings = extra_model_settings or {}
+    extra_provider_settings = extra_provider_settings or {}
+    image_provider_settings = image_provider_settings or {}
+    image_model_settings = image_model_settings or {}
+    image_model_step_settings = image_model_step_settings or {}
+    animation_settings = animation_settings or {}
+    animation_provider = str(animation_settings.get("provider") or VOCAB_ANIMATION_PROVIDER_DEFAULT)
+    animation_models = animation_settings.get("models") if isinstance(animation_settings.get("models"), dict) else {}
+    default_text_models = default_vocab_text_llm_model_settings()
+    normalized_text_models = {}
+    for step_no, provider_defaults in default_text_models.items():
+        incoming_step = model_settings.get(step_no, {}) if isinstance(model_settings, dict) else {}
+        if not isinstance(incoming_step, dict):
+            incoming_step = {"openai": incoming_step}
+        normalized_text_models[step_no] = {
+            provider: str(incoming_step.get(provider) or default_model)
+            for provider, default_model in provider_defaults.items()
+        }
+    default_extra_models = default_vocab_text_llm_extra_model_settings()
+    normalized_extra_models = {}
+    for call_id, provider_defaults in default_extra_models.items():
+        incoming_call = extra_model_settings.get(call_id, {}) if isinstance(extra_model_settings, dict) else {}
+        if not isinstance(incoming_call, dict):
+            incoming_call = {}
+        normalized_extra_models[call_id] = {
+            provider: str(incoming_call.get(provider) or default_model)
+            for provider, default_model in provider_defaults.items()
+        }
     payload = {
         "vocab_text_llm_providers": {
             step_no: str(settings.get(step_no) or default_provider)
             for step_no, default_provider in VOCAB_TEXT_LLM_STEP_DEFAULTS.items()
         },
+        "vocab_text_llm_models": normalized_text_models,
+        "vocab_text_llm_extra_providers": {
+            call_id: str(extra_provider_settings.get(call_id) or default_provider)
+            for call_id, default_provider in VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS.items()
+        },
+        "vocab_text_llm_extra_models": normalized_extra_models,
+        "vocab_text_llm_openai_models": {
+            step_no: str(normalized_text_models.get(step_no, {}).get("openai") or default_model)
+            for step_no, default_model in VOCAB_TEXT_LLM_OPENAI_MODEL_DEFAULTS.items()
+        },
+        "vocab_image_providers": {
+            step_no: str(image_provider_settings.get(step_no) or default_provider)
+            for step_no, default_provider in VOCAB_IMAGE_PROVIDER_DEFAULTS.items()
+        },
+        "vocab_image_models": {
+            provider: str(image_model_settings.get(provider) or default_model)
+            for provider, default_model in VOCAB_IMAGE_MODEL_DEFAULTS.items()
+        },
+        "vocab_image_models_by_step": {
+            step_no: {
+                provider: str(
+                    (image_model_step_settings.get(step_no, {}) if isinstance(image_model_step_settings.get(step_no, {}), dict) else {}).get(provider)
+                    or image_model_settings.get(provider)
+                    or default_model
+                )
+                for provider, default_model in provider_defaults.items()
+            }
+            for step_no, provider_defaults in VOCAB_IMAGE_MODEL_STEP_DEFAULTS.items()
+        },
+        "vocab_animation_provider": (
+            animation_provider if animation_provider in VOCAB_ANIMATION_PROVIDER_LABELS else VOCAB_ANIMATION_PROVIDER_DEFAULT
+        ),
+        "vocab_animation_models": {
+            provider: str(animation_models.get(provider) or default_model)
+            for provider, default_model in VOCAB_ANIMATION_MODEL_DEFAULTS.items()
+        },
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def apply_vocab_llm_runtime_settings(
+    step_no: str,
+    step_def: dict,
+    provider: str,
+    model_settings: dict | None = None,
+    extra_model_settings: dict | None = None,
+    extra_provider_settings: dict | None = None,
+) -> dict:
+    updated = dict(step_def)
+    args_list = list(updated.get("args") or [])
+    if "--provider" in args_list:
+        provider_idx = args_list.index("--provider")
+        if provider_idx + 1 < len(args_list):
+            args_list[provider_idx + 1] = provider
+        else:
+            args_list.append(provider)
+    else:
+        args_list.extend(["--provider", provider])
+    updated["args"] = args_list
+
+    step_key = str(step_no)
+    model_env_keys = VOCAB_TEXT_LLM_MODEL_ENV_KEYS.get(step_key, {})
+    if model_env_keys:
+        env = dict(updated.get("env") or {})
+        for model_provider, env_key in model_env_keys.items():
+            model_name = vocab_text_model_for_step(model_settings, step_key, model_provider)
+            if model_name:
+                env[env_key] = model_name
+        if step_key == "5":
+            review_provider = str((extra_provider_settings or {}).get("5_review") or VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS["5_review"]).strip().lower()
+            if review_provider in VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS:
+                env[VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS["5_review"]] = review_provider
+            for model_provider, env_key in VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS["5_review"].items():
+                model_name = vocab_text_extra_model_for_call(extra_model_settings, "5_review", model_provider)
+                if model_name:
+                    env[env_key] = model_name
+        if step_key == "12":
+            for model_provider, env_key in VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS["12_nvidia_fallback"].items():
+                model_name = vocab_text_extra_model_for_call(extra_model_settings, "12_nvidia_fallback", model_provider)
+                if model_name:
+                    env[env_key] = model_name
+        updated["env"] = env
+    return updated
+
+
+def apply_provider_arg(step_def: dict, provider: str) -> dict:
+    updated = dict(step_def)
+    args_list = list(updated.get("args") or [])
+    if "--provider" in args_list:
+        provider_idx = args_list.index("--provider")
+        if provider_idx + 1 < len(args_list):
+            args_list[provider_idx + 1] = provider
+        else:
+            args_list.append(provider)
+    else:
+        args_list.extend(["--provider", provider])
+    updated["args"] = args_list
+    return updated
+
+
+def build_storyboard_media_env(image_models: dict | None, animation_settings: dict | None) -> dict:
+    image_models = image_models or {}
+    animation_settings = animation_settings or {}
+    animation_models = animation_settings.get("models") if isinstance(animation_settings.get("models"), dict) else {}
+    animation_provider = str(animation_settings.get("provider") or VOCAB_ANIMATION_PROVIDER_DEFAULT)
+    return {
+        "CAP_STORYBOARD_GEMINI_IMAGE_MODEL": str(image_models.get("gemini") or VOCAB_IMAGE_MODEL_DEFAULTS["gemini"]),
+        "CAP_STORYBOARD_OPENAI_IMAGE_MODEL": str(image_models.get("openai") or VOCAB_IMAGE_MODEL_DEFAULTS["openai"]),
+        "CAP_STORYBOARD_NVIDIA_IMAGE_MODEL": str(image_models.get("nvidia") or VOCAB_IMAGE_MODEL_DEFAULTS["nvidia"]),
+        "CAP_ANIMATION_PROVIDER": animation_provider if animation_provider in VOCAB_ANIMATION_PROVIDER_LABELS else VOCAB_ANIMATION_PROVIDER_DEFAULT,
+        "CAP_ANIMATION_MODEL": str(animation_models.get("gemini") or VOCAB_ANIMATION_MODEL_DEFAULTS["gemini"]),
+        "CAP_OPENAI_VIDEO_MODEL": str(animation_models.get("openai") or VOCAB_ANIMATION_MODEL_DEFAULTS["openai"]),
+    }
 
 def read_text_file(path: Path | None, default: str = "") -> str:
     if not path or not path.exists():
@@ -1720,876 +1476,6 @@ def save_text_file(path: Path, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
-
-def story_outline_options_path(ep_path: Path) -> Path:
-    return ep_path / "01_preproduction" / "story_outline_options.json"
-
-def story_selected_json_path(ep_path: Path) -> Path:
-    return ep_path / "01_preproduction" / "selected_story.json"
-
-def story_selected_md_path(ep_path: Path) -> Path:
-    return ep_path / "01_preproduction" / "selected_story.md"
-
-def story_outline_json_path(ep_path: Path) -> Path:
-    return ep_path / "02_story" / "story_outline.json"
-
-def story_outline_md_path(ep_path: Path) -> Path:
-    return ep_path / "02_story" / "story_outline.md"
-
-def story_script_json_path(ep_path: Path) -> Path:
-    return ep_path / "02_story" / "story_script.json"
-
-def story_script_md_path(ep_path: Path) -> Path:
-    return ep_path / "02_story" / "story_script.md"
-
-def story_tts_text_path(ep_path: Path) -> Path:
-    return ep_path / "02_story" / "story_text_for_tts.txt"
-
-def story_characters_json_path(ep_path: Path) -> Path:
-    return ep_path / "03_characters_scenes" / "characters.json"
-
-def story_locations_json_path(ep_path: Path) -> Path:
-    return ep_path / "03_characters_scenes" / "locations.json"
-
-def story_tts_lines_json_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "tts_lines.json"
-
-def story_tts_lines_csv_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "tts_lines.csv"
-
-def story_voice_cast_json_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "voice_cast.json"
-
-def story_voice_segments_dir(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "voice_segments"
-
-def story_voice_previews_dir(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "voice_previews"
-
-def story_merged_audio_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "story_audio.m4a"
-
-def story_subtitles_srt_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "story_subtitles.srt"
-
-def story_subtitles_json_path(ep_path: Path) -> Path:
-    return ep_path / "04_audio_subtitles" / "story_subtitles.json"
-
-def story_storyboard_csv_path(ep_path: Path) -> Path:
-    return ep_path / "05_storyboards" / "storyboard.csv"
-
-def story_storyboard_json_path(ep_path: Path) -> Path:
-    return ep_path / "05_storyboards" / "storyboard.json"
-
-STORY_OPENAI_TTS_VOICES = [
-    "marin",
-    "cedar",
-    "alloy",
-    "ash",
-    "ballad",
-    "coral",
-    "echo",
-    "fable",
-    "nova",
-    "onyx",
-    "sage",
-    "shimmer",
-    "verse",
-]
-
-def default_story_voice_cast(tts_data: dict) -> dict:
-    speakers = []
-    for line in tts_data.get("lines") or []:
-        speaker = str(line.get("speaker", "")).strip()
-        if speaker and speaker not in speakers:
-            speakers.append(speaker)
-    voice_cycle = ["marin", "coral", "fable", "nova", "sage", "shimmer", "verse", "cedar"]
-    voices = {}
-    for idx, speaker in enumerate(speakers):
-        if speaker == "旁白":
-            voice = "marin"
-            instructions = "用溫暖、清楚、慢速的繁體中文說故事，像10歲以下小朋友的睡前童話旁白。"
-        else:
-            voice = voice_cycle[idx % len(voice_cycle)]
-            instructions = f"用適合兒童童話角色「{speaker}」的繁體中文聲音說話，語氣自然、清楚、情緒明確，避免誇張尖銳。"
-        voices[speaker] = {
-            "provider": "openai",
-            "voice": voice,
-            "instructions": instructions,
-        }
-    return {
-        "provider": "openai",
-        "model": "gpt-4o-mini-tts",
-        "response_format": "mp3",
-        "voice_segments_dir": "04_audio_subtitles/voice_segments",
-        "pause_ms": {
-            "default": 350,
-            "comma": 250,
-            "sentence": 500,
-            "question": 700,
-            "paragraph": 900,
-        },
-        "voices": voices,
-    }
-
-def load_story_outline_options(ep_path: Path) -> list[dict]:
-    data = read_json_file(story_outline_options_path(ep_path))
-    if data is None:
-        data = read_json_file(ep_path / "01_preproduction" / "story_brainstorm_options.json")
-    if isinstance(data, dict):
-        return list(data.get("options") or [])
-    if isinstance(data, list):
-        return data
-    return []
-
-def render_story_summary(story: dict, *, title: str = "已選定故事") -> None:
-    if not story:
-        st.warning("尚未選定本次故事。請先回 Dashboard 的「故事大綱選擇」確認一個故事。")
-        return
-    st.info(
-        f"{title}：{story.get('id', '')}｜{story.get('title', '')}\n\n"
-        f"類型：{story.get('genre', '')}｜目標年齡：{story.get('target_age', '')}\n\n"
-        f"故事一句話：{story.get('logline', '')}\n\n"
-        f"正向寓意：{story.get('moral', '')}"
-    )
-
-def render_story_outline_result(ep_path: Path) -> None:
-    outline = read_json_file(story_outline_json_path(ep_path)) or {}
-    outline_md = read_text_file(story_outline_md_path(ep_path), "")
-    if not outline and not outline_md:
-        st.warning("尚未建立故事大綱及段落。請執行 Stage 2 或子步驟 2.1。")
-        return
-
-    st.subheader("2.1 建立故事大綱及段落")
-    if outline:
-        st.info(
-            f"故事：{outline.get('title', '')}\n\n"
-            f"目標年齡：{outline.get('target_age', '')}｜調性：{outline.get('tone', '')}\n\n"
-            f"故事一句話：{outline.get('logline', '')}\n\n"
-            f"正向寓意：{outline.get('moral', '')}"
-        )
-        rows = []
-        for paragraph in outline.get("paragraphs") or []:
-            rows.append(
-                {
-                    "段落": paragraph.get("paragraph_id", ""),
-                    "標題": paragraph.get("title", ""),
-                    "目的": paragraph.get("purpose", ""),
-                    "劇情": paragraph.get("plot", ""),
-                    "旁白重點": paragraph.get("narration_focus", ""),
-                    "對話重點": paragraph.get("dialogue_focus", ""),
-                }
-            )
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    with st.expander("查看 story_outline.md", expanded=not bool(outline)):
-        st.markdown(outline_md or "story_outline.md 尚未建立。")
-
-def render_story_script_result(ep_path: Path) -> None:
-    script_data = read_json_file(story_script_json_path(ep_path)) or {}
-    script_md = read_text_file(story_script_md_path(ep_path), "")
-    tts_text = read_text_file(story_tts_text_path(ep_path), "")
-    st.subheader("2.2 產出各段落旁白與角色對話")
-    if not script_data and not script_md:
-        st.warning("尚未產出各段落旁白與角色對話。請執行 Stage 2 或子步驟 2.2。")
-        return
-
-    if script_data:
-        st.info(
-            f"故事：{script_data.get('title', '')}\n\n"
-            f"目標年齡：{script_data.get('target_age', '')}｜調性：{script_data.get('tone', '')}\n\n"
-            f"正向寓意：{script_data.get('moral', '')}"
-        )
-        for paragraph in script_data.get("paragraphs") or []:
-            label = f"{paragraph.get('paragraph_id', '')} {paragraph.get('title', '')}".strip()
-            with st.expander(label or "段落", expanded=False):
-                storybook_text = str(paragraph.get("storybook_text", "")).strip()
-                if storybook_text:
-                    st.markdown("**可直接生成語音的正文**")
-                    for block in storybook_text.split("\n\n"):
-                        if block.strip():
-                            st.write(block.strip())
-                st.markdown("**旁白**")
-                for line in paragraph.get("narration") or []:
-                    st.write(f"- {line}")
-                st.markdown("**角色對話**")
-                dialogue_rows = []
-                for item in paragraph.get("dialogues") or []:
-                    dialogue_rows.append(
-                        {
-                            "角色": item.get("speaker", ""),
-                            "台詞": item.get("text", ""),
-                            "語氣": item.get("voice_hint", ""),
-                        }
-                    )
-                if dialogue_rows:
-                    st.dataframe(pd.DataFrame(dialogue_rows), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("此段尚無角色對話。")
-                source_plot = paragraph.get("source_plot", "")
-                if source_plot:
-                    st.caption(f"來源劇情：{source_plot}")
-    with st.expander("查看 story_script.md", expanded=False):
-        st.markdown(script_md or "story_script.md 尚未建立。")
-    with st.expander("查看 story_text_for_tts.txt", expanded=False):
-        st.text_area(
-            "完整語音正文",
-            value=tts_text,
-            height=360,
-            key=f"story_tts_text_{str(ep_path)}",
-            disabled=True,
-        )
-
-def render_story_characters_result(ep_path: Path) -> None:
-    data = read_json_file(story_characters_json_path(ep_path)) or {}
-    st.subheader("3.1 角色人物塑造")
-    if not data:
-        st.warning("尚未產出角色人物 JSON。請執行 Stage 3 或子步驟 3.1。")
-        return
-    visual_system = data.get("visual_system") or {}
-    st.info(
-        f"故事：{data.get('story_title', '')}\n\n"
-        f"目標年齡：{data.get('target_age', '')}\n\n"
-        f"整體風格：{visual_system.get('global_style', '')}\n\n"
-        f"一致性規則：{visual_system.get('continuity_rule', '')}"
-    )
-    for character in data.get("characters") or []:
-        label = f"{character.get('name', '')}｜{character.get('role', '')}｜{character.get('character_type', '')}"
-        with st.expander(label, expanded=False):
-            personality = character.get("personality") or {}
-            visual = character.get("visual_design") or {}
-            image_gen = character.get("image_generation") or {}
-            st.write(f"角色 ID：{character.get('character_id', '')}")
-            st.write(f"核心特質：{'、'.join(personality.get('core_traits') or [])}")
-            st.write(f"情緒弧線：{personality.get('emotional_arc', '')}")
-            st.write(f"聲音風格：{personality.get('voice_style', '')}")
-            st.write(f"視覺風格：{visual.get('style', '')}")
-            st.write(f"色彩：{'、'.join(visual.get('color_palette') or [])}")
-            st.write(f"預設表情：{visual.get('default_expression', '')}")
-            st.write(f"一致性標籤：{'、'.join(visual.get('consistency_tags') or [])}")
-            st.markdown("**AI 人物產圖 Prompt**")
-            st.code(image_gen.get("prompt_en", ""), language="text")
-            st.markdown("**Negative Prompt**")
-            st.code(image_gen.get("negative_prompt_en", ""), language="text")
-    with st.expander("查看 characters.json", expanded=False):
-        st.json(data)
-
-def render_story_locations_result(ep_path: Path) -> None:
-    data = read_json_file(story_locations_json_path(ep_path)) or {}
-    st.subheader("3.2 場景塑造")
-    if not data:
-        st.warning("尚未產出場景 JSON。請執行 Stage 3 或子步驟 3.2。")
-        return
-    scene_world = data.get("scene_world") or {}
-    st.info(
-        f"故事：{data.get('story_title', '')}\n\n"
-        f"目標年齡：{data.get('target_age', '')}\n\n"
-        f"整體場景風格：{scene_world.get('global_style', '')}\n\n"
-        f"一致性規則：{scene_world.get('continuity_rule', '')}"
-    )
-    for location in data.get("locations") or []:
-        label = f"{location.get('name', '')}｜{location.get('story_role', '')}"
-        with st.expander(label, expanded=False):
-            visual = location.get("visual_design") or {}
-            image_gen = location.get("image_generation") or {}
-            st.write(f"場景 ID：{location.get('location_id', '')}")
-            st.write(f"對應段落：{'、'.join(location.get('linked_paragraph_ids') or [])}")
-            st.write(f"對應角色：{'、'.join(location.get('linked_characters') or [])}")
-            st.write(f"視覺風格：{visual.get('style', '')}")
-            st.write(f"情緒氛圍：{visual.get('mood', '')}")
-            st.write(f"時間光線：{visual.get('time_of_day', '')}")
-            st.write(f"色彩：{'、'.join(visual.get('color_palette') or [])}")
-            st.write(f"關鍵道具/元素：{'、'.join(visual.get('key_props') or [])}")
-            st.write(f"構圖備註：{visual.get('composition_notes', '')}")
-            st.write(f"一致性標籤：{'、'.join(visual.get('continuity_tags') or [])}")
-            st.markdown("**AI 場景產圖 Prompt**")
-            st.code(image_gen.get("prompt_en", ""), language="text")
-            st.markdown("**Negative Prompt**")
-            st.code(image_gen.get("negative_prompt_en", ""), language="text")
-    with st.expander("查看 locations.json", expanded=False):
-        st.json(data)
-
-def render_story_tts_lines_result(ep_path: Path) -> None:
-    data = read_json_file(story_tts_lines_json_path(ep_path)) or {}
-    st.subheader("4.1 依內容及角色產生各段句及對話列表")
-    if not data:
-        st.warning("尚未產出 TTS 對話列表。請執行 Stage 4 或子步驟 4.1。")
-        return
-
-    lines = data.get("lines") or []
-    st.info(
-        f"故事：{data.get('story_title', '')}\n\n"
-        f"總句數：{data.get('line_count', len(lines))}｜"
-        f"旁白：{data.get('narration_count', 0)}｜"
-        f"角色對話：{data.get('dialogue_count', 0)}"
-    )
-
-    rows = []
-    for item in lines:
-        rows.append(
-            {
-                "序號": item.get("sequence", ""),
-                "段落": item.get("paragraph_id", ""),
-                "段落標題": item.get("paragraph_title", ""),
-                "類型": "旁白" if item.get("line_type") == "narration" else "角色對話",
-                "角色": item.get("speaker", ""),
-                "角色ID": item.get("character_id", ""),
-                "聲音風格": item.get("voice_style", ""),
-                "語氣": item.get("voice_hint", ""),
-                "語音內容": item.get("text", ""),
-                "字數": item.get("text_length", ""),
-                "狀態": item.get("tts_status", ""),
-                "音檔": item.get("audio_path", ""),
-            }
-        )
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("tts_lines.json 目前沒有可顯示的句子。")
-
-    csv_path = story_tts_lines_csv_path(ep_path)
-    if csv_path.exists():
-        st.caption(f"CSV：{csv_path}")
-    with st.expander("查看 tts_lines.json", expanded=False):
-        st.json(data)
-
-def has_openai_api_key_configured() -> bool:
-    if os.environ.get("OPENAI_API_KEY"):
-        return True
-    env_path = ROOT / ".env"
-    if not env_path.exists():
-        return False
-    try:
-        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.strip().startswith("OPENAI_API_KEY=") and line.split("=", 1)[1].strip():
-                return True
-    except Exception:
-        return False
-    return False
-
-def render_story_voice_workspace(info: Dict, ep_path: Path) -> None:
-    st.subheader("語音設定 / No.4.2")
-    tts_data = read_json_file(story_tts_lines_json_path(ep_path)) or {}
-    if not tts_data:
-        st.warning("尚未建立 4.1 TTS 對話列表。請先執行 No.4.1。")
-        return
-
-    cast_path = story_voice_cast_json_path(ep_path)
-    voice_cast = read_json_file(cast_path) or default_story_voice_cast(tts_data)
-    voice_cast.setdefault("voices", {})
-    voice_cast.setdefault("pause_ms", {})
-
-    speakers = []
-    for line in tts_data.get("lines") or []:
-        speaker = str(line.get("speaker", "")).strip()
-        if speaker and speaker not in speakers:
-            speakers.append(speaker)
-    for speaker in speakers:
-        voice_cast["voices"].setdefault(
-            speaker,
-            default_story_voice_cast({"lines": [{"speaker": speaker}]}).get("voices", {}).get(speaker, {}),
-        )
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("TTS 句數", int(tts_data.get("line_count", len(tts_data.get("lines") or []))))
-    m2.metric("角色/旁白", len(speakers))
-    m3.metric("已產生片段", len(list(story_voice_segments_dir(ep_path).glob("*.*"))) if story_voice_segments_dir(ep_path).exists() else 0)
-    m4.metric("合併音檔", "已產生" if story_merged_audio_path(ep_path).exists() else "尚未")
-
-    if not has_openai_api_key_configured():
-        st.warning("尚未偵測到 OPENAI_API_KEY。儲存設定可以先做，但執行 4.2 前需要在環境變數或 .env 設定 OPENAI_API_KEY。")
-
-    with st.form(f"story_voice_cast_form_{str(ep_path)}"):
-        st.markdown("**基本設定**")
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            provider = st.selectbox(
-                "TTS Provider",
-                ["openai"],
-                index=0,
-                key=f"voice_provider_{str(ep_path)}",
-            )
-        with c2:
-            model = st.text_input(
-                "模型",
-                value=str(voice_cast.get("model", "gpt-4o-mini-tts")),
-                key=f"voice_model_{str(ep_path)}",
-            )
-        with c3:
-            response_format = st.selectbox(
-                "輸出格式",
-                ["mp3"],
-                index=0,
-                key=f"voice_format_{str(ep_path)}",
-                help="目前合併流程固定使用 mp3 片段，再輸出為 story_audio.m4a。",
-            )
-
-        st.markdown("**自然停頓設定（毫秒）**")
-        pause_cfg = voice_cast.get("pause_ms") or {}
-        p1, p2, p3, p4, p5 = st.columns(5)
-        pause_default = p1.number_input("一般", min_value=0, max_value=3000, value=int(pause_cfg.get("default", 350)), step=50)
-        pause_comma = p2.number_input("逗號", min_value=0, max_value=3000, value=int(pause_cfg.get("comma", 250)), step=50)
-        pause_sentence = p3.number_input("句號/驚嘆", min_value=0, max_value=3000, value=int(pause_cfg.get("sentence", 500)), step=50)
-        pause_question = p4.number_input("問句", min_value=0, max_value=3000, value=int(pause_cfg.get("question", 700)), step=50)
-        pause_paragraph = p5.number_input("段落切換", min_value=0, max_value=5000, value=int(pause_cfg.get("paragraph", 900)), step=50)
-
-        st.markdown("**角色聲音設定**")
-        new_voices = {}
-        for speaker in speakers:
-            cfg = voice_cast.get("voices", {}).get(speaker, {})
-            with st.expander(speaker, expanded=(speaker == "旁白")):
-                vc1, vc2 = st.columns([1, 3])
-                current_voice = str(cfg.get("voice", "marin"))
-                with vc1:
-                    selected_voice = st.selectbox(
-                        "聲音",
-                        STORY_OPENAI_TTS_VOICES,
-                        index=STORY_OPENAI_TTS_VOICES.index(current_voice) if current_voice in STORY_OPENAI_TTS_VOICES else 0,
-                        key=f"voice_select_{str(ep_path)}_{speaker}",
-                    )
-                with vc2:
-                    instructions = st.text_area(
-                        "聲音指令",
-                        value=str(cfg.get("instructions", "")),
-                        height=100,
-                        key=f"voice_instructions_{str(ep_path)}_{speaker}",
-                    )
-                sample_line = next((line for line in tts_data.get("lines") or [] if line.get("speaker") == speaker), {})
-                sample_text = str(sample_line.get("text", "")).strip()
-                if sample_text:
-                    st.caption(f"範例台詞：{sample_text[:120]}")
-                new_voices[speaker] = {
-                    "provider": provider,
-                    "voice": selected_voice,
-                    "instructions": instructions,
-                }
-
-        save_cast = st.form_submit_button("儲存語音設定")
-
-    if save_cast:
-        payload = {
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "provider": provider,
-            "model": model,
-            "response_format": response_format,
-            "voice_segments_dir": "04_audio_subtitles/voice_segments",
-            "pause_ms": {
-                "default": int(pause_default),
-                "comma": int(pause_comma),
-                "sentence": int(pause_sentence),
-                "question": int(pause_question),
-                "paragraph": int(pause_paragraph),
-            },
-            "voices": new_voices,
-        }
-        cast_path.parent.mkdir(parents=True, exist_ok=True)
-        cast_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        st.success(f"已儲存：{cast_path}")
-        st.rerun()
-
-    st.divider()
-    st.markdown("**預聽角色聲音**")
-    preview_cols = st.columns([1, 3, 1])
-    with preview_cols[0]:
-        preview_speaker = st.selectbox(
-            "角色",
-            speakers or ["旁白"],
-            key=f"story_preview_speaker_{str(ep_path)}",
-        )
-    sample_line = next((line for line in tts_data.get("lines") or [] if line.get("speaker") == preview_speaker), {})
-    default_preview_text = str(sample_line.get("text", "")).strip() or "你好，今天我們要一起走進一個溫暖又神奇的童話故事。"
-    with preview_cols[1]:
-        preview_text = st.text_area(
-            "預聽台詞",
-            value=default_preview_text,
-            height=90,
-            key=f"story_preview_text_{str(ep_path)}_{preview_speaker}",
-        )
-    preview_request_path = ep_path / "04_audio_subtitles" / "voice_preview_request.json"
-    preview_state = runner.get_substep_state(info, "4.2_preview")
-    with preview_cols[2]:
-        st.write("")
-        st.write("")
-        if st.button(
-            "產生預聽",
-            disabled=bool(preview_state.get("running")) or not bool(str(preview_text).strip()),
-            key=f"story_preview_btn_{info['ep']}",
-        ):
-            preview_request_path.parent.mkdir(parents=True, exist_ok=True)
-            preview_request_path.write_text(
-                json.dumps(
-                    {
-                        "speaker": preview_speaker,
-                        "text": str(preview_text).strip(),
-                        "voice_hint": "預聽聲音",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            res = runner.start_substep(
-                info,
-                "4.2_preview",
-                {
-                    "name": "No.4.2 預聽角色聲音",
-                    "type": "python",
-                    "script": "scripts/story_generate_tts_audio.py",
-                    "args": ["--ep", "{ep}", "--preview-request", "04_audio_subtitles/voice_preview_request.json"],
-                },
-            )
-            if res.get("ok"):
-                st.success(f"已啟動預聽：{res.get('log')}")
-            else:
-                st.error(f"預聽啟動失敗：{res.get('message')}")
-
-    if preview_state.get("running"):
-        st.info(f"預聽產生中，PID {preview_state.get('pid')}。")
-    preview_dir = story_voice_previews_dir(ep_path)
-    preview_file = preview_dir / f"{''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in preview_speaker).strip('_') or 'line'}_preview.mp3"
-    preview_request = read_json_file(preview_request_path) or {}
-    request_audio = preview_request.get("audio_path")
-    if request_audio:
-        candidate = ep_path / str(request_audio)
-        if candidate.exists():
-            preview_file = candidate
-    if preview_file.exists():
-        st.audio(str(preview_file))
-        st.caption(f"預聽音檔：{preview_file}")
-
-    st.divider()
-    st.markdown("**執行語音產生**")
-    state_42 = runner.get_substep_state(info, "4.2")
-    state_43 = runner.get_substep_state(info, "4.3")
-    state_44 = runner.get_substep_state(info, "4.4")
-    state_combo = runner.get_substep_state(info, "4.2_merge")
-    any_running = bool(state_42.get("running") or state_43.get("running") or state_44.get("running") or state_combo.get("running"))
-    b1, b2, b3, b4 = st.columns([1, 1, 1, 1.4])
-    with b1:
-        if st.button("執行 4.2 產生語音片段", disabled=any_running, key=f"run_story_42_{info['ep']}"):
-            res = runner.start_substep(
-                info,
-                "4.2",
-                {"name": "No.4.2 呼叫文字轉語音API", "type": "python", "script": "scripts/story_generate_tts_audio.py", "args": ["--ep", "{ep}"]},
-            )
-            if res.get("ok"):
-                st.success(f"已啟動 4.2：{res.get('log')}")
-            else:
-                st.error(f"4.2 啟動失敗：{res.get('message')}")
-    with b2:
-        if st.button("執行 4.3 合併語音", disabled=any_running, key=f"run_story_43_{info['ep']}"):
-            res = runner.start_substep(
-                info,
-                "4.3",
-                {"name": "No.4.3 將語音合併", "type": "python", "script": "scripts/story_merge_audio.py", "args": ["--ep", "{ep}"]},
-            )
-            if res.get("ok"):
-                st.success(f"已啟動 4.3：{res.get('log')}")
-            else:
-                st.error(f"4.3 啟動失敗：{res.get('message')}")
-    with b3:
-        if st.button("執行 4.4 產生字幕", disabled=any_running, key=f"run_story_44_{info['ep']}"):
-            res = runner.start_substep(
-                info,
-                "4.4",
-                {"name": "No.4.4 語音轉字幕", "type": "python", "script": "scripts/story_generate_subtitles.py", "args": ["--ep", "{ep}"]},
-            )
-            if res.get("ok"):
-                st.success(f"已啟動 4.4：{res.get('log')}")
-            else:
-                st.error(f"4.4 啟動失敗：{res.get('message')}")
-    with b4:
-        if st.button("產生語音並合併", disabled=any_running, type="primary", key=f"run_story_42_merge_{info['ep']}"):
-            res = runner.start_substep(
-                info,
-                "4.2_merge",
-                {
-                    "name": "No.4.2 產生語音並合併",
-                    "type": "python",
-                    "script": "scripts/story_generate_tts_audio.py",
-                    "args": ["--ep", "{ep}", "--merge-after"],
-                },
-            )
-            if res.get("ok"):
-                st.success(f"已啟動語音產生與合併：{res.get('log')}")
-            else:
-                st.error(f"啟動失敗：{res.get('message')}")
-
-    for label, state in [("4.2", state_42), ("4.3", state_43), ("4.4", state_44), ("整合執行", state_combo)]:
-        if state.get("running"):
-            st.info(f"{label} 執行中，PID {state.get('pid')}。")
-
-    merged = story_merged_audio_path(ep_path)
-    if merged.exists():
-        st.audio(str(merged))
-        st.caption(f"合併音檔：{merged}")
-    subtitles_path = story_subtitles_srt_path(ep_path)
-    if subtitles_path.exists():
-        st.caption(f"字幕檔：{subtitles_path}")
-    with st.expander("查看 voice_cast.json", expanded=False):
-        st.json(read_json_file(cast_path) or voice_cast)
-
-def render_story_subtitles_result(ep_path: Path) -> None:
-    srt_path = story_subtitles_srt_path(ep_path)
-    data = read_json_file(story_subtitles_json_path(ep_path)) or {}
-    st.subheader("4.4 語音轉字幕")
-    if not srt_path.exists() and not data:
-        st.warning("尚未產出故事字幕。請先完成 4.2 語音片段、4.3 合併語音，再執行 No.4.4。")
-        return
-
-    srt_text = read_text_file(srt_path, "")
-    subtitles = data.get("subtitles") or []
-    c1, c2, c3 = st.columns(3)
-    c1.metric("字幕數", int(data.get("subtitle_count", len(subtitles))))
-    c2.metric("來源", data.get("source", "tts_segments"))
-    c3.metric("估計長度", seconds_to_label(float(data.get("duration_seconds", 0) or 0)))
-
-    rows = []
-    for idx, item in enumerate(subtitles, 1):
-        rows.append(
-            {
-                "No": idx,
-                "Start": seconds_to_label(float(item.get("start", 0) or 0)),
-                "End": seconds_to_label(float(item.get("end", 0) or 0)),
-                "角色": item.get("speaker", ""),
-                "字幕": item.get("text", ""),
-            }
-        )
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    elif srt_path.exists():
-        parsed = parse_srt_entries(srt_path)
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "No": item.get("index", ""),
-                        "Start": item.get("start_label", ""),
-                        "End": item.get("end_label", ""),
-                        "字幕": item.get("content", ""),
-                    }
-                    for item in parsed
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with st.expander("查看 story_subtitles.srt", expanded=False):
-        st.text_area(
-            "SRT",
-            value=srt_text,
-            height=360,
-            key=f"story_subtitles_srt_{str(ep_path)}",
-            disabled=True,
-        )
-    if data:
-        with st.expander("查看 story_subtitles.json", expanded=False):
-            st.json(data)
-
-def render_story_storyboard_result(ep_path: Path) -> None:
-    csv_path = story_storyboard_csv_path(ep_path)
-    json_path = story_storyboard_json_path(ep_path)
-    data = read_json_file(json_path) or {}
-    st.subheader("5.1 字幕轉分鏡")
-    if not csv_path.exists() and not data:
-        st.warning("尚未產出故事分鏡。請先完成 4.4 字幕，再執行 No.5.1。")
-        return
-
-    df = pd.DataFrame()
-    if csv_path.exists():
-        try:
-            df = pd.read_csv(csv_path, encoding="utf-8-sig").fillna("")
-        except Exception:
-            df = pd.DataFrame()
-
-    c1, c2, c3 = st.columns(3)
-    scene_count = int(data.get("scene_count", len(df) if not df.empty else 0))
-    c1.metric("Scene 數", scene_count)
-    if not df.empty and "end_time" in df.columns:
-        c2.metric("分鏡尾端", seconds_to_label(float(pd.to_numeric(df["end_time"], errors="coerce").fillna(0).max())))
-    else:
-        c2.metric("分鏡尾端", "—")
-    c3.metric("來源", data.get("source", "story_subtitles"))
-
-    if not df.empty:
-        display_cols = [
-            col for col in [
-                "scene_id",
-                "start_time",
-                "end_time",
-                "paragraph_id",
-                "location_name",
-                "characters",
-                "summary",
-                "reason",
-            ]
-            if col in df.columns
-        ]
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-        with st.expander("查看各 Scene 產圖 Prompt", expanded=False):
-            for _, row in df.iterrows():
-                label = f"Scene {row.get('scene_id', '')}｜{row.get('location_name', '')}｜{seconds_to_label(float(row.get('start_time', 0) or 0))}-{seconds_to_label(float(row.get('end_time', 0) or 0))}"
-                st.markdown(f"**{label}**")
-                st.write(f"角色：{row.get('characters', '')}")
-                st.write(f"字幕摘要：{row.get('summary', '')}")
-                st.code(str(row.get("image_prompt", "")), language="text")
-                subref = str(row.get("subtitle_reference", "")).strip()
-                if subref:
-                    st.caption(subref)
-                st.divider()
-    else:
-        st.caption("storyboard.csv 無法讀取或目前沒有分鏡資料。")
-
-    if data:
-        with st.expander("查看 storyboard.json", expanded=False):
-            st.json(data)
-
-def render_story_selection_confirm(info: Dict, chosen: dict) -> None:
-    if not chosen:
-        return
-
-    def do_select() -> None:
-        ok, message = run_story_outline_selection(info, str(chosen.get("id", "")))
-        if ok:
-            st.session_state["story_select_notice"] = {
-                "level": "success",
-                "message": f"已選定本次故事：{chosen.get('id', '')}｜{chosen.get('title', '')}",
-            }
-            if message:
-                st.session_state["story_select_notice"]["detail"] = message
-            st.rerun()
-        st.error(f"選擇故事失敗：{message or 'unknown error'}")
-
-    if hasattr(st, "dialog"):
-        @st.dialog("確認選擇這個故事")
-        def confirm_dialog():
-            render_story_summary(chosen, title="準備選定")
-            st.warning("確認後，後續階段會以這個故事作為本集故事基底。")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("確認選擇", key=f"story_confirm_yes_{info['ep']}", type="primary"):
-                    do_select()
-            with c2:
-                if st.button("取消", key=f"story_confirm_no_{info['ep']}"):
-                    st.rerun()
-        confirm_dialog()
-    else:
-        pending_key = f"story_confirm_pending_{info['ep']}"
-        st.session_state[pending_key] = str(chosen.get("id", ""))
-
-def render_story_inline_confirm_if_needed(info: Dict, options: list[dict]) -> None:
-    pending_key = f"story_confirm_pending_{info['ep']}"
-    pending_id = st.session_state.get(pending_key)
-    if not pending_id:
-        return
-    chosen = next((item for item in options if str(item.get("id")) == str(pending_id)), {})
-    if not chosen:
-        st.session_state.pop(pending_key, None)
-        return
-    with st.container(border=True):
-        render_story_summary(chosen, title="準備選定")
-        st.warning("請再次確認。確認後，後續階段會以這個故事作為本集故事基底。")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("確認選擇", key=f"story_inline_confirm_yes_{info['ep']}", type="primary"):
-                ok, message = run_story_outline_selection(info, pending_id)
-                if ok:
-                    st.session_state.pop(pending_key, None)
-                    st.session_state["story_select_notice"] = {
-                        "level": "success",
-                        "message": f"已選定本次故事：{chosen.get('id', '')}｜{chosen.get('title', '')}",
-                    }
-                    if message:
-                        st.session_state["story_select_notice"]["detail"] = message
-                    st.rerun()
-                st.error(f"選擇故事失敗：{message or 'unknown error'}")
-        with c2:
-            if st.button("取消", key=f"story_inline_confirm_no_{info['ep']}"):
-                st.session_state.pop(pending_key, None)
-                st.rerun()
-
-def run_story_outline_selection(ep_info: Dict, option_id: str) -> tuple[bool, str]:
-    script_path = ROOT / "scripts" / "story_select_outline.py"
-    env = dict(os.environ)
-    env["CAP_WORKSPACE_ROOT"] = str((ROOT / WS_ROOT).resolve())
-    cmd = [
-        sys.executable,
-        "-u",
-        str(script_path),
-        "--ep",
-        str(ep_info["ep"]),
-        "--option-id",
-        str(option_id),
-    ]
-    result = subprocess.run(
-        cmd,
-        cwd=str(ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    message = (result.stdout or result.stderr or "").strip()
-    return result.returncode == 0, message
-
-def render_story_outline_selection_panel(eps):
-    if st.session_state["profile_id"] != "story":
-        return
-    st.divider()
-    st.subheader("故事大綱選擇")
-    notice = st.session_state.pop("story_select_notice", None)
-    if isinstance(notice, dict):
-        if notice.get("level") == "success":
-            st.success(notice.get("message", ""))
-        elif notice.get("level") == "error":
-            st.error(notice.get("message", ""))
-        if notice.get("detail"):
-            st.caption(notice.get("detail"))
-    ep_opts = {f"{e['Ep']} ({e['Range']})": e for e in eps}
-    if not ep_opts:
-        st.caption("尚未建立故事集數。")
-        return
-    choice = st.selectbox("選擇故事集數", list(ep_opts.keys()), index=max(len(ep_opts) - 1, 0), key="story_select_ep")
-    info = ep_opts[choice]["_raw"]
-    options = load_story_outline_options(info["path"])
-    selected = read_json_file(story_selected_json_path(info["path"])) or {}
-    if selected:
-        render_story_summary(selected, title="目前已選定")
-    if not options:
-        st.info("尚未產生故事大綱候選。請先在 Pipeline Manager 執行 Stage 1 或子步驟 1.2。")
-        return
-
-    selected_id = str(selected.get("id", ""))
-    option_ids = [str(item.get("id", "")) for item in options]
-    default_idx = option_ids.index(selected_id) if selected_id in option_ids else 0
-    option_id = st.radio(
-        "選擇本次故事",
-        option_ids,
-        index=default_idx,
-        format_func=lambda oid: next(
-            (
-                f"{item.get('id')}｜{item.get('title', '')}｜{item.get('genre', '')}"
-                for item in options
-                if str(item.get("id")) == str(oid)
-            ),
-            oid,
-        ),
-        key=f"story_outline_choice_{info['ep']}",
-    )
-    chosen = next((item for item in options if str(item.get("id")) == str(option_id)), {})
-    if chosen:
-        st.markdown(f"**故事一句話：** {chosen.get('logline', '')}")
-        st.markdown(f"**核心衝突：** {chosen.get('conflict', '')}")
-        outline = chosen.get("three_act_outline") or []
-        if outline:
-            st.markdown("**三幕大綱：**")
-            for idx, line in enumerate(outline, start=1):
-                st.write(f"{idx}. {line}")
-    if st.button("確認選擇這個故事", key=f"story_select_submit_{info['ep']}"):
-        render_story_selection_confirm(info, chosen)
-    render_story_inline_confirm_if_needed(info, options)
 
 def get_stage_current_step(ep_path: Path, stage_id: str) -> str:
     log_path = log_file_for_stage(ep_path, stage_id)
@@ -2620,7 +1506,7 @@ def get_stage_current_step(ep_path: Path, stage_id: str) -> str:
     return ""
 
 def format_episode_batch_label(episodes: list[int]) -> str:
-    items = [int(x) for x in episodes if str(x).strip()]
+    items = sorted([int(x) for x in episodes if str(x).strip()])
     if not items:
         return "—"
     if len(items) == 1:
@@ -2629,8 +1515,9 @@ def format_episode_batch_label(episodes: list[int]) -> str:
 
 def build_schedule_job_id(stage_id: str, episodes: list[int]) -> str:
     now_text = datetime.now().strftime("%Y%m%d_%H%M%S")
-    first_ep = int(episodes[0]) if episodes else 0
-    last_ep = int(episodes[-1]) if episodes else first_ep
+    ordered_episodes = sorted([int(x) for x in episodes]) if episodes else []
+    first_ep = int(ordered_episodes[0]) if ordered_episodes else 0
+    last_ep = int(ordered_episodes[-1]) if ordered_episodes else first_ep
     return f"sched_stage{str(stage_id).replace('.', '_')}_ep{first_ep:02d}_{last_ep:02d}_{now_text}"
 
 def get_schedule_display_status(job: Dict, state: Dict) -> str:
@@ -2658,11 +1545,28 @@ def get_schedule_status_label(status_code: str) -> str:
 def render_schedule_workspace(eps):
     st.caption("建立背景排程 job。建立後不需要停留在此分頁；job 會在指定時間自動開始，並依序處理單集或多集。")
     st.caption("為了能在半夜準時執行，新的排程會建立 Windows 排程任務，並嘗試在指定時間喚醒電腦執行；電腦仍不可關機。")
+    wake_policy = wake_timer_policy()
+    if wake_policy.get("available"):
+        ac_label = wake_policy.get("ac_label", "未知")
+        dc_label = wake_policy.get("dc_label", "未知")
+        if not wake_policy.get("ac_enabled") or not wake_policy.get("dc_enabled"):
+            st.warning(
+                "Windows 電源計畫可能阻止睡眠喚醒："
+                f"允許喚醒計時器 AC={ac_label}、DC={dc_label}。"
+                "若排程時電腦使用電池或 Modern Standby 進入低電源狀態，可能會延到手動喚醒後才執行。"
+            )
+        else:
+            st.caption(f"Windows 喚醒計時器：AC={ac_label}、DC={dc_label}。")
+    else:
+        st.caption(f"無法檢查 Windows 喚醒計時器：{wake_policy.get('message', 'unknown')}")
     if st.session_state["profile_id"] == "vocab":
         st.caption("`4.1 將所有 AI 圖片轉成動畫` 會沿用「修改分鏡 / 替換單字卡」的批次動畫流程，並把成功產出的動畫回寫成該 Scene 的預設素材。")
 
     stage_options, stage_names = get_schedule_stage_options(st.session_state["profile_id"])
-    available_eps = sorted(int(e["_raw"]["ep"]) for e in eps if e.get("_raw", {}).get("ep") is not None)
+    available_eps = sorted(
+        (int(e["_raw"]["ep"]) for e in eps if e.get("_raw", {}).get("ep") is not None),
+        reverse=True,
+    )
     if not available_eps:
         st.info("尚未發現可排程的集數。")
         return
@@ -2702,19 +1606,25 @@ def render_schedule_workspace(eps):
             end_ep = st.selectbox(
                 "結束集數",
                 available_eps,
-                index=max(len(available_eps) - 1, 0),
+                index=0,
                 key="pm_schedule_end_ep",
                 format_func=lambda ep_no: ep_label_map.get(ep_no, str(ep_no)),
             )
         low_ep = min(int(start_ep), int(end_ep))
         high_ep = max(int(start_ep), int(end_ep))
-        scheduled_episodes = [ep_no for ep_no in available_eps if low_ep <= ep_no <= high_ep]
+        scheduled_episodes = sorted(ep_no for ep_no in available_eps if low_ep <= ep_no <= high_ep)
         st.caption(f"將依序處理：{format_episode_batch_label(scheduled_episodes)}")
 
     schedule_cols = st.columns(4)
     now_dt = datetime.now()
+    today = now_dt.date()
+    saved_run_date = st.session_state.get("pm_schedule_date")
+    if isinstance(saved_run_date, datetime):
+        saved_run_date = saved_run_date.date()
+    if isinstance(saved_run_date, date) and saved_run_date < today:
+        st.session_state["pm_schedule_date"] = today
     with schedule_cols[0]:
-        run_date = st.date_input("執行日期", min_value=now_dt.date(), key="pm_schedule_date")
+        run_date = st.date_input("執行日期", min_value=today, key="pm_schedule_date")
     with schedule_cols[1]:
         run_time = st.time_input("執行時間", key="pm_schedule_time")
     with schedule_cols[2]:
@@ -2905,1696 +1815,6 @@ def render_schedule_workspace(eps):
 
     render_schedule_jobs_panel()
 
-MERGE_PROFILE_ID = "episode_merge"
-
-def merge_jobs_dir() -> Path:
-    path = ROOT / "runtime" / "merge_jobs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def merge_output_root() -> Path:
-    path = ROOT / "workspaces" / "episode_merge"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def merge_saved_configs_dir() -> Path:
-    path = merge_output_root() / "saved_configs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def merge_saved_config_path(config_id: str) -> Path:
-    safe_id = slugify_filename(config_id, fallback="merge_config")
-    return merge_saved_configs_dir() / f"{safe_id}.json"
-
-def merge_job_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.json"
-
-def merge_log_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.log"
-
-def merge_launcher_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.launch.ps1"
-
-def merge_proc_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.proc.json"
-
-def merge_proc_last_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.proc.last.json"
-
-def slugify_filename(text: str, fallback: str = "merged_episode") -> str:
-    cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", str(text or "").strip(), flags=re.UNICODE)
-    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
-    return cleaned[:48] or fallback
-
-def merge_source_profiles() -> dict[str, dict]:
-    return {
-        pid: prof
-        for pid, prof in profiles.items()
-        if pid not in {MERGE_PROFILE_ID, "youtube_ai"} and prof.get("workspace")
-    }
-
-def source_video_path(profile_id: str, ep_path: Path) -> Path:
-    if profile_id == "story":
-        return ep_path / "06_video" / "final_video.mp4"
-    return video_output_path(ep_path)
-
-def source_subtitle_path(profile_id: str, ep_path: Path) -> Path | None:
-    if profile_id == "story":
-        path = story_subtitles_srt_path(ep_path)
-        return path if path.exists() else None
-    for path in [subtitles_fixed_path(ep_path), ep_path / "02_subtitles" / "notebooklm_audio.srt"]:
-        if path.exists():
-            return path
-    return None
-
-def list_merge_episode_sources(profile_id: str) -> list[dict]:
-    profile_data = profiles.get(profile_id, {})
-    workspace = profile_data.get("workspace", "")
-    rows = []
-    for ep_path in list_episode_dirs(ROOT, workspace):
-        info = parse_episode_info(ep_path)
-        video_path = source_video_path(profile_id, ep_path)
-        subtitle_path = source_subtitle_path(profile_id, ep_path)
-        duration = media_duration_seconds(str(video_path)) if video_path.exists() else None
-        rows.append(
-            {
-                "profile_id": profile_id,
-                "profile_name": profile_data.get("name", profile_id),
-                "ep": int(info.get("ep") or 0),
-                "range": f"{int(info.get('start') or 0):04d}-{int(info.get('end') or 0):04d}",
-                "ep_path": str(ep_path),
-                "video_path": str(video_path),
-                "subtitle_path": str(subtitle_path or ""),
-                "video_ready": video_path.exists(),
-                "subtitle_ready": bool(subtitle_path and subtitle_path.exists()),
-                "duration": duration,
-            }
-        )
-    return sorted(rows, key=lambda row: int(row.get("ep") or 0))
-
-def merge_source_label(row: dict) -> str:
-    ep_text = f"Ep{int(row.get('ep') or 0):02d}"
-    ready_text = "影片就緒" if row.get("video_ready") else "缺影片"
-    subtitle_text = "字幕就緒" if row.get("subtitle_ready") else "缺字幕"
-    duration = row.get("duration")
-    duration_text = seconds_to_label(duration) if duration is not None else "--"
-    return f"{ep_text} ({row.get('range')}) | {ready_text} / {subtitle_text} | {duration_text}"
-
-def read_merge_job(job_id: str) -> dict:
-    path = merge_job_path(job_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def write_merge_job(job_id: str, payload: dict) -> Path:
-    path = merge_job_path(job_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
-
-def list_merge_saved_configs() -> list[dict]:
-    configs = []
-    for path in merge_saved_configs_dir().glob("*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["_path"] = str(path)
-            configs.append(payload)
-        except Exception:
-            continue
-    configs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
-    return configs
-
-def read_merge_saved_config(config_id: str) -> dict:
-    path = merge_saved_config_path(config_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def write_merge_saved_config(title: str, items: list[dict], config_id: str = "") -> dict:
-    now = datetime.now().isoformat(timespec="seconds")
-    clean_title = str(title or "").strip()
-    if not config_id:
-        config_id = f"cfg_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slugify_filename(clean_title, fallback='merge_config')}"
-    existing = read_merge_saved_config(config_id)
-    clean_items = []
-    for idx, item in enumerate(items, start=1):
-        clean_items.append(
-            {
-                "order": idx,
-                "profile_id": item.get("profile_id"),
-                "profile_name": item.get("profile_name"),
-                "ep": int(item.get("ep") or 0),
-                "range": item.get("range", ""),
-                "ep_path": item.get("ep_path", ""),
-                "video_path": item.get("video_path", ""),
-                "subtitle_path": item.get("subtitle_path", ""),
-            }
-        )
-    payload = {
-        "id": config_id,
-        "title": clean_title,
-        "items": clean_items,
-        "created_at": existing.get("created_at") or now,
-        "updated_at": now,
-    }
-    path = merge_saved_config_path(config_id)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    payload["_path"] = str(path)
-    return payload
-
-def merge_config_items_signature(items: list[dict]) -> list[dict]:
-    sig = []
-    for idx, item in enumerate(items, start=1):
-        sig.append(
-            {
-                "order": idx,
-                "profile_id": str(item.get("profile_id") or ""),
-                "ep": int(item.get("ep") or 0),
-                "video_path": str(item.get("video_path") or ""),
-                "subtitle_path": str(item.get("subtitle_path") or ""),
-            }
-        )
-    return sig
-
-def find_matching_merge_saved_config(title: str, items: list[dict]) -> dict:
-    clean_title = str(title or "").strip()
-    target_sig = merge_config_items_signature(items)
-    for config in list_merge_saved_configs():
-        if str(config.get("title") or "").strip() != clean_title:
-            continue
-        if merge_config_items_signature(list(config.get("items") or [])) == target_sig:
-            return config
-    return {}
-
-def get_or_write_merge_saved_config(title: str, items: list[dict], config_id: str = "") -> dict:
-    config_id = str(config_id or "").strip()
-    if config_id:
-        return write_merge_saved_config(title, items, config_id)
-    existing = find_matching_merge_saved_config(title, items)
-    if existing:
-        return existing
-    return write_merge_saved_config(title, items, "")
-
-def update_merge_saved_config_title(config_id: str, new_title: str) -> dict:
-    clean_id = str(config_id or "").strip()
-    clean_title = str(new_title or "").strip()
-    if not clean_id or not clean_title:
-        return {}
-    payload = read_merge_saved_config(clean_id)
-    if not payload:
-        return {}
-    payload["title"] = clean_title
-    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    path = merge_saved_config_path(clean_id)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    payload["_path"] = str(path)
-    return payload
-
-def delete_merge_saved_config(config_id: str) -> bool:
-    clean_id = str(config_id or "").strip()
-    if not clean_id:
-        return False
-    path = merge_saved_config_path(clean_id)
-    if not path.exists():
-        return False
-    path.unlink()
-    return True
-
-def merge_saved_config_label(config: dict) -> str:
-    title = str(config.get("title") or "未命名設定").strip()
-    updated = str(config.get("updated_at") or config.get("created_at") or "").replace("T", " ")
-    count = len(config.get("items") or [])
-    return f"{title} | {count} 支影片 | {updated}"
-
-def merge_item_duration_seconds(item: dict) -> float | None:
-    duration = item.get("duration")
-    if duration not in (None, ""):
-        try:
-            return max(float(duration), 0.0)
-        except Exception:
-            pass
-    video_path = str(item.get("video_path") or "").strip()
-    if not video_path:
-        return None
-    return media_duration_seconds(video_path)
-
-def merge_queue_duration_seconds(items: list[dict]) -> tuple[float, int]:
-    total = 0.0
-    missing = 0
-    for item in items:
-        duration = merge_item_duration_seconds(item)
-        if duration is None:
-            missing += 1
-        else:
-            total += duration
-    return total, missing
-
-def queue_from_editor(queue: list[dict], edited: pd.DataFrame | None) -> list[dict]:
-    if edited is None or edited.empty:
-        return list(queue)
-    keep_indices = [idx for idx, row in edited.iterrows() if not bool(row.get("移除"))]
-    reordered = []
-    for idx in keep_indices:
-        try:
-            order_val = int(edited.at[idx, "順序"] or (idx + 1))
-        except Exception:
-            order_val = idx + 1
-        if 0 <= int(idx) < len(queue):
-            reordered.append((order_val, int(idx), queue[int(idx)]))
-    reordered.sort(key=lambda row: (row[0], row[1]))
-    return [row[2] for row in reordered]
-
-def is_pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        out = (result.stdout or "").strip()
-        return bool(out) and "No tasks are running" not in out and out.startswith('"')
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-def get_merge_job_state(job_id: str) -> dict:
-    job = read_merge_job(job_id)
-    proc_path = merge_proc_path(job_id)
-    state = {"running": False, "pid": None, "job": job, "log": str(merge_log_path(job_id))}
-    if proc_path.exists():
-        try:
-            proc = json.loads(proc_path.read_text(encoding="utf-8"))
-            pid = int(proc.get("pid") or 0)
-            state["pid"] = pid
-            state["running"] = is_pid_running(pid)
-        except Exception:
-            pass
-    return state
-
-def get_merge_upload_state(job_id: str) -> dict:
-    proc_path = merge_upload_proc_path(job_id)
-    state = {"running": False, "pid": None, "log": str(merge_upload_log_path(job_id))}
-    if proc_path.exists():
-        try:
-            proc = json.loads(proc_path.read_text(encoding="utf-8"))
-            pid = int(proc.get("pid") or 0)
-            state["pid"] = pid
-            state["running"] = is_pid_running(pid)
-        except Exception:
-            pass
-    return state
-
-def start_merge_upload_job(job: dict, privacy: str, publish_at: str = "", playlist_id: str = "") -> dict:
-    job_id = str(job.get("id") or "").strip()
-    if not job_id:
-        return {"ok": False, "message": "missing merge job id"}
-    state = get_merge_upload_state(job_id)
-    if state.get("running"):
-        return {"ok": True, "started": False, "message": "already running", "log": state.get("log")}
-
-    job_path = merge_job_path(job_id)
-    script_path = ROOT / "scripts" / "upload_merge_to_youtube.py"
-    log_path = merge_upload_log_path(job_id)
-    proc_path = merge_upload_proc_path(job_id)
-    cmd = [
-        str(Path(sys.executable).resolve()),
-        "-u",
-        str(script_path),
-        "--job",
-        str(job_path.resolve()),
-        "--privacy",
-        str(privacy or "private"),
-        "--proc_path",
-        str(proc_path.resolve()),
-    ]
-    if publish_at:
-        cmd.extend(["--publish_at", publish_at])
-    if playlist_id:
-        cmd.extend(["--playlist_id", playlist_id])
-    cover_path = merge_job_cover_path(job)
-    if cover_path:
-        cmd.extend(["--cover_path", str(cover_path.resolve())])
-    try:
-        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-        log_file.write(f"\n==== START merge-upload:{job_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====\n")
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-            env=env,
-        )
-        log_file.close()
-        return {"ok": True, "started": True, "pid": process.pid, "log": str(log_path)}
-    except Exception as exc:
-        return {"ok": False, "message": str(exc), "log": str(log_path)}
-
-def list_merge_jobs_for_config(config_id: str = "") -> list[dict]:
-    jobs = []
-    for path in merge_jobs_dir().glob("merge_*.json"):
-        try:
-            job = json.loads(path.read_text(encoding="utf-8"))
-            if config_id and str(job.get("saved_config_id") or "") != str(config_id):
-                continue
-            jobs.append(job)
-        except Exception:
-            continue
-    jobs.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
-    return jobs
-
-def merge_job_output_video_path(job: dict) -> Path:
-    explicit = str(job.get("output_video") or "").strip()
-    if explicit:
-        return Path(explicit)
-    return Path(str(job.get("output_dir") or "")) / "final_video.mp4"
-
-def merge_job_output_subtitle_path(job: dict) -> Path:
-    explicit = str(job.get("output_subtitle") or "").strip()
-    if explicit:
-        return Path(explicit)
-    return Path(str(job.get("output_dir") or "")) / "merged_subtitles.srt"
-
-def merge_job_metadata_path(job: dict) -> Path:
-    return Path(str(job.get("output_dir") or "")) / "youtube_meta.json"
-
-def merge_job_upload_record_path(job: dict) -> Path:
-    return Path(str(job.get("output_dir") or "")) / "upload_record.json"
-
-def merge_job_cover_path(job: dict) -> Path | None:
-    output_dir = Path(str(job.get("output_dir") or ""))
-    for name in ["cover.png", "cover.jpg", "cover.jpeg", "thumbnail.png", "thumbnail.jpg", "thumbnail.jpeg"]:
-        path = output_dir / name
-        if path.exists():
-            return path
-    return None
-
-def save_merge_cover_upload(job: dict, uploaded_file) -> Path:
-    output_dir = Path(str(job.get("output_dir") or ""))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(str(uploaded_file.name or "")).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg"}:
-        suffix = ".png"
-    target = output_dir / f"cover{suffix}"
-    target.write_bytes(uploaded_file.getvalue())
-    return target
-
-def merge_upload_log_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.upload.log"
-
-def merge_upload_proc_path(job_id: str) -> Path:
-    return merge_jobs_dir() / f"{job_id}.upload.proc.json"
-
-def merge_source_metadata_paths(item: dict) -> list[Path]:
-    ep_path = Path(str(item.get("ep_path") or ""))
-    if not ep_path.exists():
-        return []
-    candidates = [
-        ep_path / "05_output" / "youtube_meta.json",
-        ep_path / "07_publish" / "youtube_meta.json",
-        ep_path / "youtube_meta.json",
-    ]
-    return [path for path in candidates if path.exists()]
-
-def merge_preview_job_label(job: dict) -> str:
-    status = get_schedule_status_label(str(job.get("status") or "queued"))
-    created = str(job.get("created_at") or "").replace("T", " ")
-    title = str(job.get("title") or job.get("id") or "").strip()
-    return f"[{status}] {title} | {created}"
-
-def merge_job_display_status(job: dict, state: dict | None = None) -> str:
-    state = state or get_merge_job_state(str(job.get("id") or ""))
-    if state.get("running"):
-        return "running"
-    status = str(job.get("status") or "queued").strip().lower()
-    if status == "queued":
-        schedule_text = str(job.get("schedule_at") or "").strip()
-        try:
-            if schedule_text and datetime.fromisoformat(schedule_text) < datetime.now() and not job.get("started_at"):
-                return "missed"
-        except Exception:
-            pass
-    return status
-
-def merge_job_status_label(status_code: str) -> str:
-    labels = {
-        "queued": "等待中",
-        "running": "執行中",
-        "done": "完成",
-        "error": "失敗",
-        "missed": "排程未啟動",
-    }
-    return labels.get(str(status_code or "").strip().lower(), str(status_code or "—"))
-
-def build_merge_segment_rows(job: dict) -> pd.DataFrame:
-    rows = []
-    offset = 0.0
-    for idx, item in enumerate(job.get("items") or [], start=1):
-        duration = merge_item_duration_seconds(item)
-        end = offset + float(duration or 0.0)
-        rows.append(
-            {
-                "順序": idx,
-                "專案模式": item.get("profile_name", item.get("profile_id", "")),
-                "集數": f"Ep{int(item.get('ep') or 0):02d}",
-                "來源範圍": item.get("range", ""),
-                "開始時間": seconds_to_label(offset),
-                "結束時間": seconds_to_label(end) if duration is not None else "未知",
-                "片段長度": seconds_to_label(duration) if duration is not None else "未知",
-                "來源影片": item.get("video_path", ""),
-            }
-        )
-        offset = end
-    return pd.DataFrame(rows)
-
-def parse_metadata_time_to_seconds(value: str) -> float | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)", text)
-    if not match:
-        return None
-    first = int(match.group(1))
-    second = int(match.group(2))
-    third = match.group(3)
-    if third is None:
-        return float(first * 60 + second)
-    return float(first * 3600 + second * 60 + int(third))
-
-def format_youtube_chapter_time(seconds_value: float) -> str:
-    total = max(0, int(round(float(seconds_value))))
-    hours, rem = divmod(total, 3600)
-    mins, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
-
-def parse_source_chapters_from_metadata(meta: dict) -> list[dict]:
-    chapters = []
-    raw_chapters = meta.get("chapters")
-    if isinstance(raw_chapters, list):
-        for item in raw_chapters:
-            if not isinstance(item, dict):
-                continue
-            seconds = parse_metadata_time_to_seconds(str(item.get("time") or ""))
-            title = str(item.get("title") or "").strip()
-            if seconds is not None and title:
-                chapters.append({"seconds": seconds, "title": title})
-    if chapters:
-        return chapters
-
-    description = str(meta.get("description") or "")
-    line_time_pattern = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*[-:：]?\s*(.+?)\s*$")
-    for raw_line in description.splitlines():
-        line = raw_line.strip()
-        match = line_time_pattern.match(line)
-        if not match:
-            continue
-        first = int(match.group(1))
-        second = int(match.group(2))
-        third = match.group(3)
-        seconds = float(first * 60 + second) if third is None else float(first * 3600 + second * 60 + int(third))
-        title = str(match.group(4) or "").strip(" -:：")
-        if title:
-            chapters.append({"seconds": seconds, "title": title})
-    return chapters
-
-def merge_source_metadata_bundle(job: dict) -> dict:
-    sources = []
-    merged_chapters = []
-    offset = 0.0
-    total_words = 0
-    for source_index, item in enumerate(job.get("items") or [], start=1):
-        duration = merge_item_duration_seconds(item) or 0.0
-        start_word = int(item.get("range", "0-0").split("-")[0] or 0) if "-" in str(item.get("range", "")) else 0
-        end_word = int(item.get("range", "0-0").split("-")[-1] or 0) if "-" in str(item.get("range", "")) else 0
-        if start_word and end_word and end_word >= start_word:
-            total_words += end_word - start_word + 1
-
-        source_meta = {}
-        source_meta_path = None
-        for path in merge_source_metadata_paths(item):
-            source_meta = read_json_file(path) or {}
-            source_meta_path = path
-            if source_meta:
-                break
-        source_chapters = parse_source_chapters_from_metadata(source_meta)
-        source_label = f"Ep{int(item.get('ep') or 0):02d} ({item.get('range', '')})"
-        sources.append(
-            {
-                "order": source_index,
-                "profile_name": item.get("profile_name", item.get("profile_id", "")),
-                "episode": source_label,
-                "offset_seconds": offset,
-                "duration_seconds": duration,
-                "metadata_path": str(source_meta_path or ""),
-                "title": source_meta.get("title", ""),
-                "summary": source_meta.get("summary", ""),
-                "description": source_meta.get("description", ""),
-                "tags": source_meta.get("tags", []),
-                "chapter_count": len(source_chapters),
-            }
-        )
-        if source_chapters:
-            for chapter in source_chapters:
-                chapter_seconds = offset + float(chapter.get("seconds") or 0.0)
-                chapter_title = str(chapter.get("title") or "").strip()
-                merged_chapters.append(
-                    {
-                        "time": format_youtube_chapter_time(chapter_seconds),
-                        "title": f"{source_label} {chapter_title}",
-                        "source_episode": source_label,
-                        "source_time": format_youtube_chapter_time(float(chapter.get("seconds") or 0.0)),
-                    }
-                )
-        else:
-            merged_chapters.append(
-                {
-                    "time": format_youtube_chapter_time(offset),
-                    "title": f"{source_label} 開始",
-                    "source_episode": source_label,
-                    "source_time": "00:00",
-                }
-            )
-        offset += duration
-    return {
-        "sources": sources,
-        "merged_chapters": merged_chapters,
-        "total_words": total_words,
-        "total_episodes": len(job.get("items") or []),
-        "total_duration_seconds": offset,
-    }
-
-def extract_json_object(text: str) -> dict:
-    raw = str(text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
-        return json.loads(raw[start:end + 1])
-    raise ValueError("LLM response did not contain a JSON object")
-
-def merge_metadata_prompt(job: dict, subtitle_text: str, source_bundle: dict) -> str:
-    title = str(job.get("title") or "").strip()
-    source_rows = []
-    for idx, item in enumerate(job.get("items") or [], start=1):
-        source_rows.append(
-            f"{idx}. {item.get('profile_name', item.get('profile_id', ''))} "
-            f"Ep{int(item.get('ep') or 0):02d} ({item.get('range', '')})"
-        )
-    sources_text = "\n".join(source_rows) or "無來源資訊"
-    merged_chapters_text = "\n".join(
-        f"{item.get('time')} {item.get('title')}"
-        for item in source_bundle.get("merged_chapters", [])
-    )
-    source_meta_summary = []
-    for source in source_bundle.get("sources", []):
-        source_meta_summary.append(
-            {
-                "episode": source.get("episode", ""),
-                "offset": format_youtube_chapter_time(source.get("offset_seconds", 0)),
-                "metadata_path": source.get("metadata_path", ""),
-                "tags": source.get("tags", []),
-                "chapter_count": source.get("chapter_count", 0),
-            }
-        )
-    return f"""你是 YouTube SEO 與影片上架 metadata 編輯。請根據合併後字幕，產生繁體中文 YouTube metadata。
-
-重要規則：
-- 不要重新產生 title。Title 已固定為：{title}
-- 這是 {source_bundle.get("total_episodes", 0)} 集合併影片，總共 {source_bundle.get("total_words", 0)} 個單字。summary 必須明確寫出這個事實。
-- 只產生 description、tags、summary。章節時間軸已由系統根據各集 metadata 與影片 offset 算好，不要自行改寫章節時間。
-- description 要適合直接貼到 YouTube 說明欄，需包含簡短影片介紹、合併來源集數摘要，並可自然提到完整章節時間軸會附在後方。
-- tags 請給 8 到 15 個繁體中文或英文關鍵字，不要包含 #。
-- 回覆必須是 JSON，不要加 markdown。
-
-來源集數：
-{sources_text}
-
-各集 metadata 摘要：
-{json.dumps(source_meta_summary, ensure_ascii=False, indent=2)}
-
-系統已計算完成的完整章節時間軸，description 不要漏掉這些來源範圍：
-{merged_chapters_text}
-
-合併後字幕 SRT：
-{subtitle_text}
-
-請輸出 JSON 格式：
-{{
-  "summary": "...",
-  "description": "...",
-  "tags": ["..."]
-}}
-"""
-
-def generate_merge_metadata_with_gemini(job: dict, prompt: str) -> tuple[dict, str]:
-    from google import genai
-    from google.genai import types
-
-    model = os.environ.get("CAP_MERGE_METADATA_GEMINI_MODEL", os.environ.get("CAP_TEXT_MODEL", "gemini-2.5-pro"))
-    client = genai.Client()
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
-    )
-    return extract_json_object(response.text), f"gemini:{model}"
-
-def generate_merge_metadata_with_openai(job: dict, prompt: str) -> tuple[dict, str]:
-    from openai import OpenAI
-
-    model = os.environ.get("CAP_MERGE_METADATA_OPENAI_MODEL", os.environ.get("OPENAI_METADATA_MODEL", "gpt-4o-mini"))
-    client = OpenAI()
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "system",
-                "content": "You generate valid JSON only. Do not wrap the response in markdown.",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0.2,
-    )
-    return extract_json_object(response.output_text), f"openai:{model}"
-
-def generate_merge_metadata(job: dict, provider: str = "auto") -> dict:
-    subtitle_path = merge_job_output_subtitle_path(job)
-    if not subtitle_path.exists():
-        raise FileNotFoundError(f"找不到合併字幕：{subtitle_path}")
-    subtitle_text = subtitle_path.read_text(encoding="utf-8", errors="ignore")
-    if not subtitle_text.strip():
-        raise ValueError("合併字幕是空的，無法產生 metadata。")
-
-    from dotenv import load_dotenv
-
-    load_dotenv(ROOT / ".env")
-    source_bundle = merge_source_metadata_bundle(job)
-    prompt = merge_metadata_prompt(job, subtitle_text, source_bundle)
-    provider = str(provider or "auto").strip().lower()
-    errors = []
-    ai_data = {}
-    generated_by = ""
-
-    if provider in {"auto", "gemini"}:
-        try:
-            ai_data, generated_by = generate_merge_metadata_with_gemini(job, prompt)
-        except Exception as exc:
-            errors.append(f"Gemini: {exc}")
-            if provider == "gemini":
-                raise
-
-    if not ai_data and provider in {"auto", "openai"}:
-        try:
-            ai_data, generated_by = generate_merge_metadata_with_openai(job, prompt)
-        except Exception as exc:
-            errors.append(f"OpenAI: {exc}")
-            raise RuntimeError("Metadata 產生失敗；" + " | ".join(errors)) from exc
-
-    if not ai_data:
-        raise RuntimeError("Metadata 產生失敗；" + " | ".join(errors))
-
-    title = str(job.get("title") or "").strip()
-    chapters = source_bundle.get("merged_chapters") or ai_data.get("chapters") or []
-    summary = str(ai_data.get("summary") or "").strip()
-    if source_bundle.get("total_episodes") and source_bundle.get("total_words"):
-        required_summary_prefix = (
-            f"本集是 {int(source_bundle.get('total_episodes') or 0)} 集合併的總複習，"
-            f"完整整理 {int(source_bundle.get('total_words') or 0)} 個國中英文單字。"
-        )
-        if str(source_bundle.get("total_words")) not in summary:
-            summary = required_summary_prefix + (" " + summary if summary else "")
-
-    chapter_text = "\n".join(f"{item.get('time')} {item.get('title')}" for item in chapters)
-    source_text = "\n".join(
-        f"{idx}. {source.get('profile_name', '')} {source.get('episode', '')}"
-        for idx, source in enumerate(source_bundle.get("sources", []), start=1)
-    )
-    description = str(ai_data.get("description") or "").strip()
-    description_parts = []
-    if summary:
-        description_parts.append(summary)
-    if description and description != summary:
-        description_parts.append(description)
-    if source_text:
-        description_parts.append("合併來源集數：\n" + source_text)
-    if chapter_text:
-        description_parts.append("章節時間軸：\n" + chapter_text)
-
-    meta = {
-        "title": title,
-        "description": "\n\n".join(description_parts).strip(),
-        "tags": [str(tag).strip() for tag in (ai_data.get("tags") or []) if str(tag).strip()],
-        "summary": summary,
-        "chapters": chapters,
-        "source_metadata": source_bundle.get("sources", []),
-        "total_episodes": source_bundle.get("total_episodes", 0),
-        "total_words": source_bundle.get("total_words", 0),
-        "default_language": "zh-TW",
-        "default_audio_language": "zh-TW",
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "generated_by": generated_by,
-        "source_job_id": job.get("id", ""),
-        "source_saved_config_id": job.get("saved_config_id", ""),
-    }
-    return meta
-
-def write_merge_metadata(job: dict, meta: dict) -> Path:
-    path = merge_job_metadata_path(job)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
-
-def build_merge_job_payload(title: str, items: list[dict], scheduled_at: datetime | None = None, saved_config: dict | None = None) -> tuple[str, dict]:
-    now_text = datetime.now().strftime("%Y%m%d_%H%M%S")
-    first_ep = int(items[0].get("ep") or 0) if items else 0
-    last_ep = int(items[-1].get("ep") or first_ep) if items else first_ep
-    job_id = f"merge_{now_text}_ep{first_ep:02d}_{last_ep:02d}"
-    output_dir = merge_output_root() / f"{now_text}_{slugify_filename(title)}"
-    clean_items = []
-    for idx, item in enumerate(items, start=1):
-        clean_items.append(
-            {
-                "order": idx,
-                "profile_id": item.get("profile_id"),
-                "profile_name": item.get("profile_name"),
-                "ep": int(item.get("ep") or 0),
-                "range": item.get("range", ""),
-                "ep_path": item.get("ep_path", ""),
-                "video_path": item.get("video_path", ""),
-                "subtitle_path": item.get("subtitle_path", ""),
-            }
-        )
-    payload = {
-        "id": job_id,
-        "title": title,
-        "saved_config_id": (saved_config or {}).get("id", ""),
-        "saved_config_updated_at": (saved_config or {}).get("updated_at", ""),
-        "items": clean_items,
-        "output_dir": str(output_dir),
-        "log_path": str(merge_log_path(job_id)),
-        "proc_path": str(merge_proc_path(job_id)),
-        "proc_last_path": str(merge_proc_last_path(job_id)),
-        "schedule_at": scheduled_at.isoformat(timespec="seconds") if scheduled_at else datetime.now().isoformat(timespec="seconds"),
-        "status": "queued",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "started_at": None,
-        "ended_at": None,
-        "last_message": "queued",
-    }
-    return job_id, payload
-
-def write_merge_launcher(job_id: str) -> Path:
-    launcher_path = merge_launcher_path(job_id)
-    script_path = (ROOT / "scripts" / "merge_episode_videos.py").resolve()
-    job_path = merge_job_path(job_id).resolve()
-    log_path = merge_log_path(job_id).resolve()
-    cmd_parts = [str(Path(sys.executable).resolve()), "-u", str(script_path), "--job", str(job_path)]
-    launcher_lines = [
-        '$ErrorActionPreference = "Continue"',
-        '$env:PYTHONUNBUFFERED = "1"',
-        '$env:PYTHONIOENCODING = "utf-8"',
-        '$env:PYTHONUTF8 = "1"',
-        "& " + " ".join(json.dumps(part, ensure_ascii=False) for part in cmd_parts) + " *>> " + json.dumps(str(log_path), ensure_ascii=False),
-        "exit $LASTEXITCODE",
-        "",
-    ]
-    launcher_path.write_text("\n".join(launcher_lines), encoding="utf-8")
-    return launcher_path
-
-def start_merge_job_now(job_id: str) -> dict:
-    log_path = merge_log_path(job_id)
-    script_path = (ROOT / "scripts" / "merge_episode_videos.py").resolve()
-    job_path = merge_job_path(job_id).resolve()
-    try:
-        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-        log_file.write(f"\n==== START merge:{job_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====\n")
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        process = subprocess.Popen(
-            [str(Path(sys.executable).resolve()), "-u", str(script_path), "--job", str(job_path)],
-            cwd=str(ROOT),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-            env=env,
-        )
-        log_file.close()
-        return {"ok": True, "pid": process.pid, "log": str(log_path)}
-    except Exception as exc:
-        return {"ok": False, "message": str(exc), "log": str(log_path)}
-
-def schedule_merge_job(job_id: str, scheduled_at: datetime) -> dict:
-    launcher_path = write_merge_launcher(job_id)
-    task_name = f"CAP2000_Merge_{job_id}"
-    register_script = (ROOT / "scripts" / "register_schedule_task.ps1").resolve()
-    register_cmd = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(register_script),
-        "-TaskName",
-        task_name,
-        "-Command",
-        "powershell.exe",
-        "-Arguments",
-        subprocess.list2cmdline(
-            [
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(launcher_path),
-            ]
-        ),
-        "-StartAt",
-        scheduled_at.isoformat(timespec="seconds"),
-        "-Description",
-        f"CAP2000 episode merge {job_id}",
-    ]
-    result = subprocess.run(
-        register_cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    if result.returncode != 0:
-        return {"ok": False, "message": (result.stderr or result.stdout or "").strip()}
-    job = read_merge_job(job_id)
-    job.update({
-        "task_name": task_name,
-        "launcher_path": str(launcher_path),
-        "last_message": f"scheduled for {scheduled_at.isoformat(sep=' ', timespec='minutes')}",
-        "registered_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    write_merge_job(job_id, job)
-    with open(merge_log_path(job_id), "a", encoding="utf-8") as log_file:
-        log_file.write(
-            f"\n==== REGISTER merge:{job_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-            f"====: {scheduled_at.isoformat(sep=' ', timespec='minutes')}\n"
-        )
-    return {"ok": True, "task_name": task_name, "log": str(merge_log_path(job_id))}
-
-def youtube_auth_file_signatures() -> tuple[int, int]:
-    token_path = ROOT / "token_youtube.pickle"
-    client_path = ROOT / "client_secret.json"
-    token_sig = token_path.stat().st_mtime_ns if token_path.exists() else 0
-    client_sig = client_path.stat().st_mtime_ns if client_path.exists() else 0
-    return token_sig, client_sig
-
-def reauthorize_youtube_for_app() -> None:
-    import pickle
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    token_path = ROOT / "token_youtube.pickle"
-    client_path = ROOT / "client_secret.json"
-    scopes = ["https://www.googleapis.com/auth/youtube.force-ssl"]
-
-    if not client_path.exists():
-        raise FileNotFoundError(f"找不到 client_secret.json：{client_path}")
-
-    try:
-        if token_path.exists():
-            token_path.unlink()
-    except Exception as e:
-        raise RuntimeError(f"刪除舊的 YouTube token 失敗：{e}")
-
-    flow = InstalledAppFlow.from_client_secrets_file(str(client_path), scopes)
-    creds = flow.run_local_server(port=0)
-    with open(token_path, "wb") as token_fp:
-        pickle.dump(creds, token_fp)
-
-def load_youtube_service_for_app():
-    import pickle
-    from google.auth.transport.requests import Request
-    from google.auth.exceptions import RefreshError
-    from googleapiclient.discovery import build
-
-    token_path = ROOT / "token_youtube.pickle"
-    client_path = ROOT / "client_secret.json"
-    if not client_path.exists():
-        raise FileNotFoundError(f"找不到 client_secret.json：{client_path}")
-
-    creds = None
-    if token_path.exists():
-        try:
-            with open(token_path, "rb") as token_fp:
-                creds = pickle.load(token_fp)
-        except Exception as e:
-            raise RuntimeError(f"讀取 YouTube token 失敗：{e}")
-
-    if not creds:
-        raise RuntimeError("尚未完成 YouTube OAuth 授權，請先執行一次上傳流程。")
-
-    if not creds.valid:
-        if creds.expired and getattr(creds, "refresh_token", None):
-            try:
-                creds.refresh(Request())
-                with open(token_path, "wb") as token_fp:
-                    pickle.dump(creds, token_fp)
-            except RefreshError as e:
-                raise RuntimeError(f"YouTube token refresh 失敗：{e}。請重新授權 YouTube。")
-        else:
-            raise RuntimeError("YouTube token 無效，請重新授權。")
-
-    return build("youtube", "v3", credentials=creds)
-
-@st.cache_data(show_spinner=False, ttl=300)
-def list_youtube_playlists_cached(token_sig: int, client_sig: int):
-    _ = (token_sig, client_sig)
-    try:
-        youtube = load_youtube_service_for_app()
-        results = []
-        page_token = None
-        while True:
-            resp = youtube.playlists().list(
-                part="snippet",
-                mine=True,
-                maxResults=50,
-                pageToken=page_token,
-            ).execute()
-            for item in resp.get("items", []):
-                playlist_id = str(item.get("id", "")).strip()
-                title = str((item.get("snippet") or {}).get("title", "")).strip()
-                if playlist_id and title:
-                    results.append({
-                        "id": playlist_id,
-                        "title": title,
-                        "label": f"{title} ({playlist_id})",
-                    })
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        return results, ""
-    except Exception as e:
-        return [], str(e)
-
-def render_episode_merge_workspace() -> None:
-    st.header("集數合併")
-
-    saved_configs = list_merge_saved_configs()
-    saved_config_map = {str(config.get("id")): config for config in saved_configs if str(config.get("id", "")).strip()}
-    saved_options = [""] + list(saved_config_map.keys())
-    current_loaded = str(st.session_state.get("merge_loaded_config_id") or "")
-    if current_loaded not in saved_options:
-        current_loaded = ""
-        st.session_state["merge_loaded_config_id"] = ""
-
-    select_sig = int(st.session_state.get("merge_saved_config_select_sig", 0) or 0)
-    saved_cols = st.columns([3, 1, 2])
-    selected_saved_id = saved_cols[0].selectbox(
-        "已儲存合併設定",
-        saved_options,
-        index=saved_options.index(current_loaded),
-        key=f"merge_saved_config_select_{select_sig}",
-        format_func=lambda config_id: "新增 / 空白設定" if not config_id else merge_saved_config_label(saved_config_map.get(config_id, {})),
-    )
-    if selected_saved_id != current_loaded:
-        if selected_saved_id:
-            selected_config = saved_config_map.get(str(selected_saved_id), {})
-            st.session_state["merge_loaded_config_id"] = str(selected_config.get("id") or "")
-            st.session_state["merge_title"] = str(selected_config.get("title") or "")
-            st.session_state["merge_queue"] = list(selected_config.get("items") or [])
-        else:
-            st.session_state["merge_loaded_config_id"] = ""
-            st.session_state["merge_title"] = ""
-            st.session_state["merge_queue"] = []
-        st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-        st.rerun()
-
-    if saved_cols[1].button("新增空白設定", key="merge_new_config"):
-        st.session_state["merge_loaded_config_id"] = ""
-        st.session_state["merge_title"] = ""
-        st.session_state["merge_queue"] = []
-        st.session_state["merge_saved_config_select_sig"] = select_sig + 1
-        st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-        st.rerun()
-    loaded_label = merge_saved_config_label(saved_config_map.get(current_loaded, {})) if current_loaded else "目前為尚未儲存的新設定"
-    saved_cols[2].caption(loaded_label)
-
-    selected_saved_config = saved_config_map.get(current_loaded, {})
-    manage_cols = st.columns([3, 1, 1, 2])
-    rename_key = f"merge_rename_title_{current_loaded or 'new'}_{select_sig}"
-    rename_title = manage_cols[0].text_input(
-        "修改已儲存設定標題",
-        value=str(selected_saved_config.get("title") or ""),
-        key=rename_key,
-        disabled=not current_loaded,
-    )
-    if manage_cols[1].button("修改標題", key="merge_update_saved_title", disabled=not current_loaded):
-        if not str(rename_title or "").strip():
-            st.error("請先輸入新的設定標題。")
-        else:
-            updated_config = update_merge_saved_config_title(current_loaded, rename_title)
-            if updated_config:
-                st.session_state["merge_title"] = str(updated_config.get("title") or "")
-                st.session_state["merge_saved_config_select_sig"] = select_sig + 1
-                st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-                st.success("已更新設定標題。")
-                st.rerun()
-            else:
-                st.error("找不到要修改的已儲存設定。")
-    if manage_cols[2].button("刪除設定", key="merge_delete_saved_config", disabled=not current_loaded):
-        if delete_merge_saved_config(current_loaded):
-            st.session_state["merge_loaded_config_id"] = ""
-            st.session_state["merge_title"] = ""
-            st.session_state["merge_queue"] = []
-            st.session_state["merge_saved_config_select_sig"] = select_sig + 1
-            st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-            st.success("已刪除合併設定。")
-            st.rerun()
-        else:
-            st.error("找不到要刪除的已儲存設定。")
-    manage_cols[3].caption("刪除只會移除合併設定，不會刪除已產出的影片、Metadata、封面或 Log。")
-
-    merge_tab, preview_tab, metadata_tab, publish_tab, log_tab = st.tabs(["合併影片", "預覽", "Metadata", "發布", "Log"])
-
-    with merge_tab:
-        title = st.text_input("標題", key="merge_title")
-        source_profiles = merge_source_profiles()
-        if not source_profiles:
-            st.info("目前沒有可選擇的來源專案模式。")
-            return
-
-        profile_options = list(source_profiles.keys())
-        selected_profile = st.selectbox(
-            "專案模式",
-            profile_options,
-            key="merge_source_profile",
-            format_func=lambda pid: source_profiles.get(pid, {}).get("name", pid),
-        )
-        source_rows = list_merge_episode_sources(selected_profile)
-        source_options = [row for row in source_rows if row.get("video_ready")]
-        if not source_options:
-            st.warning("此專案模式尚未找到可合併的 final video。")
-        else:
-            selected_idx = st.selectbox(
-                "集數",
-                list(range(len(source_options))),
-                key="merge_source_episode",
-                format_func=lambda idx: merge_source_label(source_options[int(idx)]),
-            )
-            add_cols = st.columns([1, 4])
-            if add_cols[0].button("新增", key="merge_add_source"):
-                queue = list(st.session_state.get("merge_queue", []))
-                item = dict(source_options[int(selected_idx)])
-                if any(row.get("video_path") == item.get("video_path") for row in queue):
-                    st.warning("此影片已在待合併清單中。")
-                else:
-                    queue.append(item)
-                    st.session_state["merge_queue"] = queue
-                    st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-                    st.success("已加入待合併清單。")
-                    st.rerun()
-            add_cols[1].caption(f"影片：{source_options[int(selected_idx)].get('video_path', '')}")
-
-        queue = list(st.session_state.get("merge_queue", []))
-        st.subheader("待合併清單")
-        if not queue:
-            st.caption("尚未加入任何影片。")
-        else:
-            table_rows = []
-            for idx, item in enumerate(queue, start=1):
-                table_rows.append(
-                    {
-                        "順序": idx,
-                        "移除": False,
-                        "專案模式": item.get("profile_name", item.get("profile_id", "")),
-                        "集數": f"Ep{int(item.get('ep') or 0):02d}",
-                        "範圍": item.get("range", ""),
-                        "時間長度": seconds_to_label(merge_item_duration_seconds(item)) if merge_item_duration_seconds(item) is not None else "未知",
-                        "字幕": "有" if item.get("subtitle_path") else "無",
-                        "影片路徑": item.get("video_path", ""),
-                    }
-                )
-            edited = st.data_editor(
-                pd.DataFrame(table_rows),
-                use_container_width=True,
-                hide_index=True,
-                key=f"merge_queue_editor_{int(st.session_state.get('merge_editor_sig', 0) or 0)}",
-                column_config={
-                    "順序": st.column_config.NumberColumn("順序", min_value=1, step=1),
-                    "移除": st.column_config.CheckboxColumn("移除"),
-                    "影片路徑": st.column_config.TextColumn("影片路徑", disabled=True, width="large"),
-                },
-                disabled=["專案模式", "集數", "範圍", "時間長度", "字幕", "影片路徑"],
-            )
-            preview_queue = queue_from_editor(queue, edited)
-            total_duration, missing_duration_count = merge_queue_duration_seconds(preview_queue)
-            duration_cols = st.columns([1.2, 1.2, 3.6])
-            duration_cols[0].metric("合併後時間長度", seconds_to_label(total_duration))
-            duration_cols[1].metric("待合併影片數", len(preview_queue))
-            if missing_duration_count:
-                duration_cols[2].warning(f"有 {missing_duration_count} 支影片無法讀取時間長度，總長度可能低估。")
-            else:
-                duration_cols[2].caption("時間長度會依目前表格順序與移除勾選即時更新。")
-            action_cols = st.columns([1.2, 1.2, 1.2, 3])
-            if action_cols[0].button("套用清單調整", key="merge_apply_queue"):
-                st.session_state["merge_queue"] = preview_queue
-                st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-                st.success("已更新待合併清單。")
-                st.rerun()
-            if action_cols[1].button("清空清單", key="merge_clear_queue"):
-                st.session_state["merge_queue"] = []
-                st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-                st.rerun()
-            if action_cols[2].button("儲存", key="merge_save_config"):
-                save_queue = preview_queue
-                if not title.strip():
-                    st.error("請先填寫標題。")
-                elif not save_queue:
-                    st.error("待合併清單至少需要 1 支影片才能儲存。")
-                else:
-                    saved = get_or_write_merge_saved_config(title.strip(), save_queue, st.session_state.get("merge_loaded_config_id", ""))
-                    st.session_state["merge_loaded_config_id"] = str(saved.get("id") or "")
-                    st.session_state["merge_queue"] = list(saved.get("items") or [])
-                    st.session_state["merge_saved_config_select_sig"] = int(st.session_state.get("merge_saved_config_select_sig", 0) or 0) + 1
-                    st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
-                    st.success(f"已儲存設定：{saved.get('title')}")
-                    st.rerun()
-            action_cols[3].caption("可直接修改「順序」欄位，或勾選「移除」後套用；合併與排程會先儲存目前設定再執行。")
-
-            st.divider()
-            now_dt = datetime.now()
-            schedule_cols = st.columns([1.2, 1.2, 1.2, 1.2, 2.4])
-            with schedule_cols[0]:
-                run_now = st.button("合併", type="primary", key="merge_run_now")
-            with schedule_cols[1]:
-                run_date = st.date_input("排程日期", min_value=now_dt.date(), key="merge_schedule_date")
-            with schedule_cols[2]:
-                run_time = st.time_input("排程時間", key="merge_schedule_time")
-            with schedule_cols[3]:
-                create_schedule = st.button("設定執行排程", key="merge_create_schedule")
-            schedule_cols[4].caption("至少需要 2 支影片。執行期間會要求 Windows 保持喚醒；若使用排程，電腦仍不可關機。")
-
-            if run_now or create_schedule:
-                current_queue = preview_queue
-                if len(current_queue) < 2:
-                    st.error("待合併清單至少需要 2 支影片。")
-                elif not title.strip():
-                    st.error("請先填寫標題。")
-                elif create_schedule and datetime.combine(run_date, run_time) <= now_dt:
-                    st.error("排程時間不能設定為過去時間。")
-                else:
-                    scheduled_at = datetime.combine(run_date, run_time) if create_schedule else None
-                    saved = get_or_write_merge_saved_config(title.strip(), current_queue, st.session_state.get("merge_loaded_config_id", ""))
-                    st.session_state["merge_loaded_config_id"] = str(saved.get("id") or "")
-                    st.session_state["merge_queue"] = list(saved.get("items") or [])
-                    st.session_state["merge_saved_config_select_sig"] = int(st.session_state.get("merge_saved_config_select_sig", 0) or 0) + 1
-                    job_id, payload = build_merge_job_payload(title.strip(), list(saved.get("items") or []), scheduled_at=scheduled_at, saved_config=saved)
-                    write_merge_job(job_id, payload)
-                    if run_now:
-                        res = start_merge_job_now(job_id)
-                        if res.get("ok"):
-                            st.success(f"已儲存設定並開始合併：{job_id}")
-                        else:
-                            st.error(f"合併啟動失敗：{res.get('message')}")
-                    else:
-                        res = schedule_merge_job(job_id, scheduled_at)
-                        if res.get("ok"):
-                            st.success(f"已儲存設定並建立合併排程：{scheduled_at.isoformat(sep=' ', timespec='minutes')}")
-                        else:
-                            st.error(f"排程建立失敗：{res.get('message')}")
-
-            st.subheader("合併 / 排程執行 Log")
-            selected_merge_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-            merge_log_jobs = list_merge_jobs_for_config(selected_merge_config_id)[:8]
-            if not merge_log_jobs:
-                st.caption("尚無合併或排程執行紀錄。")
-            else:
-                if st.button("刷新合併執行 Log", key="merge_run_log_refresh"):
-                    st.rerun()
-                for idx, job in enumerate(merge_log_jobs):
-                    job_id = str(job.get("id") or "")
-                    state = get_merge_job_state(job_id)
-                    display_status = merge_job_display_status(job, state)
-                    title_text = f"[{merge_job_status_label(display_status)}] {job.get('title', '')} | {job_id}"
-                    with st.expander(title_text, expanded=bool(state.get("running")) or idx == 0):
-                        log_cols = st.columns(5)
-                        log_cols[0].metric("狀態", merge_job_status_label(display_status))
-                        log_cols[1].metric("建立時間", str(job.get("created_at") or "").replace("T", " ") or "—")
-                        log_cols[2].metric("排程時間", str(job.get("schedule_at") or "").replace("T", " ") or "—")
-                        log_cols[3].metric("開始時間", str(job.get("started_at") or "").replace("T", " ") or "—")
-                        log_cols[4].metric("完成時間", str(job.get("ended_at") or "").replace("T", " ") or "—")
-                        st.caption(f"Last Message: {job.get('last_message', '')}")
-                        if display_status == "missed":
-                            st.warning("排程時間已過，但沒有開始時間。這通常代表 Windows 工作排程沒有成功啟動 launcher。新版已改用 ASCII job id/task name，請重新建立排程。")
-                        log_path = merge_log_path(job_id)
-                        if log_path.exists():
-                            st.download_button(
-                                "下載合併 Log",
-                                data=log_path.read_bytes(),
-                                file_name=log_path.name,
-                                key=f"merge_run_log_download_{job_id}_{idx}",
-                            )
-                            st.code(log_path.read_text(encoding="utf-8", errors="ignore")[-8000:], language="text")
-                        else:
-                            st.caption("尚無 Log 檔。")
-
-    with preview_tab:
-        selected_preview_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-        if selected_preview_config_id:
-            st.caption(f"目前依上方已儲存合併設定顯示預覽：{merge_saved_config_label(saved_config_map.get(selected_preview_config_id, {}))}")
-        else:
-            st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
-
-        preview_jobs = [
-            job for job in list_merge_jobs_for_config(selected_preview_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
-        ]
-        if not preview_jobs:
-            st.info("尚無可預覽的合併結果。請先完成一次合併。")
-        else:
-            selected_preview_idx = st.selectbox(
-                "選擇合併結果",
-                list(range(len(preview_jobs))),
-                key="merge_preview_job",
-                format_func=lambda idx: merge_preview_job_label(preview_jobs[int(idx)]),
-            )
-            preview_job = preview_jobs[int(selected_preview_idx)]
-            video_path = merge_job_output_video_path(preview_job)
-            subtitle_path = merge_job_output_subtitle_path(preview_job)
-            subtitle_entries = parse_srt_entries(subtitle_path)
-            video_duration = media_duration_seconds(str(video_path))
-            subtitle_end = max([safe_float(row.get("end", 0)) for row in subtitle_entries] + [0.0])
-            expected_duration, expected_missing = merge_queue_duration_seconds(list(preview_job.get("items") or []))
-
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("影片長度", seconds_to_label(video_duration) if video_duration is not None else "未知")
-            metric_cols[1].metric("字幕尾端", seconds_to_label(subtitle_end))
-            metric_cols[2].metric("字幕數", len(subtitle_entries))
-            if video_duration is not None:
-                metric_cols[3].metric("影片 / 字幕差距", f"{video_duration - subtitle_end:+.2f}s")
-            else:
-                metric_cols[3].metric("預估清單長度", seconds_to_label(expected_duration))
-            if expected_missing:
-                st.warning(f"來源清單有 {expected_missing} 支影片無法讀取長度，來源區段結束時間可能不完整。")
-
-            video_col, subtitle_col = st.columns([1.5, 1])
-            with video_col:
-                st.caption(f"合併影片：{video_path}")
-                st.video(str(video_path))
-            with subtitle_col:
-                st.caption(f"合併字幕：{subtitle_path}")
-                if subtitle_path.exists():
-                    st.download_button(
-                        "下載合併字幕",
-                        data=subtitle_path.read_bytes(),
-                        file_name=subtitle_path.name,
-                        key=f"merge_preview_download_subtitle_{preview_job.get('id', '')}",
-                    )
-                    st.text_area(
-                        "字幕檔內容",
-                        value=read_text_file(subtitle_path, ""),
-                        height=360,
-                        key=f"merge_preview_srt_text_{preview_job.get('id', '')}",
-                    )
-                else:
-                    st.warning("找不到合併字幕檔。")
-
-            st.subheader("來源集數接續區段")
-            segment_df = build_merge_segment_rows(preview_job)
-            if segment_df.empty:
-                st.caption("沒有來源集數資訊。")
-            else:
-                st.dataframe(segment_df, use_container_width=True, hide_index=True)
-
-            st.subheader("字幕時間軸")
-            if not subtitle_entries:
-                st.caption("沒有可解析的字幕。")
-            else:
-                subtitle_df = pd.DataFrame(
-                    [
-                        {
-                            "序號": row.get("index", ""),
-                            "開始": seconds_to_label(row.get("start", 0)),
-                            "結束": seconds_to_label(row.get("end", 0)),
-                            "字幕": row.get("content", ""),
-                        }
-                        for row in subtitle_entries
-                    ]
-                )
-                st.dataframe(
-                    subtitle_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=420,
-                    column_config={"字幕": st.column_config.TextColumn("字幕", width="large")},
-                )
-
-    with metadata_tab:
-        selected_metadata_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-        if selected_metadata_config_id:
-            st.caption(f"目前依上方已儲存合併設定顯示 Metadata：{merge_saved_config_label(saved_config_map.get(selected_metadata_config_id, {}))}")
-        else:
-            st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
-
-        metadata_jobs = [
-            job for job in list_merge_jobs_for_config(selected_metadata_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_subtitle_path(job).exists()
-        ]
-        if not metadata_jobs:
-            st.info("尚無可產生 Metadata 的合併結果。請先完成一次合併。")
-        else:
-            selected_meta_idx = st.selectbox(
-                "選擇合併結果",
-                list(range(len(metadata_jobs))),
-                key="merge_metadata_job",
-                format_func=lambda idx: merge_preview_job_label(metadata_jobs[int(idx)]),
-            )
-            metadata_job = metadata_jobs[int(selected_meta_idx)]
-            metadata_path = merge_job_metadata_path(metadata_job)
-            title_value = str(metadata_job.get("title") or "").strip()
-            source_bundle_preview = merge_source_metadata_bundle(metadata_job)
-            st.text_input("Title", value=title_value, disabled=True, key=f"merge_meta_title_{metadata_job.get('id', '')}")
-            st.caption("Title 沿用合併設定，不會交給 LLM 重新產生。")
-            source_metric_cols = st.columns(3)
-            source_metric_cols[0].metric("來源集數", int(source_bundle_preview.get("total_episodes") or 0))
-            source_metric_cols[1].metric("預估單字數", int(source_bundle_preview.get("total_words") or 0))
-            source_metric_cols[2].metric("來源章節數", len(source_bundle_preview.get("merged_chapters") or []))
-            with st.expander("將套用的來源章節時間軸", expanded=False):
-                st.dataframe(
-                    pd.DataFrame(source_bundle_preview.get("merged_chapters") or []),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            provider_choice = st.radio(
-                "LLM Provider",
-                ["auto", "openai", "gemini"],
-                horizontal=True,
-                key=f"merge_metadata_provider_{metadata_job.get('id', '')}",
-                format_func=lambda value: {
-                    "auto": "自動：Gemini 失敗改用 OpenAI",
-                    "openai": "OpenAI",
-                    "gemini": "Gemini",
-                }.get(value, value),
-            )
-
-            meta_action_cols = st.columns([1.2, 1.2, 3.6])
-            if meta_action_cols[0].button("產生 Metadata", type="primary", key=f"merge_generate_meta_{metadata_job.get('id', '')}"):
-                try:
-                    with st.spinner("正在使用 LLM API 產生合併 Metadata..."):
-                        meta = generate_merge_metadata(metadata_job, provider=provider_choice)
-                        saved_path = write_merge_metadata(metadata_job, meta)
-                    st.success(f"已產生 Metadata：{saved_path}")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Metadata 產生失敗：{exc}")
-            if metadata_path.exists():
-                meta_action_cols[1].download_button(
-                    "下載 Metadata",
-                    data=metadata_path.read_bytes(),
-                    file_name=metadata_path.name,
-                    key=f"merge_download_meta_{metadata_job.get('id', '')}",
-                )
-            meta_action_cols[2].caption(f"輸出檔案：{metadata_path}")
-
-            current_meta = read_json_file(metadata_path) or {}
-            desc_default = str(current_meta.get("description") or "")
-            tags_default = ", ".join([str(tag) for tag in (current_meta.get("tags") or [])])
-            summary_default = str(current_meta.get("summary") or "")
-            chapters_default = json.dumps(current_meta.get("chapters") or [], ensure_ascii=False, indent=2)
-
-            with st.form(f"merge_metadata_form_{metadata_job.get('id', '')}_{int(metadata_path.stat().st_mtime) if metadata_path.exists() else 0}"):
-                summary_val = st.text_area("Summary", value=summary_default, height=110)
-                desc_val = st.text_area("Description", value=desc_default, height=300)
-                tags_val = st.text_input("Tags", value=tags_default)
-                chapters_val = st.text_area("Chapters JSON", value=chapters_default, height=180)
-                save_meta = st.form_submit_button("儲存 Metadata")
-            if save_meta:
-                try:
-                    chapters_data = json.loads(chapters_val or "[]")
-                    tags_data = [tag.strip() for tag in tags_val.split(",") if tag.strip()]
-                    meta = {
-                        **current_meta,
-                        "title": title_value,
-                        "summary": summary_val.strip(),
-                        "description": desc_val.strip(),
-                        "tags": tags_data,
-                        "chapters": chapters_data,
-                        "default_language": current_meta.get("default_language") or "zh-TW",
-                        "default_audio_language": current_meta.get("default_audio_language") or "zh-TW",
-                        "updated_at": datetime.now().isoformat(timespec="seconds"),
-                        "source_job_id": metadata_job.get("id", ""),
-                        "source_saved_config_id": metadata_job.get("saved_config_id", ""),
-                    }
-                    saved_path = write_merge_metadata(metadata_job, meta)
-                    st.success(f"已儲存 Metadata：{saved_path}")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"儲存 Metadata 失敗：{exc}")
-
-            if current_meta:
-                with st.expander("Metadata JSON", expanded=False):
-                    st.json(current_meta)
-
-    with publish_tab:
-        selected_publish_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-        if selected_publish_config_id:
-            st.caption(f"目前依上方已儲存合併設定顯示發布項目：{merge_saved_config_label(saved_config_map.get(selected_publish_config_id, {}))}")
-        else:
-            st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
-
-        publish_jobs = [
-            job for job in list_merge_jobs_for_config(selected_publish_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
-        ]
-        if not publish_jobs:
-            st.info("尚無可發布的合併結果。請先完成合併。")
-        else:
-            selected_publish_idx = st.selectbox(
-                "選擇合併結果",
-                list(range(len(publish_jobs))),
-                key="merge_publish_job",
-                format_func=lambda idx: merge_preview_job_label(publish_jobs[int(idx)]),
-            )
-            publish_job = publish_jobs[int(selected_publish_idx)]
-            publish_job_id = str(publish_job.get("id") or "")
-            video_path = merge_job_output_video_path(publish_job)
-            subtitle_path = merge_job_output_subtitle_path(publish_job)
-            metadata_path = merge_job_metadata_path(publish_job)
-            cover_path = merge_job_cover_path(publish_job)
-            upload_record_path = merge_job_upload_record_path(publish_job)
-            upload_record = read_json_file(upload_record_path) or {}
-            upload_state = get_merge_upload_state(publish_job_id)
-
-            ready_cols = st.columns(5)
-            ready_cols[0].metric("影片", "就緒" if video_path.exists() else "缺少")
-            ready_cols[1].metric("字幕", "就緒" if subtitle_path.exists() else "缺少")
-            ready_cols[2].metric("Metadata", "就緒" if metadata_path.exists() else "缺少")
-            ready_cols[3].metric("封面", "就緒" if cover_path else "未設定")
-            ready_cols[4].metric("上傳狀態", "執行中" if upload_state.get("running") else upload_record.get("status", "尚無"))
-            st.caption(f"影片：{video_path}")
-            st.caption(f"字幕：{subtitle_path}")
-            st.caption(f"Metadata：{metadata_path}")
-            st.caption(f"封面：{cover_path or '尚未上傳'}")
-
-            cover_cols = st.columns([1.2, 2.4, 2.4])
-            with cover_cols[0]:
-                uploaded_cover = st.file_uploader(
-                    "上傳封面",
-                    type=["png", "jpg", "jpeg"],
-                    key=f"merge_cover_upload_{publish_job_id}",
-                )
-                if uploaded_cover is not None:
-                    upload_sig = f"{uploaded_cover.name}:{uploaded_cover.size}"
-                    processed_key = f"merge_cover_upload_processed_{publish_job_id}"
-                    if st.session_state.get(processed_key) != upload_sig:
-                        try:
-                            saved_cover = save_merge_cover_upload(publish_job, uploaded_cover)
-                            st.session_state[processed_key] = upload_sig
-                            st.success(f"已儲存封面：{saved_cover.name}")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"封面儲存失敗：{exc}")
-            with cover_cols[1]:
-                if cover_path and cover_path.exists():
-                    st.image(str(cover_path), caption="目前封面", use_container_width=True)
-                else:
-                    st.caption("尚未上傳封面。")
-            with cover_cols[2]:
-                st.caption("封面會在上傳影片成功後設定到 YouTube。YouTube API 接受的縮圖大小上限為 2MB；若超過，系統會嘗試壓縮後再上傳。")
-
-            if upload_record.get("video_id"):
-                st.markdown(f"[開啟 YouTube 影片](https://www.youtube.com/watch?v={upload_record['video_id']})")
-
-            if not metadata_path.exists():
-                st.warning("發布前需要先在 Metadata 分頁產生並確認 youtube_meta.json。")
-
-            token_sig, client_sig = youtube_auth_file_signatures()
-            playlist_items, playlist_error = list_youtube_playlists_cached(token_sig, client_sig)
-            playlist_options = [{"id": "", "title": "(不加入播放清單)", "label": "(不加入播放清單)"}] + playlist_items
-            if playlist_error:
-                st.error(f"YouTube 播放清單讀取失敗：{playlist_error}")
-                if "invalid_grant" in playlist_error.lower() or "重新授權" in playlist_error:
-                    if st.button("重新授權 YouTube", key=f"merge_reauth_youtube_{publish_job_id}"):
-                        try:
-                            reauthorize_youtube_for_app()
-                            list_youtube_playlists_cached.clear()
-                            st.success("YouTube 已重新授權。")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"YouTube 重新授權失敗：{exc}")
-
-            publish_defaults = {
-                "privacy": str(upload_record.get("privacy") or "private"),
-                "schedule_on": bool(upload_record.get("publish_at")),
-                "publish_at": str(upload_record.get("publish_at") or ""),
-                "playlist_id": str(upload_record.get("playlist_id") or ""),
-            }
-            privacy_key = f"merge_publish_privacy_{publish_job_id}"
-            schedule_key = f"merge_publish_schedule_on_{publish_job_id}"
-            date_key = f"merge_publish_date_{publish_job_id}"
-            time_key = f"merge_publish_time_{publish_job_id}"
-            playlist_key = f"merge_publish_playlist_{publish_job_id}"
-
-            if privacy_key not in st.session_state:
-                st.session_state[privacy_key] = publish_defaults["privacy"] if publish_defaults["privacy"] in {"private", "unlisted", "public"} else "private"
-            if schedule_key not in st.session_state:
-                st.session_state[schedule_key] = publish_defaults["schedule_on"]
-            if playlist_key not in st.session_state:
-                st.session_state[playlist_key] = resolve_default_playlist_id(playlist_options, publish_defaults["playlist_id"])
-
-            privacy_val = st.selectbox("隱私設定", ["private", "unlisted", "public"], key=privacy_key)
-            schedule_on = st.checkbox("排程發布", key=schedule_key)
-            schedule_cols = st.columns(2)
-            with schedule_cols[0]:
-                publish_date = st.date_input("發布日期", key=date_key, disabled=not schedule_on)
-            with schedule_cols[1]:
-                publish_time = st.time_input("發布時間", key=time_key, disabled=not schedule_on)
-
-            selected_playlist_id = st.selectbox(
-                "播放清單",
-                options=[item["id"] for item in playlist_options],
-                format_func=lambda pid: next((item["label"] for item in playlist_options if item["id"] == pid), pid or "(不加入播放清單)"),
-                key=playlist_key,
-            )
-
-            publish_at_text = ""
-            if schedule_on:
-                publish_at_text = datetime.combine(publish_date, publish_time).strftime("%Y-%m-%d %H:%M")
-                st.caption(f"YouTube 排程發布時間：{publish_at_text} (Asia/Taipei)。排程發布會以 private 上傳並設定 publishAt。")
-            elif privacy_val == "public":
-                st.warning("選擇 public 會在上傳完成後立即公開。")
-
-            upload_disabled = (
-                upload_state.get("running")
-                or not video_path.exists()
-                or not metadata_path.exists()
-            )
-            action_cols = st.columns([1.2, 1.2, 3.6])
-            if action_cols[0].button("上傳到 YouTube", type="primary", key=f"merge_upload_youtube_{publish_job_id}", disabled=upload_disabled):
-                res = start_merge_upload_job(
-                    publish_job,
-                    privacy=privacy_val,
-                    publish_at=publish_at_text,
-                    playlist_id=selected_playlist_id.strip(),
-                )
-                if res.get("ok"):
-                    st.success(f"已啟動合併影片上傳。log: {res.get('log')}")
-                    st.rerun()
-                else:
-                    st.error(f"上傳啟動失敗：{res.get('message')}")
-            if action_cols[1].button("重新整理發布狀態", key=f"merge_publish_refresh_{publish_job_id}"):
-                st.rerun()
-            action_cols[2].caption("上傳會在背景執行。若 YouTube token 失效，背景程序可能需要重新授權；請依 Log 提示處理。")
-
-            if upload_record:
-                with st.expander("上傳紀錄", expanded=True):
-                    st.json(upload_record)
-
-            upload_log = merge_upload_log_path(publish_job_id)
-            if upload_log.exists():
-                with st.expander("發布 Log", expanded=bool(upload_state.get("running"))):
-                    st.download_button(
-                        "下載發布 Log",
-                        data=upload_log.read_bytes(),
-                        file_name=upload_log.name,
-                        key=f"merge_download_publish_log_{publish_job_id}",
-                    )
-                    st.code(upload_log.read_text(encoding="utf-8", errors="ignore")[-8000:], language="text")
-            elif upload_state.get("running"):
-                st.info(f"上傳背景執行中，PID {upload_state.get('pid')}，Log 尚未建立。")
-
-    with log_tab:
-        selected_log_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-        if selected_log_config_id:
-            st.caption(f"目前依上方已儲存合併設定篩選 Log：{merge_saved_config_label(saved_config_map.get(selected_log_config_id, {}))}")
-        else:
-            st.caption("目前未選擇已儲存合併設定，顯示全部 Log。")
-        auto_refresh = st.toggle("自動刷新合併 Log", value=True, key="merge_log_auto_refresh")
-
-        @st.fragment(run_every=5 if auto_refresh else None)
-        def render_merge_logs():
-            jobs = list_merge_jobs_for_config(selected_log_config_id)
-            if not jobs:
-                st.caption("尚無合併 Log。")
-                return
-            st.button("只刷新合併 Log", key="merge_log_refresh")
-            for idx, job in enumerate(jobs[:12]):
-                job_id = str(job.get("id", ""))
-                state = get_merge_job_state(job_id)
-                latest_job = state.get("job") or job
-                status = "running" if state.get("running") else str(latest_job.get("status", "queued"))
-                with st.expander(f"[{get_schedule_status_label(status)}] {latest_job.get('title', '')} | {job_id}", expanded=bool(state.get("running"))):
-                    cols = st.columns(4)
-                    cols[0].metric("狀態", get_schedule_status_label(status))
-                    cols[1].metric("PID", state.get("pid") or "—")
-                    cols[2].metric("建立時間", str(latest_job.get("created_at", "")).replace("T", " ") or "—")
-                    cols[3].metric("排程時間", str(latest_job.get("schedule_at", "")).replace("T", " ") or "—")
-                    if latest_job.get("saved_config_id"):
-                        st.caption(f"儲存設定：{latest_job.get('saved_config_id')}")
-                    st.caption(f"輸出資料夾：{latest_job.get('output_dir', '')}")
-                    if latest_job.get("output_video"):
-                        st.caption(f"合併影片：{latest_job.get('output_video')}")
-                    if latest_job.get("output_subtitle"):
-                        st.caption(f"合併字幕：{latest_job.get('output_subtitle')}")
-                    log_path = merge_log_path(job_id)
-                    if log_path.exists():
-                        st.download_button("下載 Log", data=log_path.read_bytes(), file_name=log_path.name, key=f"merge_dl_log_{job_id}_{idx}")
-                        st.code(log_path.read_text(encoding="utf-8", errors="ignore")[-8000:], language="text")
-                    else:
-                        st.caption("尚無 Log。")
-
-        render_merge_logs()
-
 def shared_prompt_dir(profile_id: str) -> Path:
     return ROOT / "config" / str(profile_id or "default").strip() / "prompts"
 
@@ -4696,6 +1916,56 @@ def render_text_output_expander(title: str, path: Path | None, *, text_label: st
             height=height,
         )
 
+
+def render_subtitle_compare_panel(ep_path: Path, *, key_prefix: str, expanded: bool = False):
+    raw_path = subtitles_raw_path(ep_path)
+    fixed_path = subtitles_fixed_path(ep_path)
+    raw_text = read_text_file(raw_path, "")
+    fixed_text = read_text_file(fixed_path, "")
+
+    with st.expander("No.11 / No.12 字幕比對", expanded=expanded):
+        st.caption("No.11 原始字幕保留在 notebooklm_audio.srt；No.12 校對後字幕輸出到 notebooklm_audio_fixed.srt。")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("No.11 Whisper 原始字幕")
+            st.caption(str(raw_path))
+            if raw_path.exists():
+                st.download_button(
+                    "下載 No.11 原始字幕",
+                    data=raw_path.read_bytes(),
+                    file_name=raw_path.name,
+                    key=f"{key_prefix}_download_raw_srt",
+                )
+            st.text_area(
+                "原始字幕內容",
+                value=raw_text,
+                height=420,
+                key=f"{key_prefix}_raw_srt",
+                disabled=True,
+            )
+        with c2:
+            st.subheader("No.12 AI 校對字幕")
+            st.caption(str(fixed_path))
+            if fixed_path.exists():
+                st.download_button(
+                    "下載 No.12 校對字幕",
+                    data=fixed_path.read_bytes(),
+                    file_name=fixed_path.name,
+                    key=f"{key_prefix}_download_fixed_srt",
+                )
+            st.text_area(
+                "校對字幕內容",
+                value=fixed_text,
+                height=420,
+                key=f"{key_prefix}_fixed_srt",
+                disabled=True,
+            )
+        if not raw_path.exists():
+            st.warning("尚未找到 No.11 原始字幕，請先執行 No.11 Whisper 產生字幕。")
+        if not fixed_path.exists():
+            st.caption("尚未找到 No.12 校對字幕；執行 No.12 後即可比對。")
+
+
 def render_final_prompt_expander(title: str, prompt_text: str, *, key_prefix: str, expanded: bool = False, height: int = 360):
     text_key = f"{key_prefix}_final_prompt"
     loaded_key = f"{text_key}__loaded"
@@ -4747,7 +2017,7 @@ def build_prompt_source_rows(profile_id: str) -> list[Dict]:
             "主要資料來源": "storyboard vocab + 校對字幕 + host/cloze 規則",
         },
         {
-            "Step": "19",
+            "Step": "20",
             "用途": "YouTube Metadata",
             "Prompt 檔案": str(youtube_meta_prompt_path(profile_id)),
             "缺檔時預設": "DEFAULT_YOUTUBE_META_PROMPT_TEMPLATE",
@@ -4949,6 +2219,8 @@ def render_manual_subtitle_editor(ep_path: Path, step_no: str, *, key_prefix: st
             st.info("已重新載入目前字幕檔內容。")
             st.rerun()
 
+        render_subtitle_compare_panel(ep_path, key_prefix=f"{key_prefix}_compare", expanded=False)
+
         if subtitle_path.exists():
             st.download_button(
                 "下載字幕",
@@ -5119,20 +2391,137 @@ def render_prompts_workspace(
         "script": "scripts/llm_director.py",
         "args": ["--ep", str(info["ep"])],
     }
-    step19_def = {
+    step20_def = {
         "name": "產生 YouTube Metadata",
         "type": "python",
         "script": "scripts/generate_youtube_meta.py",
         "args": ["--ep", str(info["ep"])],
     }
-    prompt_step_ids = ["5", "7.1", "8", "12", "14", "19"]
+    prompt_step_ids = ["5", "7.1", "8", "12", "14", "20"]
     any_prompt_running = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in prompt_step_ids)
     prompt_refresh_interval = 2 if (prompt_auto_refresh and any_prompt_running) else None
+    prompt_running_prev_key = f"prompt_running_prev_{info['ep']}_{profile_id}_{int(show_header)}"
+    if any_prompt_running:
+        st.session_state[prompt_running_prev_key] = True
 
     @st.fragment(run_every=prompt_refresh_interval)
     def render_prompt_panels():
         st.caption("只會刷新此面板，不會切換集數或跳離目前頁面。")
         st.button("只刷新 Prompt 狀態", key=f"refresh_prompt_blocks_{info['ep']}_{profile_id}_{int(show_header)}")
+        latest_prompt_running = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in prompt_step_ids)
+        if st.session_state.get(prompt_running_prev_key) and not latest_prompt_running:
+            st.session_state[prompt_running_prev_key] = False
+            st.rerun()
+        st.session_state[prompt_running_prev_key] = latest_prompt_running
+        prompt_provider_settings = load_profile_llm_provider_settings(profile_id) if profile_id == "vocab" else {}
+        prompt_model_settings = load_profile_llm_model_settings(profile_id) if profile_id == "vocab" else {}
+        prompt_extra_provider_settings = load_profile_llm_extra_provider_settings(profile_id) if profile_id == "vocab" else {}
+        prompt_extra_model_settings = load_profile_llm_extra_model_settings(profile_id) if profile_id == "vocab" else {}
+        step14_provider_key = f"prompt_step14_provider_{info['ep']}_{profile_id}"
+        step14_model_keys = {
+            provider: f"prompt_step14_{provider}_model_{info['ep']}_{profile_id}"
+            for provider in ("gemini", "openai", "nvidia")
+        }
+
+        def render_step14_llm_controls():
+            if profile_id != "vocab":
+                return
+            provider_options = list(VOCAB_TEXT_LLM_PROVIDER_LABELS.keys())
+            saved_provider = str(prompt_provider_settings.get("14") or VOCAB_TEXT_LLM_STEP_DEFAULTS["14"])
+            if saved_provider not in provider_options:
+                saved_provider = "openai"
+            provider_choice = st.selectbox(
+                "Step 14 文字 LLM Provider",
+                provider_options,
+                index=provider_options.index(saved_provider),
+                key=step14_provider_key,
+                format_func=lambda value: vocab_text_provider_label(value, "14"),
+            )
+            model_choices = {}
+            model_cols = st.columns(3)
+            for col, model_provider in zip(model_cols, ("gemini", "openai", "nvidia")):
+                with col:
+                    model_choices[model_provider] = st.text_input(
+                        f"Step 14 {model_provider} model",
+                        value=vocab_text_model_for_step(prompt_model_settings, "14", model_provider),
+                        key=step14_model_keys[model_provider],
+                        help=f"執行時注入 {VOCAB_TEXT_LLM_MODEL_ENV_KEYS['14'][model_provider]}。",
+                    ).strip()
+            st.caption("目前執行 model：" + vocab_text_model_summary({"14": model_choices}, "14", provider_choice))
+            if st.button("儲存 Step 14 LLM 設定", key=f"save_prompt_step14_llm_{info['ep']}_{profile_id}"):
+                prompt_provider_settings["14"] = provider_choice
+                prompt_model_settings["14"] = {
+                    provider: model_choices.get(provider) or VOCAB_TEXT_LLM_MODEL_DEFAULTS["14"][provider]
+                    for provider in ("gemini", "openai", "nvidia")
+                }
+                saved_path = save_profile_llm_provider_settings(profile_id, prompt_provider_settings, prompt_model_settings)
+                st.success(f"Step 14 LLM 設定已儲存：{saved_path}")
+                st.rerun()
+
+        def render_step5_review_model_controls():
+            if profile_id != "vocab":
+                return
+            st.caption("No.5 題目生成 model 與 review model 分開設定。")
+            provider_options = list(VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS.keys())
+            saved_review_provider = str(prompt_extra_provider_settings.get("5_review") or VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS["5_review"])
+            if saved_review_provider not in provider_options:
+                saved_review_provider = "auto"
+            review_provider = st.selectbox(
+                "Step 5 review provider",
+                provider_options,
+                index=provider_options.index(saved_review_provider),
+                key=f"prompt_step5_review_provider_{info['ep']}_{profile_id}",
+                format_func=lambda value: VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS.get(value, value),
+                help=f"執行 review 時注入 {VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS['5_review']}。",
+            )
+            review_models = {}
+            review_cols = st.columns(2)
+            for col, model_provider in zip(review_cols, ("gemini", "openai")):
+                with col:
+                    review_models[model_provider] = st.text_input(
+                        f"Step 5 review {model_provider} model",
+                        value=vocab_text_extra_model_for_call(prompt_extra_model_settings, "5_review", model_provider),
+                        key=f"prompt_step5_review_{model_provider}_model_{info['ep']}_{profile_id}",
+                        help=f"執行 review 時注入 {VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS['5_review'][model_provider]}。",
+                    ).strip()
+            if st.button("儲存 Step 5 Review 模型", key=f"save_prompt_step5_review_models_{info['ep']}_{profile_id}"):
+                prompt_extra_provider_settings["5_review"] = review_provider
+                prompt_extra_model_settings["5_review"] = {
+                    provider: review_models.get(provider) or VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS["5_review"][provider]
+                    for provider in ("gemini", "openai")
+                }
+                saved_path = save_profile_llm_provider_settings(
+                    profile_id,
+                    prompt_provider_settings,
+                    prompt_model_settings,
+                    extra_model_settings=prompt_extra_model_settings,
+                    extra_provider_settings=prompt_extra_provider_settings,
+                )
+                st.success(f"Step 5 Review 模型已儲存：{saved_path}")
+                st.rerun()
+
+        def render_step12_extra_model_controls():
+            if profile_id != "vocab":
+                return
+            st.caption("No.12 NVIDIA fallback model 可用逗號分隔多個模型，會依序重試；不跟主字幕校對 model 共用。")
+            fallback_model = st.text_input(
+                "Step 12 NVIDIA fallback model",
+                value=vocab_text_extra_model_for_call(prompt_extra_model_settings, "12_nvidia_fallback", "nvidia"),
+                key=f"prompt_step12_nvidia_fallback_model_{info['ep']}_{profile_id}",
+                help=f"執行 fallback retry 時注入 {VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS['12_nvidia_fallback']['nvidia']}。",
+            ).strip()
+            if st.button("儲存 Step 12 Fallback 模型", key=f"save_prompt_step12_fallback_model_{info['ep']}_{profile_id}"):
+                prompt_extra_model_settings["12_nvidia_fallback"] = {
+                    "nvidia": fallback_model or VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS["12_nvidia_fallback"]["nvidia"]
+                }
+                saved_path = save_profile_llm_provider_settings(
+                    profile_id,
+                    prompt_provider_settings,
+                    prompt_model_settings,
+                    extra_model_settings=prompt_extra_model_settings,
+                )
+                st.success(f"Step 12 Fallback 模型已儲存：{saved_path}")
+                st.rerun()
 
         prompt_path = ensure_cloze_prompt_file(profile_id)
         render_prompt_block(
@@ -5148,6 +2537,7 @@ def render_prompts_workspace(
                 key_prefix=f"studio_step5_{info['ep']}_{profile_id}",
                 expanded=False,
             ),
+            extra_renderer=render_step5_review_model_controls,
             final_prompt_renderer=lambda template_text: render_step5_prompt_preview(template_text, ep_path),
         )
 
@@ -5231,41 +2621,65 @@ def render_prompts_workspace(
                 expanded=False,
                 height=260,
             ) if subtitle_path.exists() else None,
+            extra_renderer=render_step12_extra_model_controls,
             final_prompt_renderer=lambda template_text: render_step12_prompt_preview(
                 template_text,
+                ep_path,
                 ep_path / "02_subtitles" / "notebooklm_audio.srt",
             ),
         )
 
         storyboard_prompt = ensure_storyboard_prompt_file(profile_id)
+        step14_runtime_def = step14_def
+        if profile_id == "vocab":
+            runtime_provider = str(
+                st.session_state.get(step14_provider_key)
+                or prompt_provider_settings.get("14")
+                or VOCAB_TEXT_LLM_STEP_DEFAULTS["14"]
+            )
+            runtime_models = dict(prompt_model_settings)
+            runtime_models["14"] = {
+                model_provider: str(
+                    st.session_state.get(step14_model_keys[model_provider])
+                    or vocab_text_model_for_step(prompt_model_settings, "14", model_provider)
+                ).strip()
+                for model_provider in ("gemini", "openai", "nvidia")
+            }
+            step14_runtime_def = apply_vocab_llm_runtime_settings(
+                "14",
+                step14_def,
+                runtime_provider,
+                runtime_models,
+            )
         render_prompt_block(
             "14",
             "AI 依語境分鏡規劃",
             storyboard_prompt,
             DEFAULT_STORYBOARD_PROMPT_TEMPLATE,
-            step14_def,
+            step14_runtime_def,
             help_text="Step 14 會依字幕與單字表生成 storyboard.csv。",
             output_renderer=lambda: render_dataframe_output_expander(
                 "Step 14 輸出預覽",
                 read_storyboard_df(ep_path),
                 expanded=False,
             ),
+            extra_renderer=render_step14_llm_controls,
             final_prompt_renderer=lambda template_text: render_step14_prompt_preview(template_text, ep_path, subtitle_path),
         )
 
         meta_prompt = ensure_youtube_meta_prompt_file(profile_id)
         render_prompt_block(
-            "19",
+            "20",
             "產生 YouTube Metadata",
             meta_prompt,
             DEFAULT_YOUTUBE_META_PROMPT_TEMPLATE,
-            step19_def,
-            help_text="Step 19 會讀取校對字幕與集數範圍，產生 youtube_meta.json。",
+            step20_def,
+            help_text="Step 20 會讀取校對字幕與集數範圍，產生 youtube_meta.json。",
             output_renderer=lambda: render_text_output_expander(
-                "Step 19 輸出預覽",
+                "Step 20 輸出預覽",
                 first_existing_path(youtube_meta_paths(ep_path)),
                 text_label="YouTube Metadata JSON",
-                key_prefix=f"studio_step19_{info['ep']}_{profile_id}",
+                key_prefix=f"studio_step20_{info['ep']}_{profile_id}",
                 expanded=False,
                 height=260,
             ) if first_existing_path(youtube_meta_paths(ep_path)) and first_existing_path(youtube_meta_paths(ep_path)).exists() else None,
@@ -5315,6 +2729,130 @@ def render_vocab_audio_upload_control(ep_path: Path, ns: str, is_done: bool):
                 lf.write(f"intro_marker_cleared={marker_was_present}\n")
             st.success("語音已上傳並改名為 notebooklm_audio.m4a。No.10.5 片頭合併標記已重置。")
             st.rerun()
+
+
+def vocab_outro_dir(ep_path: Path) -> Path:
+    return ep_path / "05_output" / "outro"
+
+
+def vocab_outro_config_path(ep_path: Path) -> Path:
+    return vocab_outro_dir(ep_path) / "outro_config.json"
+
+
+def load_vocab_outro_config(ep_path: Path) -> Dict:
+    config = read_json_file(vocab_outro_config_path(ep_path)) or {}
+    return config if isinstance(config, dict) else {}
+
+
+def find_vocab_outro_media(ep_path: Path) -> Path | None:
+    outro_dir = vocab_outro_dir(ep_path)
+    for ext in (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mov", ".webm", ".m4v"):
+        candidate = outro_dir / f"outro_media{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_vocab_outro_audio(ep_path: Path) -> Path | None:
+    outro_dir = vocab_outro_dir(ep_path)
+    for ext in (".m4a", ".mp3", ".wav", ".aac", ".ogg"):
+        candidate = outro_dir / f"outro_audio{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def save_uploaded_file(uploaded_file, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(uploaded_file.getbuffer())
+
+
+def render_vocab_outro_control(ep_path: Path, ns: str, is_done: bool):
+    config = load_vocab_outro_config(ep_path)
+    media_path = find_vocab_outro_media(ep_path)
+    audio_path = find_vocab_outro_audio(ep_path)
+    current_duration = float(config.get("duration_seconds") or 5.0)
+    if current_duration <= 0:
+        current_duration = 5.0
+
+    st.caption("可選步驟；未上傳片尾媒體時，No.18 產生合成清單會略過片尾。")
+    duration_seconds = st.number_input(
+        "片尾長度（秒）",
+        min_value=0.5,
+        max_value=120.0,
+        value=current_duration,
+        step=0.5,
+        key=f"pm_vocab_outro_duration_{ep_path.name}_{ns}",
+    )
+    uploaded_media = st.file_uploader(
+        "上傳片尾圖片或影像",
+        type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm", "m4v"],
+        key=f"pm_vocab_outro_media_{ep_path.name}_{ns}",
+    )
+    uploaded_audio = st.file_uploader(
+        "上傳片尾音效",
+        type=["m4a", "mp3", "wav", "aac", "ogg"],
+        key=f"pm_vocab_outro_audio_{ep_path.name}_{ns}",
+    )
+
+    if media_path:
+        size_mb = media_path.stat().st_size / (1024 * 1024)
+        st.caption(f"目前片尾媒體：{media_path.name} ({size_mb:.2f} MB)")
+        if media_path.suffix.lower() in {".mp4", ".mov", ".webm", ".m4v"}:
+            st.video(str(media_path))
+        else:
+            st.image(str(media_path))
+    elif is_done:
+        st.caption("狀態顯示已完成，但找不到片尾媒體。請重新上傳。")
+    else:
+        st.caption("目前未設定片尾媒體。")
+
+    if audio_path:
+        size_mb = audio_path.stat().st_size / (1024 * 1024)
+        st.caption(f"目前片尾音效：{audio_path.name} ({size_mb:.2f} MB)")
+        st.audio(str(audio_path))
+    else:
+        st.caption("片尾音效未設定；合成時會使用靜音片尾。")
+
+    if st.button("儲存片尾設定", key=f"pm_vocab_outro_save_{ep_path.name}_{ns}"):
+        outro_dir = vocab_outro_dir(ep_path)
+        outro_dir.mkdir(parents=True, exist_ok=True)
+        saved_media_path = media_path
+        saved_audio_path = audio_path
+
+        if uploaded_media is not None:
+            media_suffix = Path(uploaded_media.name).suffix.lower()
+            for old_media in outro_dir.glob("outro_media.*"):
+                old_media.unlink(missing_ok=True)
+            saved_media_path = outro_dir / f"outro_media{media_suffix}"
+            save_uploaded_file(uploaded_media, saved_media_path)
+
+        if uploaded_audio is not None:
+            audio_suffix = Path(uploaded_audio.name).suffix.lower()
+            for old_audio in outro_dir.glob("outro_audio.*"):
+                old_audio.unlink(missing_ok=True)
+            saved_audio_path = outro_dir / f"outro_audio{audio_suffix}"
+            save_uploaded_file(uploaded_audio, saved_audio_path)
+
+        config = {
+            "duration_seconds": float(duration_seconds),
+            "media_path": str(saved_media_path.relative_to(ep_path)).replace("\\", "/") if saved_media_path else "",
+            "audio_path": str(saved_audio_path.relative_to(ep_path)).replace("\\", "/") if saved_audio_path else "",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        vocab_outro_config_path(ep_path).write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log_path = log_file_for_stage(ep_path, f"sub{ns}")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"\n==== SAVE sub{ns} | 片尾製作 | "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+            )
+            lf.write(json.dumps(config, ensure_ascii=False) + "\n")
+        st.success("片尾設定已儲存。")
+        st.rerun()
 
 
 def render_prerender_workspace(ep_path: Path):
@@ -5388,6 +2926,12 @@ def render_prerender_workspace(ep_path: Path):
             st.dataframe(full_subtitle_df, use_container_width=True, hide_index=True)
         else:
             st.caption("目前沒有可解析的字幕。")
+
+    render_subtitle_compare_panel(
+        ep_path,
+        key_prefix=f"prerender_subtitle_compare_{parse_episode_info(ep_path).get('ep')}_{st.session_state.get('profile_id', '')}",
+        expanded=False,
+    )
 
     with st.expander("完整分鏡表", expanded=False):
         st.dataframe(preview_storyboard_df, use_container_width=True, hide_index=True)
@@ -5634,6 +3178,80 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         "只處理 `source_type=AI` 的 Scene。批次任務會先替每個 Scene 產生並儲存 `animation_prompt`，"
         "再接著生成動畫；已經使用動畫的 Scene 會自動略過。若缺圖、Prompt 生成失敗或動畫 API 失敗，會寫入 batch log 後繼續下一個 Scene。"
     )
+    media_image_provider_settings = load_profile_image_provider_settings(profile_id) if profile_id == "vocab" else dict(VOCAB_IMAGE_PROVIDER_DEFAULTS)
+    media_image_model_settings = load_profile_image_model_settings(profile_id) if profile_id == "vocab" else dict(VOCAB_IMAGE_MODEL_DEFAULTS)
+    media_image_model_step_settings = load_profile_image_model_step_settings(profile_id) if profile_id == "vocab" else default_vocab_image_model_step_settings()
+    media_animation_settings = load_profile_animation_provider_settings(profile_id) if profile_id == "vocab" else {
+        "provider": VOCAB_ANIMATION_PROVIDER_DEFAULT,
+        "models": dict(VOCAB_ANIMATION_MODEL_DEFAULTS),
+    }
+    with st.expander("AI 產圖 / 動畫 Provider", expanded=False):
+        provider_cols = st.columns(2)
+        with provider_cols[0]:
+            image_provider_options = list(VOCAB_IMAGE_PROVIDER_LABELS.keys())
+            selected_image_provider = st.selectbox(
+                "圖片 Provider",
+                image_provider_options,
+                index=image_provider_options.index(str(media_image_provider_settings.get("16") or "auto")),
+                key=f"storyboard_image_provider_{info['ep']}_{profile_id}",
+                format_func=lambda value: VOCAB_IMAGE_PROVIDER_LABELS.get(value, value),
+            )
+            if selected_image_provider == "nvidia" and not os.environ.get("CAP_STORYBOARD_NVIDIA_IMAGE_BASE_URL") and not os.environ.get("NVIDIA_IMAGE_BASE_URL"):
+                st.warning("NVIDIA 圖片 Provider 需要先在 .env 設定 CAP_STORYBOARD_NVIDIA_IMAGE_BASE_URL 或 NVIDIA_IMAGE_BASE_URL。")
+            image_model_values = {}
+            for provider_key, options in VOCAB_IMAGE_MODEL_OPTIONS.items():
+                current_model = vocab_image_model_for_step(media_image_model_step_settings, "16", provider_key)
+                if current_model not in options:
+                    options = [current_model] + options
+                image_model_values[provider_key] = st.selectbox(
+                    f"{VOCAB_IMAGE_PROVIDER_LABELS[provider_key]} 圖片模型",
+                    options,
+                    index=options.index(current_model),
+                    key=f"storyboard_image_model_{provider_key}_{info['ep']}_{profile_id}",
+                )
+        with provider_cols[1]:
+            animation_provider_options = list(VOCAB_ANIMATION_PROVIDER_LABELS.keys())
+            selected_animation_provider = st.selectbox(
+                "動畫 Provider",
+                animation_provider_options,
+                index=animation_provider_options.index(str(media_animation_settings.get("provider") or VOCAB_ANIMATION_PROVIDER_DEFAULT)),
+                key=f"storyboard_animation_provider_{info['ep']}_{profile_id}",
+                format_func=lambda value: VOCAB_ANIMATION_PROVIDER_LABELS.get(value, value),
+            )
+            animation_model_settings = dict(media_animation_settings.get("models") or {})
+            animation_model_values = {}
+            for provider_key, options in VOCAB_ANIMATION_MODEL_OPTIONS.items():
+                current_model = str(animation_model_settings.get(provider_key) or VOCAB_ANIMATION_MODEL_DEFAULTS[provider_key])
+                if current_model not in options:
+                    options = [current_model] + options
+                animation_model_values[provider_key] = st.selectbox(
+                    f"{VOCAB_ANIMATION_PROVIDER_LABELS[provider_key]} 動畫模型",
+                    options,
+                    index=options.index(current_model),
+                    key=f"storyboard_animation_model_{provider_key}_{info['ep']}_{profile_id}",
+                )
+            st.caption("NVIDIA 目前只接了圖片 NIM；官方 Visual GenAI NIM 文件沒有同等的通用影片生成 API，因此動畫 Provider 暫不提供 NVIDIA。")
+        if st.button("儲存 AI 產圖 / 動畫 Provider", key=f"save_storyboard_media_provider_{info['ep']}_{profile_id}"):
+            if profile_id == "vocab":
+                media_image_provider_settings["16"] = selected_image_provider
+                media_animation_settings = {"provider": selected_animation_provider, "models": animation_model_values}
+                saved_path = save_profile_llm_provider_settings(
+                    profile_id,
+                    load_profile_llm_provider_settings(profile_id),
+                    load_profile_llm_model_settings(profile_id),
+                    media_image_provider_settings,
+                    image_model_values,
+                    media_animation_settings,
+                    image_model_step_settings={
+                        **media_image_model_step_settings,
+                        "16": image_model_values,
+                    },
+                )
+                st.success(f"已儲存 Provider 設定：{saved_path}")
+                st.rerun()
+            else:
+                st.info("此 Provider 設定目前只套用於 vocab profile。")
+    current_media_env = build_storyboard_media_env(image_model_values, {"provider": selected_animation_provider, "models": animation_model_values})
     if batch_animation_task.get("log"):
         st.caption(f"批次 log：{batch_animation_task.get('log')}")
     if batch_generate_animations:
@@ -5644,7 +3262,8 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                 "name": "將所有 AI 圖片轉成動畫",
                 "type": "python",
                 "script": "scripts/generate_all_scene_animations.py",
-                "args": ["--ep", str(info["ep"])],
+                "args": ["--ep", str(info["ep"]), "--provider", selected_animation_provider],
+                "env": current_media_env,
             },
         )
         if res.get("ok"):
@@ -5665,7 +3284,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         )
         for _, r in storyboard_df.iterrows()
     }
-    scene_select_key = f"storyboard_scene_{storyboard_key_suffix}"
+    scene_select_key = f"storyboard_scene_{info['ep']}_{profile_id}"
     if st.session_state.get(scene_select_key) not in scene_choice_ids:
         st.session_state[scene_select_key] = scene_choice_ids[0]
     selected_scene_value = st.selectbox(
@@ -6205,7 +3824,8 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                     "name": f"重產 Scene {selected_scene_id} 圖片",
                     "type": "python",
                     "script": "scripts/gen_matched_preview_v4.py",
-                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id)],
+                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id), "--provider", selected_image_provider],
+                    "env": current_media_env,
                 },
             )
             if res.get("ok"):
@@ -6245,7 +3865,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                     "name": f"AI 建議 Scene {selected_scene_id} 動畫 Prompt",
                     "type": "python",
                     "script": "scripts/generate_animation_prompt.py",
-                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id)],
+                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id), "--provider", "auto"],
                 },
             )
             if res.get("ok"):
@@ -6289,7 +3909,8 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                     "name": f"產生 Scene {selected_scene_id} 動畫",
                     "type": "python",
                     "script": "scripts/generate_scene_animation.py",
-                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id)],
+                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id), "--provider", selected_animation_provider],
+                    "env": current_media_env,
                 },
             )
             if res.get("ok"):
@@ -6333,7 +3954,17 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                     "name": f"重產 Scene {selected_scene_id} 圖片並產生動畫",
                     "type": "python",
                     "script": "scripts/generate_scene_image_and_animation.py",
-                    "args": ["--ep", str(info["ep"]), "--scene_id", str(selected_scene_id)],
+                    "args": [
+                        "--ep",
+                        str(info["ep"]),
+                        "--scene_id",
+                        str(selected_scene_id),
+                        "--provider",
+                        selected_image_provider,
+                        "--animation_provider",
+                        selected_animation_provider,
+                    ],
+                    "env": current_media_env,
                 },
             )
             if res.get("ok"):
@@ -6346,8 +3977,6 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         bool(task.get("running"))
         for task in [selected_scene_task, selected_anim_prompt_task, selected_anim_video_task, selected_img_anim_task, batch_animation_task]
     )
-    scene_running_prev_key = f"storyboard_running_prev_{info['ep']}_{selected_scene_id}"
-    st.session_state[scene_running_prev_key] = any_scene_worker_running
     scene_refresh_interval = 2 if (storyboard_auto_refresh and any_scene_worker_running) else None
 
     @st.fragment(run_every=scene_refresh_interval)
@@ -6377,10 +4006,6 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
             latest_img_anim_state.get("running"),
             latest_batch_animation_state.get("running"),
         ])
-        if st.session_state.get(scene_running_prev_key) and not latest_any_running:
-            st.session_state[scene_running_prev_key] = False
-            st.rerun()
-        st.session_state[scene_running_prev_key] = latest_any_running
 
         st.subheader("Scene 執行狀態")
         status_top1, status_top2, status_top3, status_top4, status_top5, status_top6 = st.columns([1, 1, 1, 1.2, 1.1, 1.2])
@@ -6605,6 +4230,9 @@ def sync_textarea_state(text_key: str, loaded_key: str, file_text: str) -> None:
     elif st.session_state.get(loaded_key) != file_text:
         st.session_state[text_key] = file_text
         st.session_state[loaded_key] = file_text
+    elif file_text.strip() and not str(st.session_state.get(text_key, "")).strip():
+        st.session_state[text_key] = file_text
+        st.session_state[loaded_key] = file_text
 
 def seconds_to_label(seconds_value) -> str:
     try:
@@ -6697,6 +4325,106 @@ def save_publish_settings(ep_path: Path, settings: Dict) -> Path:
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
+
+def post_publish_settings_path(ep_path: Path) -> Path:
+    return ep_path / "05_output" / "post_publish_settings.json"
+
+
+def load_post_publish_settings(ep_path: Path | None) -> Dict:
+    if not ep_path:
+        return {}
+    payload = read_json_file(post_publish_settings_path(ep_path))
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_post_publish_settings(ep_path: Path, settings: Dict) -> Path:
+    path = post_publish_settings_path(ep_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def load_cloze_question_rows(ep_path: Path) -> list[Dict]:
+    json_path = cloze_question_json_path(ep_path)
+    csv_path = cloze_question_csv_path(ep_path)
+    rows = []
+    if json_path.exists():
+        payload = read_json_file(json_path)
+        if isinstance(payload, list):
+            rows = [item for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict) and isinstance(payload.get("questions"), list):
+            rows = [item for item in payload.get("questions", []) if isinstance(item, dict)]
+    if not rows and csv_path.exists():
+        try:
+            rows = pd.read_csv(csv_path).fillna("").to_dict("records")
+        except Exception:
+            rows = []
+    return rows
+
+
+def cloze_question_id(row: Dict, fallback_index: int) -> str:
+    raw = str(row.get("question_id", "") or "").strip()
+    return raw or f"Q{fallback_index:02d}"
+
+
+def format_cloze_question_for_post(row: Dict, fallback_index: int) -> str:
+    qid = cloze_question_id(row, fallback_index)
+    sentence = str(row.get("blank_sentence", "") or row.get("question", "") or "").strip()
+    choices = []
+    for opt in ["A", "B", "C", "D"]:
+        choice_text = str(row.get(f"choice_{opt}", "") or row.get(opt, "") or "").strip()
+        if choice_text:
+            choices.append(f"{opt}. {choice_text}")
+    word_hint = str(row.get("word", "") or row.get("correct_word", "") or "").strip()
+    header = f"{qid}"
+    if word_hint:
+        header += f" | {word_hint}"
+    parts = [header]
+    if sentence:
+        parts.append(sentence)
+    parts.extend(choices)
+    return "\n".join(parts)
+
+
+def build_cloze_post_text(ep_num: int, selected_rows: list[Dict]) -> str:
+    blocks = [f"Ep{ep_num:02d} 克漏字小測驗"]
+    for idx, row in enumerate(selected_rows, start=1):
+        blocks.append(format_cloze_question_for_post(row, idx))
+    blocks.append("把你的答案留言在下方，下一集公布解析。")
+    return "\n\n".join(block for block in blocks if block.strip())
+
+
+def publish_video_candidates(ep_path: Path) -> list[dict]:
+    output_dir = ep_path / "05_output"
+    candidates = [
+        ("final_video_with_outro.mp4", "含片尾版"),
+        ("final_video_no_outro.mp4", "無片尾版"),
+        ("final_video.mp4", "相容預設版"),
+    ]
+    rows = []
+    seen = set()
+    for filename, label in candidates:
+        if filename in seen:
+            continue
+        seen.add(filename)
+        path = output_dir / filename
+        if path.exists():
+            rows.append({"filename": filename, "label": label, "path": path})
+    return rows
+
+
+def default_publish_video_name(ep_path: Path, publish_defaults: Dict) -> str:
+    saved_name = Path(str(publish_defaults.get("video_name", "") or "")).name
+    candidates = publish_video_candidates(ep_path)
+    candidate_names = [item["filename"] for item in candidates]
+    if saved_name and saved_name in candidate_names:
+        return saved_name
+    if "final_video_with_outro.mp4" in candidate_names:
+        return "final_video_with_outro.mp4"
+    if "final_video_no_outro.mp4" in candidate_names:
+        return "final_video_no_outro.mp4"
+    return "final_video.mp4"
+
 def parse_publish_at_value(value: str) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -6716,6 +4444,7 @@ def studio_default_publish_settings(ep_path: Path, ep_num: int, upload_record: D
         "publish_at": str(upload_record.get("publish_at", "")).strip(),
         "playlist_id": str(upload_record.get("playlist_id", "")).strip(),
         "cover_name": str(upload_record.get("cover_name", "")).strip(),
+        "video_name": str(upload_record.get("video_name", "")).strip(),
     }
     if any(current_from_record.values()):
         return {
@@ -6724,6 +4453,7 @@ def studio_default_publish_settings(ep_path: Path, ep_num: int, upload_record: D
             "publish_at": current_from_record["publish_at"],
             "playlist_id": current_from_record["playlist_id"],
             "cover_name": current_from_record["cover_name"] or "cover.png",
+            "video_name": current_from_record["video_name"] or "",
         }
 
     prev_ep_path = find_episode_path_by_number(ep_num - 1) if ep_num > 1 else None
@@ -6739,6 +4469,7 @@ def studio_default_publish_settings(ep_path: Path, ep_num: int, upload_record: D
             "publish_at": str(prev_record.get("publish_at", "")).strip(),
             "playlist_id": str(prev_record.get("playlist_id", "")).strip(),
             "cover_name": str(prev_record.get("cover_name", "")).strip() or "cover.png",
+            "video_name": str(prev_record.get("video_name", "")).strip(),
         }
 
     return {
@@ -6747,6 +4478,7 @@ def studio_default_publish_settings(ep_path: Path, ep_num: int, upload_record: D
         "publish_at": "",
         "playlist_id": "",
         "cover_name": "cover.png",
+        "video_name": "",
     }
 
 def resolve_default_playlist_id(playlist_options: list[Dict], preferred_playlist_id: str) -> str:
@@ -6859,12 +4591,18 @@ def storyboard_path_for(ep_path: Path) -> Path:
         return ep_path / "05_storyboards" / "storyboard.csv"
     return ep_path / "03_storyboards" / "storyboard.csv"
 
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _read_storyboard_df_cached(path_str: str, signature: tuple[int, int]) -> pd.DataFrame:
+    _ = signature
+    return pd.read_csv(path_str, encoding="utf-8-sig").fillna("")
+
+
 def read_storyboard_df(ep_path: Path) -> pd.DataFrame:
     p = storyboard_path_for(ep_path)
     if not p.exists():
         return pd.DataFrame()
-    df = pd.read_csv(p, encoding="utf-8-sig").fillna("")
-    return df
+    return _read_storyboard_df_cached(str(p), file_signature(p))
 
 def storyboard_file_signature(ep_path: Path) -> str:
     p = storyboard_path_for(ep_path)
@@ -7094,20 +4832,33 @@ def render_step7_1_prompt_preview(template_text: str, ep_path: Path) -> str:
         .replace("{{HOST_PROFILE_JSON}}", host_profile_json_text_for_prompt())
     ).strip() + "\n"
 
-def render_step12_prompt_preview(template_text: str, subtitle_path: Path) -> str:
-    return template_text.replace("{{SRT_CONTENT}}", read_text_file(subtitle_path, ""))
+def render_step12_prompt_preview(template_text: str, ep_path: Path, subtitle_path: Path) -> str:
+    ep_num = int(parse_episode_info(ep_path).get("ep") or 0)
+    notebook_prompt = read_text_file(notebooklm_prompt_output_path(ep_path, ep_num), "").strip()
+    rendered = (
+        template_text
+        .replace("{{SRT_CONTENT}}", read_text_file(subtitle_path, ""))
+        .replace("{{NOTEBOOKLM_PROMPT}}", notebook_prompt or "（未找到 No.8 output，請僅依原始字幕內容校對。）")
+    )
+    if "{{NOTEBOOKLM_PROMPT}}" not in template_text and notebook_prompt:
+        rendered += "\n\n【No.8 產生語音摘要 Prompt 參考】\n" + notebook_prompt + "\n"
+    return rendered
 
 def render_step14_prompt_preview(template_text: str, ep_path: Path, subtitle_path: Path) -> str:
     vocab_df = load_vocab_df_for_prompt(ep_path)
     word_list = vocab_df["Word"].astype(str).str.strip().tolist() if not vocab_df.empty and "Word" in vocab_df.columns else []
     cloze_rules = build_storyboard_cloze_rules_for_prompt(ep_path, int(parse_episode_info(ep_path).get("ep") or 0))
     host_rules = build_storyboard_host_rules_for_prompt()
+    subtitle_text = read_text_file(
+        subtitle_path,
+        f"（尚未找到 No.12 校對字幕：{subtitle_path}。請先完成 No.12，No.14 才能產生分鏡。）",
+    )
     rendered = (
         template_text
         .replace("{{WORD_LIST}}", json.dumps(word_list, ensure_ascii=False, indent=2))
         .replace("{{CLOZE_CARD_RULES}}", cloze_rules)
         .replace("{{HOST_PROFILE_RULES}}", host_rules)
-        .replace("{{SRT_CONTENT}}", read_text_file(subtitle_path, ""))
+        .replace("{{SRT_CONTENT}}", subtitle_text)
     )
     if "{{CLOZE_CARD_RULES}}" not in template_text and cloze_rules.strip():
         rendered += "\n\nCloze card rules:\n" + cloze_rules.strip()
@@ -7505,7 +5256,47 @@ def build_episode_preview_payload(ep_path: Path, storyboard_df: pd.DataFrame, su
             "image_data_uri": image_cache[image_path_str],
             "animation_path": animation_path_str,
             "animation_data_uri": animation_data_uri,
+            "animation_file_uri": path_to_file_uri(Path(animation_path_str)) if animation_path_str else "",
             "asset_mode": "ANIMATION" if animation_path_str else "IMAGE",
+        })
+    outro_config = load_vocab_outro_config(ep_path)
+    outro_media_path = find_vocab_outro_media(ep_path)
+    outro_audio_path = find_vocab_outro_audio(ep_path)
+    outro_duration = safe_float(outro_config.get("duration_seconds", 0), 0)
+    if outro_media_path and outro_media_path.exists() and outro_duration > 0:
+        outro_start = max(
+            [safe_float(scene.get("end", 0)) for scene in scenes]
+            + [safe_float(row.get("end", 0)) for row in subtitle_entries]
+            + [0.0]
+        )
+        media_suffix = outro_media_path.suffix.lower()
+        is_video = media_suffix in {".mp4", ".mov", ".webm", ".m4v"}
+        outro_image_data_uri = ""
+        outro_animation_data_uri = ""
+        outro_animation_file_uri = ""
+        if is_video:
+            if outro_media_path.stat().st_size <= inline_animation_limit:
+                outro_animation_data_uri = video_to_data_uri(str(outro_media_path))
+            outro_animation_file_uri = path_to_file_uri(outro_media_path)
+        else:
+            outro_image_data_uri = image_to_preview_data_uri(str(outro_media_path))
+        scenes.append({
+            "scene_id": "片尾",
+            "start": outro_start,
+            "end": outro_start + outro_duration,
+            "source_type": "OUTRO",
+            "flashcard_word": "",
+            "reason": "片尾製作",
+            "image_prompt": "",
+            "animation_prompt": "",
+            "subtitle_reference": "",
+            "image_path": str(outro_media_path) if not is_video else "",
+            "image_data_uri": outro_image_data_uri,
+            "animation_path": str(outro_media_path) if is_video else "",
+            "animation_data_uri": outro_animation_data_uri,
+            "animation_file_uri": outro_animation_file_uri,
+            "asset_mode": "ANIMATION" if is_video else "IMAGE",
+            "is_outro": True,
         })
     subtitles = [{
         "index": str(row.get("index", "")),
@@ -7516,6 +5307,11 @@ def build_episode_preview_payload(ep_path: Path, storyboard_df: pd.DataFrame, su
     return {
         "scenes": scenes,
         "subtitles": subtitles,
+        "outro": {
+            "enabled": bool(outro_media_path and outro_media_path.exists() and outro_duration > 0),
+            "audio_data_uri": file_to_data_uri(outro_audio_path) if outro_audio_path else "",
+            "duration": outro_duration,
+        },
         "allow_inline_animations": allow_inline_animations,
         "total_animation_bytes": total_animation_bytes,
     }
@@ -7696,6 +5492,7 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
           </div>
           <div class="cap-side">
             <audio id="cap-audio" class="cap-audio" controls preload="metadata" src="{audio_data_uri}"></audio>
+            <audio id="cap-outro-audio" preload="metadata" src=""></audio>
             <div class="cap-subtitle" id="cap-subtitle">按下播放後，這裡會同步顯示整集字幕。</div>
             <div class="cap-meta">
               <div class="cap-chip"><div class="cap-label">目前 Scene</div><div class="cap-value" id="cap-scene-id">-</div></div>
@@ -7738,7 +5535,9 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
       const payload = {json.dumps(payload, ensure_ascii=False)};
       const scenes = payload.scenes || [];
       const subtitles = payload.subtitles || [];
+      const outro = payload.outro || {{}};
       const audio = document.getElementById("cap-audio");
+      const outroAudio = document.getElementById("cap-outro-audio");
       const sceneImage = document.getElementById("cap-scene-image");
       const sceneVideo = document.getElementById("cap-scene-video");
       const sceneEmpty = document.getElementById("cap-scene-empty");
@@ -7754,6 +5553,36 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
       let activeSceneIndex = -1;
       let activeSubtitleIndex = -1;
       let activeSceneVideoSrc = "";
+      let isOutroPlayback = false;
+      if (outro.audio_data_uri) outroAudio.src = outro.audio_data_uri;
+
+      function outroScene() {{
+        return scenes.find((scene) => scene && scene.is_outro);
+      }}
+
+      function previewTime() {{
+        const scene = outroScene();
+        if (isOutroPlayback && scene) {{
+          return Number(scene.start || 0) + Number(outroAudio.currentTime || 0);
+        }}
+        return Number(audio.currentTime || 0);
+      }}
+
+      function playOutro(offsetSeconds = 0) {{
+        const scene = outroScene();
+        if (!scene) return;
+        isOutroPlayback = true;
+        audio.pause();
+        const duration = Number(scene.end || 0) - Number(scene.start || 0);
+        const target = Math.min(Math.max(Number(offsetSeconds || 0), 0), Math.max(duration, 0));
+        if (outroAudio.src) {{
+          outroAudio.currentTime = target;
+          outroAudio.play().catch(() => null);
+        }} else {{
+          outroAudio.currentTime = target;
+        }}
+        syncPreview();
+      }}
 
       function fmtTime(sec) {{
         const total = Math.max(Number(sec || 0), 0);
@@ -7801,14 +5630,23 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
         sceneList.querySelectorAll("[data-scene-index]").forEach((node) => {{
           node.addEventListener("click", () => {{
             const idx = Number(node.getAttribute("data-scene-index"));
-            audio.currentTime = Number(scenes[idx].start || 0);
-            audio.play();
+            const scene = scenes[idx];
+            if (scene && scene.is_outro) {{
+              playOutro(0);
+            }} else {{
+              isOutroPlayback = false;
+              outroAudio.pause();
+              audio.currentTime = Number(scene.start || 0);
+              audio.play();
+            }}
             syncPreview();
           }});
         }});
         subtitleList.querySelectorAll("[data-sub-index]").forEach((node) => {{
           node.addEventListener("click", () => {{
             const idx = Number(node.getAttribute("data-sub-index"));
+            isOutroPlayback = false;
+            outroAudio.pause();
             audio.currentTime = Number(subtitles[idx].start || 0);
             audio.play();
             syncPreview();
@@ -7817,9 +5655,10 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
       }}
 
       function syncPreview() {{
-        const currentTime = Number(audio.currentTime || 0);
+        const currentTime = previewTime();
         const sceneIdx = findActiveIndex(scenes, currentTime);
-        const subtitleIdx = findActiveIndex(subtitles, currentTime);
+        const activeSceneForSubtitle = scenes[sceneIdx];
+        const subtitleIdx = activeSceneForSubtitle && activeSceneForSubtitle.is_outro ? -1 : findActiveIndex(subtitles, currentTime);
 
         if (sceneIdx !== activeSceneIndex) {{
           activeSceneIndex = sceneIdx;
@@ -7835,10 +5674,11 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
             promptEl.textContent = scene.asset_mode === "ANIMATION"
               ? (scene.animation_prompt || scene.image_prompt || "-")
               : (scene.image_prompt || "-");
-            if (scene.asset_mode === "ANIMATION" && scene.animation_file_uri) {{
-              if (activeSceneVideoSrc !== scene.animation_file_uri) {{
-                sceneVideo.src = scene.animation_file_uri;
-                activeSceneVideoSrc = scene.animation_file_uri;
+            const sceneVideoSrc = scene.animation_data_uri || scene.animation_file_uri || "";
+            if (scene.asset_mode === "ANIMATION" && sceneVideoSrc) {{
+              if (activeSceneVideoSrc !== sceneVideoSrc) {{
+                sceneVideo.src = sceneVideoSrc;
+                activeSceneVideoSrc = sceneVideoSrc;
               }}
               const sceneOffset = Math.max(currentTime - Number(scene.start || 0), 0);
               const syncSceneVideo = () => {{
@@ -7916,8 +5756,15 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
       function jumpToNeighbor(items, currentIndex, direction) {{
         if (!items.length) return;
         const nextIndex = Math.min(Math.max(currentIndex + direction, 0), items.length - 1);
-        audio.currentTime = Number(items[nextIndex].start || 0);
-        audio.play();
+        const item = items[nextIndex];
+        if (item && item.is_outro) {{
+          playOutro(0);
+        }} else {{
+          isOutroPlayback = false;
+          outroAudio.pause();
+          audio.currentTime = Number(item.start || 0);
+          audio.play();
+        }}
         syncPreview();
       }}
 
@@ -7930,11 +5777,24 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
       audio.addEventListener("timeupdate", syncPreview);
       audio.addEventListener("seeked", syncPreview);
       audio.addEventListener("loadedmetadata", syncPreview);
+      audio.addEventListener("ended", () => {{
+        const scene = outroScene();
+        if (scene) playOutro(0);
+      }});
       audio.addEventListener("pause", () => {{
         if (!sceneVideo.paused) sceneVideo.pause();
       }});
       audio.addEventListener("play", () => {{
+        if (isOutroPlayback) {{
+          isOutroPlayback = false;
+          outroAudio.pause();
+        }}
         if (sceneVideo.src) sceneVideo.play().catch(() => null);
+      }});
+      outroAudio.addEventListener("timeupdate", syncPreview);
+      outroAudio.addEventListener("ended", () => {{
+        isOutroPlayback = false;
+        syncPreview();
       }});
       syncPreview();
     </script>
@@ -8140,1620 +6000,54 @@ def publisher_task_state(info: Dict, task_name: str) -> Dict:
 def start_publisher_task(info: Dict, task_name: str, step_def: Dict) -> Dict:
     return runner.start_substep(info, f"pub_{task_name}", step_def)
 
-SHORT_BLANK_OPTION = "新增/空白設定"
-SHORT_STATUS_OPTIONS = ["製作中", "已上傳"]
-SHORT_EPISODE_DIRS = [
-    "00_logs",
-    "01_audio",
-    "02_subtitles",
-    "03_storyboards",
-    "04_images",
-    "05_output",
-]
-
-def short_workspace_root() -> Path:
-    path = ROOT / "workspaces" / "short_generator"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def short_programs_path() -> Path:
-    return short_workspace_root() / "programs.json"
-
-def short_slugify(name: str) -> str:
-    text = re.sub(r"\s+", "_", str(name or "").strip())
-    text = re.sub(r'[<>:"/\\|?*]', "_", text)
-    text = text.strip("._")
-    return text or "short_program"
-
-def short_read_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-def short_write_json(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def short_load_programs() -> list[Dict]:
-    payload = short_read_json(short_programs_path(), {"programs": []})
-    programs = payload.get("programs", []) if isinstance(payload, dict) else []
-    return [p for p in programs if isinstance(p, dict)]
-
-def short_save_programs(programs: list[Dict]) -> None:
-    short_write_json(short_programs_path(), {"programs": programs})
-
-def short_program_dir(program: Dict) -> Path:
-    return short_workspace_root() / short_slugify(program.get("slug") or program.get("name"))
-
-def short_next_program_id(programs: list[Dict]) -> str:
-    max_no = 0
-    for program in programs:
-        m = re.match(r"short_program_(\d+)$", str(program.get("id", "")))
-        if m:
-            max_no = max(max_no, int(m.group(1)))
-    return f"short_program_{max_no + 1}"
-
-def short_get_program(program_id: str) -> Dict | None:
-    for program in short_load_programs():
-        if program.get("id") == program_id:
-            return program
-    return None
-
-def short_episode_dir(program: Dict, episode_no: int) -> Path:
-    return short_program_dir(program) / f"Ep{int(episode_no):02d}"
-
-def short_episode_json_path(ep_dir: Path) -> Path:
-    return ep_dir / "short.json"
-
-def short_metadata_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "short_metadata.json"
-
-def short_storyboard_path(ep_dir: Path) -> Path:
-    return ep_dir / "03_storyboards" / "storyboard.json"
-
-def short_compose_list_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "compose_list.json"
-
-def short_preview_video_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "preview_short.mp4"
-
-def short_final_video_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "final_short.mp4"
-
-def short_upload_record_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "upload_record.json"
-
-def short_publish_settings_path(ep_dir: Path) -> Path:
-    return ep_dir / "05_output" / "publish_settings.json"
-
-def short_publish_cover_path(ep_dir: Path) -> Path | None:
-    for path in [
-        ep_dir / "05_output" / "cover.png",
-        ep_dir / "05_output" / "cover.jpg",
-        ep_dir / "05_output" / "cover.jpeg",
-        ep_dir / "04_images" / "storyboard" / "scene_001.png",
-    ]:
-        if path.exists() and path.stat().st_size > 0:
-            return path
-    return None
-
-def short_step_log_path(ep_dir: Path, step_no: str) -> Path:
-    return ep_dir / "00_logs" / f"short_step_{str(step_no).replace('.', '_')}.log"
-
-def short_step_proc_path(ep_dir: Path, step_no: str) -> Path:
-    return ep_dir / "00_logs" / f"short_step_{str(step_no).replace('.', '_')}.proc.json"
-
-def short_append_step_log(ep_dir: Path, step_no: str, message: str, level: str = "INFO") -> None:
-    log_path = short_step_log_path(ep_dir, step_no)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().isoformat(timespec="seconds")
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(f"[{ts}] [{level}] {message}\n")
-
-def short_log_run_marker(ep_dir: Path, step_no: str, label: str, status: str, level: str = "INFO") -> None:
-    ts = datetime.now().isoformat(timespec="seconds")
-    short_append_step_log(ep_dir, step_no, f"===== RUN {status} {ts}：{label} =====", level=level)
-
-def short_step_log_text(ep_dir: Path, step_no: str) -> str:
-    log_path = short_step_log_path(ep_dir, step_no)
-    if not log_path.exists():
-        return ""
-    return log_path.read_text(encoding="utf-8", errors="ignore")
-
-def short_log_has_error(text: str) -> bool:
-    lowered = text.lower()
-    return any(token in lowered for token in ["[error]", "traceback", "exception", "failed", "失敗", "錯誤"])
-
-def short_is_pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-        )
-        return f'"{pid}"' in result.stdout or f",{pid}," in result.stdout
-    except Exception:
-        return False
-
-def short_step_state(ep_dir: Path, step_no: str) -> Dict:
-    proc_path = short_step_proc_path(ep_dir, step_no)
-    state = {"running": False, "pid": None, "started_at": "", "ended_at": ""}
-    if not proc_path.exists():
-        return state
-    try:
-        payload = json.loads(proc_path.read_text(encoding="utf-8"))
-    except Exception:
-        return state
-    pid = int(payload.get("pid", 0) or 0)
-    running = short_is_pid_running(pid)
-    state.update({
-        "running": running,
-        "pid": pid,
-        "started_at": payload.get("started_at", ""),
-        "ended_at": payload.get("ended_at", ""),
-    })
-    if not running and not payload.get("ended_at"):
-        payload["ended_at"] = datetime.now().isoformat(timespec="seconds")
-        try:
-            proc_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            short_log_run_marker(ep_dir, step_no, str(payload.get("label") or f"步驟{step_no}"), "END")
-            short_append_step_log(ep_dir, step_no, f"背景程序已結束，結束時間：{payload['ended_at']}。請檢查輸出檔與上方 stdout/stderr。")
-        except Exception:
-            pass
-        state["ended_at"] = payload["ended_at"]
-    return state
-
-def short_rerun_when_step_finishes(ep_dir: Path, step_no: str, key_suffix: str = "") -> Dict:
-    state = short_step_state(ep_dir, step_no)
-    state_key = f"short_step_was_running_{ep_dir.name}_{str(step_no).replace('.', '_')}_{key_suffix}"
-    was_running = bool(st.session_state.get(state_key, False))
-    is_running = bool(state.get("running"))
-    st.session_state[state_key] = is_running
-    if was_running and not is_running:
-        st.rerun()
-    return state
-
-def short_output_completed(path: Path) -> bool:
-    if path.is_dir():
-        return path.exists() and any(path.iterdir())
-    if not path.exists():
-        return False
-    if path.suffix.lower() in {".txt", ".srt", ".json", ".csv", ".md"}:
-        return path.stat().st_size > 0
-    return True
-
-def render_short_copy_error_button(text: str, key: str) -> None:
-    payload = json.dumps(text)
-    components.html(
-        f"""
-        <button id="{key}" style="padding:0.35rem 0.7rem;border:1px solid #bbb;border-radius:6px;background:white;cursor:pointer;">
-          複製錯誤 Log
-        </button>
-        <span id="{key}_msg" style="margin-left:0.5rem;color:#666;font-size:0.85rem;"></span>
-        <script>
-        const btn = document.getElementById("{key}");
-        const msg = document.getElementById("{key}_msg");
-        btn.onclick = async () => {{
-          await navigator.clipboard.writeText({payload});
-          msg.textContent = "已複製";
-          setTimeout(() => msg.textContent = "", 1600);
-        }};
-        </script>
-        """,
-        height=42,
-    )
-
-def short_render_step_log_panel(
-    ep_dir: Path,
-    step_no: str,
-    label: str,
-    expanded: bool = False,
-    auto_expand_errors: bool = True,
-    key_suffix: str = "",
-) -> None:
-    log_path = short_step_log_path(ep_dir, step_no)
-    text = short_step_log_text(ep_dir, step_no)
-    state = short_step_state(ep_dir, step_no)
-    has_error = short_log_has_error(text)
-    title = f"步驟{step_no} Log - {label}"
-    if state.get("running"):
-        title += f"（執行中 PID {state.get('pid')}）"
-    if has_error:
-        title += "（偵測到錯誤）"
-    state_key = f"short_log_expanded_{ep_dir.name}_{str(step_no).replace('.', '_')}_{key_suffix}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = False
-    is_expanded = st.checkbox(
-        title,
-        key=state_key,
-        help="勾選展開 Log；取消勾選收合。此狀態會在自動刷新後保留。",
-    )
-    if is_expanded:
-        st.caption(str(log_path))
-        if state.get("started_at"):
-            st.caption(f"開始時間：{state.get('started_at')}")
-        if state.get("ended_at"):
-            st.caption(f"結束時間：{state.get('ended_at')}")
-        if state.get("running"):
-            st.info(f"背景執行中，PID {state.get('pid')}。自動刷新開啟時會持續更新這裡的輸出。")
-        if text:
-            st.code(text[-8000:], language="text")
-            if has_error:
-                st.text_area(
-                    "錯誤內容，可手動複製",
-                    value=text,
-                    height=160,
-                    key=f"short_error_copy_text_{ep_dir.name}_{step_no}_{key_suffix}",
-                )
-                render_short_copy_error_button(text, f"short_copy_error_{ep_dir.name}_{step_no}_{key_suffix}")
-        else:
-            st.caption("尚無 log。")
-
-def short_run_logged_step(ep_dir: Path, step_no: str, label: str, action) -> bool:
-    import traceback
-
-    short_log_run_marker(ep_dir, step_no, label, "START")
-    short_append_step_log(ep_dir, step_no, f"開始：{label}")
-    try:
-        action()
-    except Exception as exc:
-        short_append_step_log(ep_dir, step_no, f"失敗：{exc}", level="ERROR")
-        short_append_step_log(ep_dir, step_no, traceback.format_exc(), level="ERROR")
-        short_log_run_marker(ep_dir, step_no, label, "END", level="ERROR")
-        st.error(f"步驟{step_no}執行失敗，請查看下方 Log。")
-        return False
-    short_append_step_log(ep_dir, step_no, f"完成：{label}")
-    short_log_run_marker(ep_dir, step_no, label, "END")
-    return True
-
-def short_run_logged_script(ep_dir: Path, step_no: str, label: str, cmd: list[str]) -> bool:
-    short_log_run_marker(ep_dir, step_no, label, "START")
-    short_append_step_log(ep_dir, step_no, f"開始：{label}")
-    short_append_step_log(ep_dir, step_no, "執行命令：" + " ".join(cmd))
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["CAP_WORKSPACE_ROOT"] = str(short_workspace_root())
-    env["CAP_PROFILE_ID"] = "short_generator"
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except Exception as exc:
-        short_append_step_log(ep_dir, step_no, f"啟動失敗：{exc}", level="ERROR")
-        short_log_run_marker(ep_dir, step_no, label, "END", level="ERROR")
-        st.error(f"步驟{step_no}啟動失敗，請查看下方 Log。")
-        return False
-    if result.stdout:
-        short_append_step_log(ep_dir, step_no, "stdout:\n" + result.stdout.rstrip())
-    if result.stderr:
-        short_append_step_log(ep_dir, step_no, "stderr:\n" + result.stderr.rstrip(), level="ERROR" if result.returncode else "INFO")
-    short_append_step_log(ep_dir, step_no, f"return_code={result.returncode}")
-    if result.returncode != 0:
-        short_append_step_log(ep_dir, step_no, f"失敗：{label}", level="ERROR")
-        short_log_run_marker(ep_dir, step_no, label, "END", level="ERROR")
-        st.error(f"步驟{step_no}執行失敗，請查看下方 Log。")
-        return False
-    short_append_step_log(ep_dir, step_no, f"完成：{label}")
-    short_log_run_marker(ep_dir, step_no, label, "END")
-    return True
-
-def short_start_logged_script(ep_dir: Path, step_no: str, label: str, cmd: list[str]) -> bool:
-    state = short_step_state(ep_dir, step_no)
-    if state.get("running"):
-        st.warning(f"步驟{step_no}仍在執行中，PID {state.get('pid')}。")
-        return False
-
-    log_path = short_step_log_path(ep_dir, step_no)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    short_log_run_marker(ep_dir, step_no, label, "START")
-    short_append_step_log(ep_dir, step_no, f"開始背景執行：{label}")
-    short_append_step_log(ep_dir, step_no, "執行命令：" + " ".join(cmd))
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["CAP_WORKSPACE_ROOT"] = str(short_workspace_root())
-    env["CAP_PROFILE_ID"] = "short_generator"
-    log_fh = None
-    try:
-        log_fh = open(log_path, "a", encoding="utf-8", buffering=1)
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            env=env,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-        )
-    except Exception as exc:
-        short_append_step_log(ep_dir, step_no, f"啟動失敗：{exc}", level="ERROR")
-        short_log_run_marker(ep_dir, step_no, label, "END", level="ERROR")
-        st.error(f"步驟{step_no}啟動失敗，請查看下方 Log。")
-        return False
-    finally:
-        if log_fh is not None:
-            try:
-                log_fh.close()
-            except Exception:
-                pass
-
-    short_step_proc_path(ep_dir, step_no).write_text(
-        json.dumps(
-            {
-                "pid": proc.pid,
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "label": label,
-                "cmd": cmd,
-                "ended_at": "",
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    short_append_step_log(ep_dir, step_no, f"背景程序已啟動，PID {proc.pid}。")
-    return True
-
-def short_audio_files(ep_dir: Path) -> list[Path]:
-    audio_dir = ep_dir / "01_audio"
-    if not audio_dir.exists():
-        return []
-    return sorted([p for p in audio_dir.iterdir() if p.is_file()])
-
-def short_list_episodes(program: Dict) -> list[Dict]:
-    program_dir = short_program_dir(program)
-    if not program_dir.exists():
-        return []
-    rows = []
-    for ep_dir in sorted([p for p in program_dir.iterdir() if p.is_dir() and re.match(r"^Ep\d+$", p.name)]):
-        try:
-            episode_no = int(ep_dir.name.replace("Ep", ""))
-        except ValueError:
-            continue
-        data = short_read_json(short_episode_json_path(ep_dir), {})
-        meta = short_read_json(short_metadata_path(ep_dir), {})
-        upload_record = short_read_json(short_upload_record_path(ep_dir), {})
-        uploaded_marker = ep_dir / "05_output" / "uploaded.txt"
-        upload_success = str(upload_record.get("status", "")).strip().lower() == "success" or uploaded_marker.exists()
-        status = "已上傳" if upload_success else (data.get("status") or "製作中")
-        rows.append({
-            "episode_no": episode_no,
-            "title": data.get("title") or meta.get("title") or f"Ep{episode_no:02d}",
-            "status": status,
-            "path": ep_dir,
-            "updated_at": upload_record.get("ended_at") or data.get("updated_at", ""),
-        })
-    return rows
-
-def short_next_episode_no(program: Dict) -> int:
-    episodes = short_list_episodes(program)
-    if not episodes:
-        return 1
-    return max(int(e["episode_no"]) for e in episodes) + 1
-
-def short_ensure_episode(program: Dict, episode_no: int, title: str = "") -> Path:
-    ep_dir = short_episode_dir(program, episode_no)
-    for rel in SHORT_EPISODE_DIRS:
-        (ep_dir / rel).mkdir(parents=True, exist_ok=True)
-    data = short_read_json(short_episode_json_path(ep_dir), {})
-    data.update({
-        "program_id": program.get("id"),
-        "program_name": program.get("name", ""),
-        "episode_no": int(episode_no),
-        "title": title or data.get("title") or f"{program.get('name', 'Short')} Ep{int(episode_no):02d}",
-        "status": data.get("status") or "製作中",
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    short_write_json(short_episode_json_path(ep_dir), data)
-    return ep_dir
-
-def short_save_episode_data(ep_dir: Path, updates: Dict) -> Dict:
-    data = short_read_json(short_episode_json_path(ep_dir), {})
-    data.update(updates)
-    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    short_write_json(short_episode_json_path(ep_dir), data)
-    return data
-
-def render_short_management():
-    st.header("Short 管理")
-    programs = short_load_programs()
-    notice = st.session_state.pop("short_program_notice", None)
-    if notice:
-        st.success(notice)
-
-    with st.expander("新增 Short 節目", expanded=not programs):
-        with st.form("short_create_program_form"):
-            name = st.text_input("Short節目名稱", key="short_new_program_name")
-            submitted = st.form_submit_button("新增節目")
-        if submitted:
-            clean_name = name.strip()
-            if not clean_name:
-                st.error("請輸入 Short 節目名稱。")
-            elif any(p.get("name") == clean_name for p in programs):
-                st.error("已有相同名稱的 Short 節目。")
-            else:
-                now = datetime.now().isoformat(timespec="seconds")
-                slug_base = short_slugify(clean_name)
-                slug = slug_base
-                used = {short_slugify(p.get("slug") or p.get("name")) for p in programs}
-                suffix = 2
-                while slug in used:
-                    slug = f"{slug_base}_{suffix}"
-                    suffix += 1
-                programs.append({
-                    "id": short_next_program_id(programs),
-                    "name": clean_name,
-                    "slug": slug,
-                    "created_at": now,
-                    "updated_at": now,
-                })
-                short_save_programs(programs)
-                short_program_dir(programs[-1]).mkdir(parents=True, exist_ok=True)
-                st.session_state["short_program_notice"] = "Short 節目已新增。"
-                st.rerun()
-
-    if not programs:
-        st.info("尚未建立 Short 節目。請先新增節目名稱。")
-        return
-
-    rows = []
-    for program in programs:
-        episodes = short_list_episodes(program)
-        rows.append({
-            "節目名稱": program.get("name", ""),
-            "已生成集數": len(episodes),
-            "製作中": sum(1 for ep in episodes if ep.get("status") == "製作中"),
-            "已上傳": sum(1 for ep in episodes if ep.get("status") == "已上傳"),
-            "最後更新": program.get("updated_at", ""),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    selected_id = st.selectbox(
-        "選擇要管理的 Short 節目",
-        [p.get("id") for p in programs],
-        format_func=lambda pid: next((p.get("name", pid) for p in programs if p.get("id") == pid), pid),
-        key="short_manage_program",
-    )
-    selected = short_get_program(selected_id)
-    if not selected:
-        return
-
-    col_rename, col_delete = st.columns([2, 1])
-    with col_rename:
-        with st.form(f"short_rename_{selected_id}"):
-            new_name = st.text_input("修改short節目名稱", value=selected.get("name", ""))
-            rename_submit = st.form_submit_button("儲存節目名稱")
-        if rename_submit:
-            clean_name = new_name.strip()
-            if not clean_name:
-                st.error("節目名稱不可空白。")
-            elif any(p.get("id") != selected_id and p.get("name") == clean_name for p in programs):
-                st.error("已有相同名稱的 Short 節目。")
-            else:
-                for program in programs:
-                    if program.get("id") == selected_id:
-                        program["name"] = clean_name
-                        program["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                short_save_programs(programs)
-                st.session_state["short_program_notice"] = "Short 節目名稱已更新。"
-                st.rerun()
-    with col_delete:
-        st.caption("刪除只會從管理清單移除，不刪除既有檔案。")
-        confirm = st.checkbox("確認刪除此節目", key=f"short_delete_confirm_{selected_id}")
-        if st.button("刪除節目", key=f"short_delete_{selected_id}", disabled=not confirm):
-            programs = [p for p in programs if p.get("id") != selected_id]
-            short_save_programs(programs)
-            st.session_state.pop("short_manage_program", None)
-            st.session_state["short_program_notice"] = "Short 節目已從清單刪除。"
-            st.rerun()
-
-    episodes = short_list_episodes(selected)
-    st.subheader("已生成集數及狀態")
-    if episodes:
-        st.dataframe(
-            pd.DataFrame([{
-                "集數": f"Ep{ep['episode_no']:02d}",
-                "標題": ep.get("title", ""),
-                "狀態": ep.get("status", "製作中"),
-                "最後更新": ep.get("updated_at", ""),
-                "資料夾": str(ep.get("path", "")),
-            } for ep in episodes]),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("此節目尚未生成任何 Short 集數。")
-
-def render_short_control_steps(program: Dict, ep_dir: Path | None, selected_episode_no: int | None):
-    st.subheader("控制步驟")
-    is_new = ep_dir is None
-    base_data = {} if is_new else short_read_json(short_episode_json_path(ep_dir), {})
-    default_title = "" if is_new else base_data.get("title", "")
-    title = st.text_input("步驟一「設定標題」", value=default_title, key=f"short_title_{program.get('id')}_{selected_episode_no or 'new'}")
-    status_value = st.selectbox(
-        "集數狀態",
-        SHORT_STATUS_OPTIONS,
-        index=SHORT_STATUS_OPTIONS.index(base_data.get("status", "製作中")) if base_data.get("status", "製作中") in SHORT_STATUS_OPTIONS else 0,
-        key=f"short_status_{program.get('id')}_{selected_episode_no or 'new'}",
-    )
-    if st.button("儲存標題 / 建立集數", key=f"short_save_title_{program.get('id')}_{selected_episode_no or 'new'}"):
-        episode_no = selected_episode_no or short_next_episode_no(program)
-        ep_dir = short_ensure_episode(program, episode_no, title=title)
-        ok = short_run_logged_step(
-            ep_dir,
-            "1",
-            "設定標題",
-            lambda: short_save_episode_data(ep_dir, {"title": title, "status": status_value}),
-        )
-        if ok:
-            st.success(f"Ep{episode_no:02d} 已儲存。")
-            st.rerun()
-
-    if is_new:
-        st.info("請先儲存標題建立新集數，再上傳語音或編輯後續內容。")
-        return
-
-    auto_refresh_logs = st.toggle(
-        "自動刷新步驟 Log",
-        value=True,
-        key=f"short_log_auto_refresh_{ep_dir.name}",
-        help="開啟後，Log 面板每 2 秒刷新一次，用來觀察後續接入背景任務後的執行進度。",
-    )
-
-    def render_inline_short_step_log(log_step_no: str, log_label: str):
-        log_state = short_step_state(ep_dir, log_step_no)
-        refresh_interval = 2 if (auto_refresh_logs and log_state.get("running")) else None
-
-        @st.fragment(run_every=refresh_interval)
-        def _render_inline_log():
-            short_rerun_when_step_finishes(ep_dir, log_step_no, "control")
-            short_render_step_log_panel(
-                ep_dir,
-                log_step_no,
-                log_label,
-                auto_expand_errors=(str(log_step_no) != "4"),
-                key_suffix="control",
-            )
-
-        _render_inline_log()
-
-    render_inline_short_step_log("1", "設定標題")
-
-    st.divider()
-    st.markdown("**步驟二「上傳語音」**")
-    uploaded_audio = st.file_uploader(
-        "上傳語音",
-        type=["mp3", "m4a", "wav", "aac", "ogg"],
-        key=f"short_audio_upload_{ep_dir.name}",
-    )
-    if uploaded_audio and st.button("儲存語音檔", key=f"short_audio_save_{ep_dir.name}"):
-        audio_path = ep_dir / "01_audio" / uploaded_audio.name
-        ok = short_run_logged_step(
-            ep_dir,
-            "2",
-            "上傳語音",
-            lambda: audio_path.write_bytes(uploaded_audio.getbuffer()),
-        )
-        if ok:
-            st.success(f"語音已儲存：{audio_path.name}")
-    audio_files = short_audio_files(ep_dir)
-    if audio_files:
-        audio_choice = st.selectbox("預覽語音", audio_files, format_func=lambda p: p.name, key=f"short_audio_preview_{ep_dir.name}")
-        st.audio(str(audio_choice))
-    else:
-        st.caption("尚未上傳語音。")
-    render_inline_short_step_log("2", "上傳語音")
-
-    st.divider()
-    steps = [
-        ("3", "Whisper產生字幕", ep_dir / "02_subtitles" / "whisper.srt", "使用本地端 Whisper 模型將上傳語音轉成 SRT 字幕。"),
-        ("4", "AI字幕校對", ep_dir / "02_subtitles" / "reviewed.srt", "使用選定 AI Provider 校對 Whisper 字幕並輸出 reviewed.srt。"),
-        ("6", "AI 依語境分鏡規劃", short_storyboard_path(ep_dir), "使用選定 AI Provider 依字幕語境產生可編輯分鏡草稿。"),
-        ("7", "AI 產生分鏡圖片", ep_dir / "04_images" / "storyboard_images_manifest.json", "依分鏡 prompt 產生 9:16 Short 圖片，並寫回分鏡 asset 欄位。"),
-        ("8", "產生合成清單", short_compose_list_path(ep_dir), "依目前分鏡產生合成清單。"),
-        ("9", "FFmpeg 影片合成", ep_dir / "05_output" / "final_short.mp4", "依合成清單用 FFmpeg 合成 9:16 Short 影片。"),
-        ("10", "產生 Short metadata", short_metadata_path(ep_dir), "產生可於 Metadata 分頁修改的 metadata。"),
-    ]
-    short_subtitle_review_provider = st.session_state.get(f"short_subtitle_review_provider_{ep_dir.name}", "auto")
-    short_storyboard_provider = st.session_state.get(f"short_storyboard_provider_{ep_dir.name}", "auto")
-    short_metadata_provider = st.session_state.get(f"short_metadata_provider_{ep_dir.name}", "auto")
-    for step_no, label, output_path, caption in steps:
-        step_state = short_step_state(ep_dir, step_no)
-        cols = st.columns([1.2, 3, 1])
-        cols[0].markdown(f"**步驟{step_no}「{label}」**")
-        cols[1].caption(caption)
-        exists = short_output_completed(output_path)
-        if step_state.get("running"):
-            cols[2].write("執行中")
-        else:
-            cols[2].write("已完成" if exists else "未產生")
-        if step_no == "4":
-            short_subtitle_review_provider = st.selectbox(
-                "步驟四 AI字幕校對 Provider",
-                ["auto", "gemini", "openai"],
-                index=["auto", "gemini", "openai"].index(short_subtitle_review_provider)
-                if short_subtitle_review_provider in ["auto", "gemini", "openai"]
-                else 0,
-                key=f"short_subtitle_review_provider_{ep_dir.name}",
-                format_func=lambda value: {
-                    "auto": "Gemini 額度不夠/失敗時自動轉 OpenAI",
-                    "gemini": "Gemini",
-                    "openai": "OpenAI",
-                }.get(value, value),
-            )
-        if step_no == "6":
-            short_storyboard_provider = st.selectbox(
-                "步驟六 AI分鏡規劃 Provider",
-                ["auto", "gemini", "openai", "nvidia"],
-                index=["auto", "gemini", "openai", "nvidia"].index(short_storyboard_provider)
-                if short_storyboard_provider in ["auto", "gemini", "openai", "nvidia"]
-                else 0,
-                key=f"short_storyboard_provider_{ep_dir.name}",
-                format_func=lambda value: {
-                    "auto": "Gemini 額度不夠/失敗時自動轉 OpenAI",
-                    "gemini": "Gemini",
-                    "openai": "OpenAI",
-                    "nvidia": "NVIDIA",
-                }.get(value, value),
-            )
-        if step_no == "10":
-            short_metadata_provider = st.selectbox(
-                "步驟十 Short metadata Provider",
-                ["auto", "gemini", "openai", "nvidia"],
-                index=["auto", "gemini", "openai", "nvidia"].index(short_metadata_provider)
-                if short_metadata_provider in ["auto", "gemini", "openai", "nvidia"]
-                else 0,
-                key=f"short_metadata_provider_{ep_dir.name}",
-                format_func=lambda value: {
-                    "auto": "Gemini 額度不夠/失敗時自動轉 OpenAI",
-                    "gemini": "Gemini",
-                    "openai": "OpenAI",
-                    "nvidia": "NVIDIA",
-                }.get(value, value),
-            )
-        button_label = "執行中..." if step_state.get("running") else "產生/更新"
-        if cols[2].button(
-            button_label,
-            key=f"short_step_{step_no}_{ep_dir.name}",
-            disabled=bool(step_state.get("running")),
-        ):
-            if step_no == "3":
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_whisper_subtitles.py"),
-                    "--ep-dir",
-                    str(ep_dir),
-                    "--output",
-                    str(output_path),
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "4":
-                source = ep_dir / "02_subtitles" / "whisper.srt"
-                if not short_output_completed(source):
-                    short_append_step_log(ep_dir, step_no, "找不到非空的 Whisper 字幕結果，無法執行 AI字幕校對。", level="ERROR")
-                    st.error("請先完成步驟3，產生非空的 Whisper 字幕。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_subtitle_reviewer.py"),
-                    "--input",
-                    str(source),
-                    "--output",
-                    str(output_path),
-                    "--provider",
-                    short_subtitle_review_provider,
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "6":
-                reviewed_source = ep_dir / "02_subtitles" / "reviewed.srt"
-                whisper_source = ep_dir / "02_subtitles" / "whisper.srt"
-                source = reviewed_source if short_output_completed(reviewed_source) else whisper_source
-                if not short_output_completed(source):
-                    short_append_step_log(ep_dir, step_no, "找不到非空字幕，無法執行 AI 依語境分鏡規劃。", level="ERROR")
-                    st.error("請先完成步驟4，或至少完成步驟3產生非空字幕。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_storyboard_planner.py"),
-                    "--input-srt",
-                    str(source),
-                    "--output",
-                    str(output_path),
-                    "--provider",
-                    short_storyboard_provider,
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "7":
-                storyboard_source = short_storyboard_path(ep_dir)
-                if not short_output_completed(storyboard_source):
-                    short_append_step_log(ep_dir, step_no, "找不到非空分鏡 storyboard.json，無法產生分鏡圖片。", level="ERROR")
-                    st.error("請先完成步驟6，產生非空的 storyboard.json。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_generate_storyboard_images.py"),
-                    "--ep-dir",
-                    str(ep_dir),
-                    "--storyboard",
-                    str(storyboard_source),
-                    "--manifest",
-                    str(output_path),
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "8":
-                storyboard_source = short_storyboard_path(ep_dir)
-                if not short_output_completed(storyboard_source):
-                    short_append_step_log(ep_dir, step_no, "找不到非空分鏡 storyboard.json，無法產生合成清單。", level="ERROR")
-                    st.error("請先完成步驟6，產生非空的 storyboard.json。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_build_compose_list.py"),
-                    "--ep-dir",
-                    str(ep_dir),
-                    "--storyboard",
-                    str(storyboard_source),
-                    "--output",
-                    str(output_path),
-                    "--preview-output",
-                    str(short_preview_video_path(ep_dir)),
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "9":
-                compose_source = short_compose_list_path(ep_dir)
-                if not short_output_completed(compose_source):
-                    short_append_step_log(ep_dir, step_no, "找不到非空合成清單 compose_list.json，無法執行 FFmpeg 合成。", level="ERROR")
-                    st.error("請先完成步驟8，產生非空的 compose_list.json。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_ffmpeg_compose.py"),
-                    "--ep-dir",
-                    str(ep_dir),
-                    "--compose-list",
-                    str(compose_source),
-                    "--output",
-                    str(output_path),
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-            if step_no == "10":
-                subtitle_source = ep_dir / "02_subtitles" / "final.srt"
-                reviewed_source = ep_dir / "02_subtitles" / "reviewed.srt"
-                whisper_source = ep_dir / "02_subtitles" / "whisper.srt"
-                if not any(short_output_completed(path) for path in [subtitle_source, reviewed_source, whisper_source]):
-                    short_append_step_log(ep_dir, step_no, "找不到非空字幕，無法產生 Short metadata。", level="ERROR")
-                    st.error("請先完成字幕步驟，至少需有 final.srt、reviewed.srt 或 whisper.srt。")
-                    continue
-                cmd = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts" / "short_metadata_generator.py"),
-                    "--ep-dir",
-                    str(ep_dir),
-                    "--output",
-                    str(output_path),
-                    "--provider",
-                    short_metadata_provider,
-                ]
-                ok = short_start_logged_script(ep_dir, step_no, label, cmd)
-                if ok:
-                    st.success(f"步驟{step_no}已啟動，請看本步驟下方 Log。")
-                    st.rerun()
-                continue
-
-            def run_short_placeholder_step():
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text("", encoding="utf-8")
-
-            ok = short_run_logged_step(ep_dir, step_no, label, run_short_placeholder_step)
-            if ok:
-                st.success(f"步驟{step_no}已建立輸出。")
-                st.rerun()
-        render_inline_short_step_log(step_no, label)
-        if step_no in {"3", "4"} and short_output_completed(output_path):
-            with st.expander(f"查看步驟{step_no}字幕結果", expanded=False):
-                st.code(output_path.read_text(encoding="utf-8", errors="ignore")[-12000:], language="text")
-        if step_no == "6" and short_output_completed(output_path):
-            with st.expander("查看步驟6分鏡規劃結果", expanded=False):
-                storyboard_preview = short_read_json(output_path, [])
-                if isinstance(storyboard_preview, list) and storyboard_preview:
-                    st.dataframe(pd.DataFrame(storyboard_preview).head(20), use_container_width=True, hide_index=True)
-                st.code(output_path.read_text(encoding="utf-8", errors="ignore")[:12000], language="json")
-        if step_no == "7" and short_output_completed(output_path):
-            with st.expander("查看步驟7分鏡圖片結果", expanded=False):
-                manifest = short_read_json(output_path, {})
-                items = manifest.get("items", []) if isinstance(manifest, dict) else []
-                if isinstance(manifest, dict) and manifest.get("status") == "quota_exhausted":
-                    st.error("Gemini/Imagen 額度或 monthly spending cap 已用盡，步驟7已停止批次產圖。")
-                    st.caption(str(manifest.get("error", "")))
-                elif isinstance(manifest, dict) and manifest.get("status") == "image_generation_failed":
-                    st.error("Gemini/Imagen 已達上限，且 OpenAI 圖片 fallback 也失敗。")
-                    st.caption(str(manifest.get("error", "")))
-                elif isinstance(manifest, dict) and manifest.get("fallback") == "openai":
-                    st.warning("Gemini/Imagen 已達上限，部分或全部圖片已自動改用 OpenAI 產生。")
-                if items:
-                    st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
-                    preview_cols = st.columns(3)
-                    for idx, item in enumerate(items[:9]):
-                        image_path = ep_dir / str(item.get("path", ""))
-                        if image_path.exists():
-                            preview_cols[idx % 3].image(str(image_path), caption=f"Scene {item.get('scene', '')}", use_container_width=True)
-                st.code(output_path.read_text(encoding="utf-8", errors="ignore")[:12000], language="json")
-        if step_no == "4":
-            source_path = output_path if short_output_completed(output_path) else (ep_dir / "02_subtitles" / "whisper.srt")
-            subtitle_text = source_path.read_text(encoding="utf-8", errors="ignore") if short_output_completed(source_path) else ""
-            with st.expander("手動調整字幕", expanded=not short_output_completed(output_path) and bool(subtitle_text)):
-                st.caption("優先編輯 AI 校對後的 reviewed.srt；若尚未產生，會先載入 whisper.srt。儲存後會寫入 reviewed.srt。")
-                edited_reviewed_srt = st.text_area(
-                    "字幕內容",
-                    value=subtitle_text,
-                    height=320,
-                    key=f"short_step4_manual_srt_{ep_dir.name}",
-                )
-                if st.button("儲存手動調整字幕", key=f"short_step4_save_manual_srt_{ep_dir.name}"):
-                    def save_manual_reviewed_srt():
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_text(edited_reviewed_srt.strip() + "\n", encoding="utf-8")
-
-                    ok = short_run_logged_step(ep_dir, "4", "手動調整字幕", save_manual_reviewed_srt)
-                    if ok:
-                        st.success("手動調整字幕已儲存到 reviewed.srt。")
-                        st.rerun()
-
-    st.divider()
-    st.markdown("**步驟五「人工字幕確認」**")
-    reviewed_path = ep_dir / "02_subtitles" / "reviewed.srt"
-    final_path = ep_dir / "02_subtitles" / "final.srt"
-    subtitle_text = final_path.read_text(encoding="utf-8", errors="ignore") if final_path.exists() else (
-        reviewed_path.read_text(encoding="utf-8", errors="ignore") if reviewed_path.exists() else ""
-    )
-    edited_subtitles = st.text_area("手動修改字幕後存檔", value=subtitle_text, height=260, key=f"short_final_subtitles_{ep_dir.name}")
-    if st.button("儲存人工確認字幕", key=f"short_save_final_subtitles_{ep_dir.name}"):
-        def save_final_subtitles():
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            final_path.write_text(edited_subtitles, encoding="utf-8")
-
-        ok = short_run_logged_step(ep_dir, "5", "人工字幕確認", save_final_subtitles)
-        if ok:
-            st.success("人工確認字幕已儲存。")
-    render_inline_short_step_log("5", "人工字幕確認")
-
-def render_short_storyboard_editor(ep_dir: Path):
-    st.subheader("修改分鏡/替換影音")
-    storyboard_path = short_storyboard_path(ep_dir)
-    storyboard = short_read_json(storyboard_path, [])
-    if isinstance(storyboard, dict) and isinstance(storyboard.get("scenes"), list):
-        storyboard = storyboard.get("scenes", [])
-    if not isinstance(storyboard, list):
-        storyboard = []
-    if not storyboard:
-        storyboard = [{
-            "scene": 1,
-            "start": "00:00:00,000",
-            "end": "00:00:03,000",
-            "start_seconds": 0,
-            "end_seconds": 3,
-            "subtitle": "",
-            "summary": "",
-            "prompt": "Vertical 9:16 short video scene",
-            "image_prompt": "Vertical 9:16 short video scene",
-            "asset": "",
-            "animation_prompt": "",
-            "animation_asset": "",
-            "reason": "",
-        }]
-    storyboard_sig = "missing"
-    if storyboard_path.exists():
-        storyboard_sig = f"{int(storyboard_path.stat().st_mtime)}_{storyboard_path.stat().st_size}_{len(storyboard)}"
-    st.caption(f"分鏡來源：{storyboard_path}")
-    top_cols = st.columns([1, 1, 2])
-    top_cols[0].metric("Scenes", len(storyboard))
-    top_cols[1].metric("步驟6結果", "已產生" if short_output_completed(storyboard_path) else "尚未產生")
-    if top_cols[2].button("重新載入步驟6分鏡結果", key=f"short_reload_storyboard_{ep_dir.name}_{storyboard_sig}"):
-        st.rerun()
-    meta_path = storyboard_path.with_name("storyboard_meta.json")
-    if meta_path.exists():
-        meta = short_read_json(meta_path, {})
-        st.caption(
-            f"Provider: {meta.get('provider_used', '') or meta.get('provider_requested', '')} | "
-            f"Prompt: {meta.get('prompt_path', '')}"
-        )
-
-    def save_storyboard_rows(rows: list[dict], action_label: str) -> bool:
-        for idx, row in enumerate(rows, 1):
-            row["scene"] = idx
-        return short_run_logged_step(ep_dir, "6", action_label, lambda: short_write_json(storyboard_path, rows))
-
-    def scene_id(row: dict) -> str:
-        return str(row.get("scene", row.get("scene_id", ""))).strip()
-
-    def scene_label(row: dict) -> str:
-        text = str(row.get("summary") or row.get("subtitle") or row.get("prompt") or "").strip()
-        return f"Scene {scene_id(row)} | {text[:60]}"
-
-    def resolve_asset_path(value: str) -> Path:
-        raw = Path(str(value or "").strip())
-        return raw if raw.is_absolute() else ep_dir / raw
-
-    def rel_asset(path: Path) -> str:
-        try:
-            return path.resolve().relative_to(ep_dir.resolve()).as_posix()
-        except Exception:
-            return str(path)
-
-    def collect_short_assets(kind: str) -> list[Path]:
-        patterns = ["*.png", "*.jpg", "*.jpeg", "*.webp"] if kind == "image" else ["*.mp4", "*.mov", "*.webm"]
-        out = []
-        seen = set()
-        for pattern in patterns:
-            for path in short_workspace_root().rglob(pattern):
-                key = str(path.resolve())
-                if key not in seen:
-                    seen.add(key)
-                    out.append(path)
-        return sorted(out)
-
-    def current_image(row: dict) -> Path | None:
-        value = str(row.get("asset", "") or row.get("image_asset", "")).strip()
-        path = resolve_asset_path(value) if value else None
-        return path if path and path.exists() else None
-
-    def current_animation(row: dict) -> Path | None:
-        value = str(row.get("animation_asset", "") or row.get("animation_video_path", "")).strip()
-        path = resolve_asset_path(value) if value else None
-        return path if path and path.exists() else None
-
-    work_tab, edit_tab, assets_tab, table_tab = st.tabs(["單鏡工作台", "合併 / 切分", "素材 / Tag", "整張分鏡表"])
-
-    with work_tab:
-        scene_ids = [scene_id(row) or str(idx + 1) for idx, row in enumerate(storyboard)]
-        scene_by_id = {sid: idx for idx, sid in enumerate(scene_ids)}
-        scene_select_key = f"short_scene_select_{ep_dir.name}"
-        if st.session_state.get(scene_select_key) not in scene_by_id:
-            st.session_state[scene_select_key] = scene_ids[0]
-        selected_scene_id = st.selectbox(
-            "選擇 Scene",
-            scene_ids,
-            key=scene_select_key,
-            format_func=lambda sid: scene_label(storyboard[scene_by_id.get(str(sid), 0)]),
-        )
-        selected_idx = scene_by_id.get(str(selected_scene_id), 0)
-        selected = dict(storyboard[selected_idx])
-        selected_scene = scene_id(selected) or str(selected_idx + 1)
-
-        left, right = st.columns([1.1, 1])
-        with left:
-            st.markdown(f"**Scene {selected_scene}**")
-            selected["summary"] = st.text_area("summary", value=str(selected.get("summary", "")), height=80, key=f"short_scene_summary_{ep_dir.name}_{selected_scene}_{storyboard_sig}")
-            selected["subtitle"] = st.text_area("subtitle", value=str(selected.get("subtitle", "")), height=90, key=f"short_scene_subtitle_{ep_dir.name}_{selected_scene}_{storyboard_sig}")
-            selected["prompt"] = st.text_area("image prompt", value=str(selected.get("prompt") or selected.get("image_prompt") or ""), height=150, key=f"short_scene_prompt_{ep_dir.name}_{selected_scene}_{storyboard_sig}")
-            selected["image_prompt"] = selected["prompt"]
-            selected["animation_prompt"] = st.text_area("animation prompt", value=str(selected.get("animation_prompt", "")), height=130, key=f"short_scene_anim_prompt_{ep_dir.name}_{selected_scene}_{storyboard_sig}")
-
-            if st.button("儲存此 Scene", key=f"short_save_scene_{ep_dir.name}_{selected_scene}_{storyboard_sig}"):
-                storyboard[selected_idx].update(selected)
-                if save_storyboard_rows(storyboard, f"儲存 Scene {selected_scene}"):
-                    st.success("Scene 已儲存。")
-                    st.rerun()
-
-            btn_cols = st.columns(4)
-            if btn_cols[0].button("AI建議動畫 Prompt", key=f"short_suggest_anim_{ep_dir.name}_{selected_scene}"):
-                storyboard[selected_idx].update(selected)
-                save_storyboard_rows(storyboard, f"儲存 Scene {selected_scene} 後產生動畫 Prompt")
-                cmd = [sys.executable, "-u", str(ROOT / "scripts" / "short_generate_animation_prompt.py"), "--storyboard", str(storyboard_path), "--scene-id", selected_scene]
-                if short_start_logged_script(ep_dir, "6", f"AI 建議 Scene {selected_scene} 動畫 Prompt", cmd):
-                    st.success("動畫 Prompt 任務已啟動。")
-                    st.rerun()
-            if btn_cols[1].button("產生動畫", key=f"short_gen_anim_{ep_dir.name}_{selected_scene}"):
-                cmd = [sys.executable, "-u", str(ROOT / "scripts" / "short_generate_animation.py"), "--ep-dir", str(ep_dir), "--storyboard", str(storyboard_path), "--scene-id", selected_scene]
-                if short_start_logged_script(ep_dir, "7", f"產生 Scene {selected_scene} 動畫", cmd):
-                    st.success("動畫任務已啟動。")
-                    st.rerun()
-            if btn_cols[2].button("重產圖片", key=f"short_regen_image_{ep_dir.name}_{selected_scene}"):
-                cmd = [
-                    sys.executable, "-u", str(ROOT / "scripts" / "short_generate_storyboard_images.py"),
-                    "--ep-dir", str(ep_dir),
-                    "--storyboard", str(storyboard_path),
-                    "--manifest", str(ep_dir / "04_images" / "storyboard_images_manifest.json"),
-                    "--force",
-                    "--scene-id", selected_scene,
-                ]
-                if short_start_logged_script(ep_dir, "7", f"重產 Scene {selected_scene} 圖片", cmd):
-                    st.success("重產圖片任務已啟動。")
-                    st.rerun()
-            if btn_cols[3].button("重產圖並產動畫", key=f"short_regen_image_anim_{ep_dir.name}_{selected_scene}"):
-                cmd = [
-                    sys.executable, "-u", str(ROOT / "scripts" / "short_regenerate_image_prompt_animation.py"),
-                    "--ep-dir", str(ep_dir),
-                    "--storyboard", str(storyboard_path),
-                    "--manifest", str(ep_dir / "04_images" / "storyboard_images_manifest.json"),
-                    "--scene-id", selected_scene,
-                ]
-                if short_start_logged_script(ep_dir, "7", f"重產 Scene {selected_scene} 圖片並產動畫", cmd):
-                    st.success("重產圖並產動畫任務已啟動。")
-                    st.rerun()
-
-            st.markdown("**Scene 任務 Log**")
-            short_render_step_log_panel(ep_dir, "6", "分鏡 / 動畫 Prompt", auto_expand_errors=False, key_suffix=f"scene_{selected_scene}")
-            short_render_step_log_panel(ep_dir, "7", "圖片 / 動畫", auto_expand_errors=False, key_suffix=f"scene_{selected_scene}")
-
-        with right:
-            image_path = current_image(selected)
-            animation_path = current_animation(selected)
-            st.markdown("**目前素材預覽**")
-            if image_path:
-                st.image(str(image_path), caption=f"圖片：{image_path.name} | Tag: {asset_tag_badge(image_path)}", use_container_width=True)
-            else:
-                st.info("此 Scene 尚未指定圖片。")
-            if animation_path:
-                st.video(str(animation_path))
-                st.caption(f"動畫：{animation_path.name} | Tag: {asset_tag_badge(animation_path)}")
-            else:
-                st.caption("此 Scene 尚未指定動畫。")
-
-            uploaded_image = st.file_uploader("上傳/更換圖片", type=["png", "jpg", "jpeg", "webp"], key=f"short_upload_image_{ep_dir.name}_{selected_scene}")
-            if uploaded_image and st.button("使用上傳圖片", key=f"short_use_upload_image_{ep_dir.name}_{selected_scene}"):
-                safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", uploaded_image.name)
-                target = ep_dir / "04_images" / "storyboard" / f"scene_{selected_scene}_upload_{safe_name}"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(uploaded_image.getbuffer())
-                storyboard[selected_idx]["asset"] = rel_asset(target)
-                if save_storyboard_rows(storyboard, f"更換 Scene {selected_scene} 圖片"):
-                    st.rerun()
-
-            uploaded_animation = st.file_uploader("上傳/更換動畫", type=["mp4", "mov", "webm"], key=f"short_upload_animation_{ep_dir.name}_{selected_scene}")
-            if uploaded_animation and st.button("使用上傳動畫", key=f"short_use_upload_animation_{ep_dir.name}_{selected_scene}"):
-                safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", uploaded_animation.name)
-                target = ep_dir / "04_images" / "animations" / f"scene_{selected_scene}_upload_{safe_name}"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(uploaded_animation.getbuffer())
-                rel = rel_asset(target)
-                storyboard[selected_idx]["animation_asset"] = rel
-                storyboard[selected_idx]["animation_video_path"] = rel
-                if save_storyboard_rows(storyboard, f"更換 Scene {selected_scene} 動畫"):
-                    st.rerun()
-
-    with edit_tab:
-        scene_options = [scene_label(row) for row in storyboard]
-        st.markdown("**合併多個分鏡**")
-        merge_cols = st.columns(3)
-        merge_start = merge_cols[0].selectbox("起始 Scene", scene_options, key=f"short_merge_start_{ep_dir.name}_{storyboard_sig}")
-        merge_end = merge_cols[1].selectbox("結束 Scene", scene_options, index=min(1, len(scene_options) - 1), key=f"short_merge_end_{ep_dir.name}_{storyboard_sig}")
-        if merge_cols[2].button("合併選取 Scene", key=f"short_merge_apply_{ep_dir.name}_{storyboard_sig}"):
-            start_idx = scene_options.index(merge_start)
-            end_idx = scene_options.index(merge_end)
-            if start_idx > end_idx:
-                start_idx, end_idx = end_idx, start_idx
-            merged_rows = storyboard[start_idx:end_idx + 1]
-            merged = dict(merged_rows[0])
-            merged["end"] = merged_rows[-1].get("end", merged.get("end", ""))
-            merged["end_seconds"] = merged_rows[-1].get("end_seconds", merged.get("end_seconds", ""))
-            merged["subtitle"] = " ".join(str(row.get("subtitle", "")).strip() for row in merged_rows if str(row.get("subtitle", "")).strip())
-            merged["summary"] = " / ".join(str(row.get("summary", "")).strip() for row in merged_rows if str(row.get("summary", "")).strip())[:240]
-            merged["reason"] = "手動合併多個分鏡"
-            if save_storyboard_rows(storyboard[:start_idx] + [merged] + storyboard[end_idx + 1:], "合併多個分鏡"):
-                st.rerun()
-
-        st.divider()
-        st.markdown("**一個分鏡切成多個**")
-        split_cols = st.columns(3)
-        split_label = split_cols[0].selectbox("要切分的 Scene", scene_options, key=f"short_split_scene_{ep_dir.name}_{storyboard_sig}")
-        split_count = int(split_cols[1].number_input("切成幾段", min_value=2, max_value=8, value=2, step=1, key=f"short_split_count_{ep_dir.name}_{storyboard_sig}"))
-        if split_cols[2].button("套用切分", key=f"short_split_apply_{ep_dir.name}_{storyboard_sig}"):
-            idx = scene_options.index(split_label)
-            source = storyboard[idx]
-            start_sec = float(source.get("start_seconds", 0) or 0)
-            end_sec = float(source.get("end_seconds", start_sec + split_count) or start_sec + split_count)
-            duration = max((end_sec - start_sec) / split_count, 0.3)
-            parts = []
-            for part_idx in range(split_count):
-                part = dict(source)
-                part_start = start_sec + duration * part_idx
-                part_end = end_sec if part_idx == split_count - 1 else part_start + duration
-                part["start_seconds"] = round(part_start, 3)
-                part["end_seconds"] = round(part_end, 3)
-                part["start"] = seconds_to_label(part_start).replace(".", ",")
-                part["end"] = seconds_to_label(part_end).replace(".", ",")
-                part["summary"] = f"{source.get('summary', '')} Part {part_idx + 1}".strip()
-                part["asset"] = source.get("asset", "") if part_idx == 0 else ""
-                part["animation_asset"] = ""
-                part["animation_video_path"] = ""
-                part["reason"] = "手動切分分鏡"
-                parts.append(part)
-            if save_storyboard_rows(storyboard[:idx] + parts + storyboard[idx + 1:], "一個分鏡切成多個"):
-                st.rerun()
-
-    with assets_tab:
-        image_assets = collect_short_assets("image")
-        animation_assets = collect_short_assets("animation")
-        all_assets = image_assets + animation_assets
-        tag_options = collect_asset_tag_options(all_assets)
-        selected_tag = st.selectbox(
-            "依 Tag 篩選素材",
-            tag_options,
-            format_func=lambda value: {"__all__": "全部", "__untagged__": "未貼 tag"}.get(value, value),
-            key=f"short_asset_tag_filter_{ep_dir.name}_{storyboard_sig}",
-        )
-        filtered_images = filter_asset_paths_by_tag(image_assets, selected_tag)
-        filtered_animations = filter_asset_paths_by_tag(animation_assets, selected_tag)
-        labels = [scene_label(row) for row in storyboard]
-        selected_label = st.selectbox("套用到 Scene", labels, key=f"short_asset_scene_select_{ep_dir.name}_{storyboard_sig}")
-        selected_idx = labels.index(selected_label)
-        selected_scene = scene_id(storyboard[selected_idx])
-        col_img, col_anim = st.columns(2)
-        with col_img:
-            st.caption("圖片素材")
-            if filtered_images:
-                chosen_image = st.selectbox("選擇圖片", [str(path) for path in filtered_images], format_func=lambda value: f"{Path(value).name} | Tag: {asset_tag_badge(Path(value))}", key=f"short_choose_image_asset_{ep_dir.name}_{storyboard_sig}")
-                if st.button("套用圖片", key=f"short_apply_image_asset_{ep_dir.name}_{storyboard_sig}"):
-                    storyboard[selected_idx]["asset"] = rel_asset(Path(chosen_image))
-                    if save_storyboard_rows(storyboard, f"套用圖片到 Scene {selected_scene}"):
-                        st.rerun()
-            else:
-                st.caption("沒有符合條件的圖片。")
-        with col_anim:
-            st.caption("動畫素材")
-            if filtered_animations:
-                chosen_animation = st.selectbox("選擇動畫", [str(path) for path in filtered_animations], format_func=lambda value: f"{Path(value).name} | Tag: {asset_tag_badge(Path(value))}", key=f"short_choose_animation_asset_{ep_dir.name}_{storyboard_sig}")
-                if st.button("套用動畫", key=f"short_apply_animation_asset_{ep_dir.name}_{storyboard_sig}"):
-                    rel = rel_asset(Path(chosen_animation))
-                    storyboard[selected_idx]["animation_asset"] = rel
-                    storyboard[selected_idx]["animation_video_path"] = rel
-                    if save_storyboard_rows(storyboard, f"套用動畫到 Scene {selected_scene}"):
-                        st.rerun()
-            else:
-                st.caption("沒有符合條件的動畫。")
-
-        tag_target_options = [str(path) for path in all_assets]
-        if tag_target_options:
-            tag_target = st.selectbox("選擇要貼 Tag 的素材", tag_target_options, format_func=lambda value: f"{Path(value).name} | Tag: {asset_tag_badge(Path(value))}", key=f"short_tag_target_{ep_dir.name}_{storyboard_sig}")
-            tag_text = st.text_input("Tag", value=asset_tag_for_path(tag_target), key=f"short_tag_text_{ep_dir.name}_{storyboard_sig}_{tag_target}")
-            if st.button("儲存素材 Tag", key=f"short_save_asset_tag_{ep_dir.name}_{storyboard_sig}"):
-                saved = set_asset_tag_for_path(tag_target, tag_text)
-                if saved:
-                    st.success(f"已更新素材 Tag：{saved}")
-                    st.rerun()
-
-    with table_tab:
-        df = pd.DataFrame(storyboard)
-        preferred_cols = ["scene", "start", "end", "subtitle", "summary", "prompt", "image_prompt", "asset", "animation_prompt", "animation_asset", "reason", "start_seconds", "end_seconds", "source_type"]
-        ordered_cols = [col for col in preferred_cols if col in df.columns] + [col for col in df.columns if col not in preferred_cols]
-        df = df[ordered_cols]
-        edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key=f"short_storyboard_editor_{ep_dir.name}_{storyboard_sig}")
-        if st.button("儲存整張分鏡表", key=f"short_save_storyboard_{ep_dir.name}"):
-            if save_storyboard_rows(edited.fillna("").to_dict(orient="records"), "儲存整張分鏡表"):
-                st.success("分鏡已儲存。")
-
-    st.caption("替換影音可先填入 asset / animation_asset；執行「產生合成清單」會將目前分鏡寫入清單。")
-
-def render_short_video_preview(ep_dir: Path):
-    st.subheader("影片預覽")
-    compose_path = short_compose_list_path(ep_dir)
-    preview_video_path = short_preview_video_path(ep_dir)
-    final_video_path = ep_dir / "05_output" / "final_short.mp4"
-
-    if not short_output_completed(compose_path):
-        st.info("尚未產生合成清單。請先執行步驟8「產生合成清單」。")
-        return
-
-    compose_payload = short_read_json(compose_path, {})
-    if not isinstance(compose_payload, dict):
-        st.error("合成清單格式無法讀取。")
-        return
-
-    items = compose_payload.get("items", []) if isinstance(compose_payload.get("items", []), list) else []
-    warnings = compose_payload.get("warnings", []) if isinstance(compose_payload.get("warnings", []), list) else []
-    timeline_rows = [
-        {
-            "scene": item.get("scene", idx + 1),
-            "start": item.get("start", ""),
-            "end": item.get("end", ""),
-            "duration_seconds": item.get("duration_seconds", ""),
-            "visual_type": item.get("visual_type", ""),
-            "subtitle": item.get("subtitle", ""),
-            "selected_visual": item.get("selected_visual", ""),
-        }
-        for idx, item in enumerate(items)
-    ]
-
-    subtitle_candidates = compose_payload.get("subtitle_candidates", [])
-    subtitle_path = None
-    if isinstance(subtitle_candidates, list):
-        for candidate in subtitle_candidates:
-            path = Path(str(candidate))
-            if not path.is_absolute():
-                path = ep_dir / path
-            if short_output_completed(path):
-                subtitle_path = path
-                break
-
-    def video_meta(path: Path) -> tuple[str, str]:
-        if not short_output_completed(path):
-            return "未產生", ""
-        duration = media_duration_seconds(str(path))
-        duration_label = seconds_to_label(duration) if duration is not None else "未知"
-        size_mb = path.stat().st_size / 1024 / 1024
-        return duration_label, f"{size_mb:.1f} MB"
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Scenes", compose_payload.get("scene_count", len(items)))
-    c2.metric("Warnings", len(warnings))
-    c3.metric("預覽長度", video_meta(preview_video_path)[0])
-    c4.metric("正式影片", "已產生" if short_output_completed(final_video_path) else "未產生")
-
-    if warnings:
-        st.warning("合成清單有缺少素材或其他警告，請先在「修改分鏡/替換影音」補齊。")
-
-    preview_tab, final_tab, data_tab = st.tabs(["合成前預覽", "正式影片", "資料檢查"])
-
-    def render_player_panel(path: Path, empty_message: str, caption: str):
-        player_col, side_col = st.columns([0.78, 1.42], gap="large")
-        with player_col:
-            if short_output_completed(path):
-                st.video(str(path))
-                st.caption(caption)
-            else:
-                st.info(empty_message)
-        with side_col:
-            duration_label, size_label = video_meta(path)
-            info_cols = st.columns(3)
-            info_cols[0].metric("長度", duration_label)
-            info_cols[1].metric("大小", size_label or "-")
-            info_cols[2].metric("比例", compose_payload.get("ratio", "9:16"))
-            if path.exists():
-                st.caption(str(path))
-            if timeline_rows:
-                st.dataframe(pd.DataFrame(timeline_rows), use_container_width=True, hide_index=True, height=330)
-
-    with preview_tab:
-        preview_state = short_step_state(ep_dir, "8_preview")
-        preview_is_stale = (
-            short_output_completed(preview_video_path)
-            and preview_video_path.stat().st_mtime < compose_path.stat().st_mtime
-        )
-        action_cols = st.columns([1.1, 1, 2.4])
-        if action_cols[0].button(
-            "產生/更新預覽影片",
-            key=f"short_generate_preview_video_{ep_dir.name}",
-            disabled=bool(preview_state.get("running")) or bool(warnings),
-        ):
-            cmd = [
-                sys.executable,
-                "-u",
-                str(ROOT / "scripts" / "short_ffmpeg_compose.py"),
-                "--ep-dir",
-                str(ep_dir),
-                "--compose-list",
-                str(compose_path),
-                "--output",
-                str(preview_video_path),
-            ]
-            ok = short_start_logged_script(ep_dir, "8_preview", "合成前預覽影片", cmd)
-            if ok:
-                st.success("合成前預覽影片已啟動產生，請看下方 Log。")
-                st.rerun()
-        action_cols[1].write("執行中" if preview_state.get("running") else ("已產生" if short_output_completed(preview_video_path) else "未產生"))
-        if warnings:
-            action_cols[2].caption("合成清單仍有警告，請先補齊素材後再產生預覽影片。")
-        elif preview_is_stale:
-            action_cols[2].warning("預覽影片早於目前合成清單，建議重新產生。")
-        else:
-            action_cols[2].caption("預覽影片依步驟8合成清單產生，適合先檢查節奏、字幕與素材。")
-        render_player_panel(
-            preview_video_path,
-            "尚未產生合成前預覽影片。執行步驟8後會自動產生，也可以在這裡手動更新。",
-            "合成前預覽影片",
-        )
-        short_render_step_log_panel(ep_dir, "8_preview", "合成前預覽影片", auto_expand_errors=False, key_suffix="video_preview")
-
-    with final_tab:
-        render_player_panel(
-            final_video_path,
-            "尚未產生正式影片。請執行步驟9「FFmpeg 影片合成」。",
-            "步驟9正式輸出影片",
-        )
-
-    with data_tab:
-        if warnings:
-            with st.expander("合成清單警告", expanded=True):
-                st.dataframe(pd.DataFrame(warnings), use_container_width=True, hide_index=True)
-        if subtitle_path:
-            with st.expander("查看字幕檔", expanded=False):
-                st.caption(str(subtitle_path))
-                st.code(subtitle_path.read_text(encoding="utf-8", errors="ignore")[-12000:], language="text")
-        with st.expander("查看 compose_list.json", expanded=False):
-            st.code(compose_path.read_text(encoding="utf-8", errors="ignore")[:12000], language="json")
-
-def render_short_metadata_editor(ep_dir: Path):
-    st.subheader("Metadata")
-    meta_path = short_metadata_path(ep_dir)
-    ep_data = short_read_json(short_episode_json_path(ep_dir), {})
-    metadata = short_read_json(meta_path, {})
-    with st.form(f"short_metadata_form_{ep_dir.name}"):
-        title = st.text_input("Title", value=metadata.get("title") or ep_data.get("title", ""))
-        hook = st.text_input("Hook", value=metadata.get("hook", ""))
-        description = st.text_area("Description", value=metadata.get("description", ""), height=180)
-        hashtags = st.text_input("Hashtags", value=", ".join(metadata.get("hashtags", ["#Shorts"]) if isinstance(metadata.get("hashtags", []), list) else []))
-        tags = st.text_input("Tags", value=", ".join(metadata.get("tags", []) if isinstance(metadata.get("tags", []), list) else []))
-        pinned_comment = st.text_area("Pinned Comment", value=metadata.get("pinned_comment", ""), height=120)
-        summary = st.text_area("Summary", value=metadata.get("summary", ""), height=120)
-        privacy = st.selectbox("Privacy", ["private", "unlisted", "public"], index=["private", "unlisted", "public"].index(metadata.get("privacy", "private")) if metadata.get("privacy", "private") in ["private", "unlisted", "public"] else 0)
-        submitted = st.form_submit_button("儲存 Metadata")
-    if submitted:
-        payload = {
-            "title": title,
-            "hook": hook,
-            "description": description,
-            "hashtags": [h.strip() for h in hashtags.split(",") if h.strip()],
-            "tags": [tag.strip().lstrip("#") for tag in tags.split(",") if tag.strip()],
-            "pinned_comment": pinned_comment,
-            "summary": summary,
-            "language": metadata.get("language", "zh-TW"),
-            "privacy": privacy,
-            "generated_by": metadata.get("generated_by", ""),
-            "generated_at": metadata.get("generated_at", ""),
-            "source": metadata.get("source", {}),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        ok = short_run_logged_step(
-            ep_dir,
-            "10",
-            "修改 Short metadata",
-            lambda: short_write_json(meta_path, payload),
-        )
-        if ok:
-            st.success("Short metadata 已儲存。")
-    if meta_path.exists():
-        st.code(meta_path.read_text(encoding="utf-8", errors="ignore"), language="json")
-
-def render_short_publish(ep_dir: Path):
-    st.subheader("發佈")
-    video_path = short_final_video_path(ep_dir)
-    meta_path = short_metadata_path(ep_dir)
-    subtitle_path = next((path for path in [
-        ep_dir / "02_subtitles" / "final.srt",
-        ep_dir / "02_subtitles" / "reviewed.srt",
-        ep_dir / "02_subtitles" / "whisper.srt",
-    ] if short_output_completed(path)), None)
-    cover_path = short_publish_cover_path(ep_dir)
-    upload_record_path = short_upload_record_path(ep_dir)
-    upload_record = short_read_json(upload_record_path, {})
-    upload_state = short_step_state(ep_dir, "publish")
-
-    ready_cols = st.columns(5)
-    ready_cols[0].metric("影片", "就緒" if short_output_completed(video_path) else "缺少")
-    ready_cols[1].metric("Metadata", "就緒" if short_output_completed(meta_path) else "缺少")
-    ready_cols[2].metric("字幕", "就緒" if subtitle_path else "缺少")
-    ready_cols[3].metric("封面", "就緒" if cover_path else "未設定")
-    ready_cols[4].metric("上傳狀態", "執行中" if upload_state.get("running") else upload_record.get("status", "尚無"))
-
-    st.caption(f"影片：{video_path}")
-    st.caption(f"Metadata：{meta_path}")
-    st.caption(f"字幕：{subtitle_path or '尚未找到字幕'}")
-    st.caption(f"封面：{cover_path or '預設會尋找 05_output/cover 或第一張分鏡圖'}")
-
-    cover_cols = st.columns([1.1, 1, 2])
-    with cover_cols[0]:
-        uploaded_cover = st.file_uploader("上傳封面", type=["png", "jpg", "jpeg"], key=f"short_cover_upload_{ep_dir.name}")
-        if uploaded_cover is not None:
-            suffix = Path(uploaded_cover.name).suffix.lower() or ".png"
-            save_path = ep_dir / "05_output" / f"cover{suffix}"
-            upload_sig = f"{uploaded_cover.name}:{uploaded_cover.size}"
-            processed_key = f"short_cover_upload_processed_{ep_dir.name}"
-            if st.session_state.get(processed_key) != upload_sig:
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                save_path.write_bytes(uploaded_cover.getbuffer())
-                st.session_state[processed_key] = upload_sig
-                st.success(f"已儲存封面：{save_path.name}")
-                st.rerun()
-    with cover_cols[1]:
-        if cover_path and cover_path.exists():
-            st.image(str(cover_path), caption="目前封面", use_container_width=True)
-        else:
-            st.caption("尚未設定封面。")
-    with cover_cols[2]:
-        st.caption("封面會在上傳影片成功後設定到 YouTube。若未上傳封面，會優先使用第一張分鏡圖。")
-
-    if upload_record.get("video_id"):
-        st.markdown(f"[開啟 YouTube 影片](https://www.youtube.com/watch?v={upload_record['video_id']})")
-
-    if not short_output_completed(video_path):
-        st.warning("發布前需要先完成步驟9，產生 final_short.mp4。")
-    if not short_output_completed(meta_path):
-        st.warning("發布前需要先完成步驟10，產生並確認 Short metadata。")
-
-    token_sig, client_sig = youtube_auth_file_signatures()
-    playlist_items, playlist_error = list_youtube_playlists_cached(token_sig, client_sig)
-    playlist_options = [{"id": "", "title": "(不加入播放清單)", "label": "(不加入播放清單)"}] + playlist_items
-    if playlist_error:
-        st.error(f"YouTube 播放清單讀取失敗：{playlist_error}")
-        if "invalid_grant" in playlist_error.lower() or "重新授權" in playlist_error:
-            if st.button("重新授權 YouTube", key=f"short_reauth_youtube_{ep_dir.name}"):
-                try:
-                    reauthorize_youtube_for_app()
-                    list_youtube_playlists_cached.clear()
-                    st.success("YouTube 已重新授權。")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"YouTube 重新授權失敗：{exc}")
-
-    settings = short_read_json(short_publish_settings_path(ep_dir), {})
-    privacy_key = f"short_publish_privacy_{ep_dir.name}"
-    schedule_key = f"short_publish_schedule_on_{ep_dir.name}"
-    date_key = f"short_publish_date_{ep_dir.name}"
-    time_key = f"short_publish_time_{ep_dir.name}"
-    playlist_key = f"short_publish_playlist_{ep_dir.name}"
-    if privacy_key not in st.session_state:
-        st.session_state[privacy_key] = str(settings.get("privacy") or upload_record.get("privacy") or "private")
-    if schedule_key not in st.session_state:
-        st.session_state[schedule_key] = bool(settings.get("schedule_on") or upload_record.get("publish_at"))
-    if playlist_key not in st.session_state:
-        st.session_state[playlist_key] = resolve_default_playlist_id(playlist_options, str(settings.get("playlist_id") or upload_record.get("playlist_id") or ""))
-
-    privacy_val = st.selectbox("隱私設定", ["private", "unlisted", "public"], key=privacy_key)
-    schedule_on = st.checkbox("排程發布", key=schedule_key)
-    sched_cols = st.columns(2)
-    with sched_cols[0]:
-        publish_date = st.date_input("發布日期", key=date_key, disabled=not schedule_on)
-    with sched_cols[1]:
-        publish_time = st.time_input("發布時間", key=time_key, disabled=not schedule_on)
-    selected_playlist_id = st.selectbox(
-        "播放清單",
-        options=[item["id"] for item in playlist_options],
-        format_func=lambda pid: next((item["label"] for item in playlist_options if item["id"] == pid), pid or "(不加入播放清單)"),
-        key=playlist_key,
-    )
-
-    publish_at_text = ""
-    if schedule_on:
-        publish_at_text = datetime.combine(publish_date, publish_time).strftime("%Y-%m-%d %H:%M")
-        st.caption(f"YouTube 排程發布時間：{publish_at_text} (Asia/Taipei)。排程發布會以 private 上傳並設定 publishAt。")
-    elif privacy_val == "public":
-        st.warning("選擇 public 會在上傳完成後立即公開。")
-
-    action_cols = st.columns([1.2, 1.2, 3])
-    if action_cols[0].button("儲存發布設定", key=f"short_save_publish_settings_{ep_dir.name}"):
-        short_write_json(short_publish_settings_path(ep_dir), {
-            "privacy": privacy_val,
-            "schedule_on": bool(schedule_on),
-            "publish_at": publish_at_text,
-            "playlist_id": selected_playlist_id,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        })
-        st.success("發布設定已儲存。")
-    upload_disabled = upload_state.get("running") or not short_output_completed(video_path) or not short_output_completed(meta_path)
-    if action_cols[1].button("上傳到 YouTube", type="primary", key=f"short_upload_youtube_{ep_dir.name}", disabled=upload_disabled):
-        cmd = [
-            sys.executable,
-            "-u",
-            str(ROOT / "scripts" / "upload_short_to_youtube.py"),
-            "--ep-dir",
-            str(ep_dir),
-            "--privacy",
-            privacy_val,
-        ]
-        if publish_at_text:
-            cmd.extend(["--publish_at", publish_at_text])
-        if selected_playlist_id:
-            cmd.extend(["--playlist_id", selected_playlist_id])
-        if cover_path:
-            cmd.extend(["--cover_path", str(cover_path)])
-        ok = short_start_logged_script(ep_dir, "publish", "上傳 Short 到 YouTube", cmd)
-        if ok:
-            st.success("已啟動 YouTube 上傳，請查看發布 Log。")
-            st.rerun()
-    if action_cols[2].button("重新整理發布狀態", key=f"short_refresh_publish_{ep_dir.name}"):
-        st.rerun()
-
-    if upload_record:
-        with st.expander("上傳紀錄", expanded=False):
-            st.json(upload_record)
-    short_render_step_log_panel(ep_dir, "publish", "上傳 Short 到 YouTube", auto_expand_errors=False, key_suffix="publish")
-
-def render_short_factory():
-    st.header("短影音工廠")
-    programs = short_load_programs()
-    if not programs:
-        st.info("尚未建立 Short 節目。請先到「Short 管理」新增節目名稱。")
-        return
-    program_id = st.selectbox(
-        "選擇 Short 節目名稱",
-        [p.get("id") for p in programs],
-        format_func=lambda pid: next((p.get("name", pid) for p in programs if p.get("id") == pid), pid),
-        key="short_factory_program",
-    )
-    program = short_get_program(program_id)
-    if not program:
-        return
-    episodes = short_list_episodes(program)
-    episode_options = [SHORT_BLANK_OPTION] + [f"Ep{ep['episode_no']:02d} - {ep.get('title', '')}" for ep in episodes]
-    episode_choice = st.selectbox("選擇集數", episode_options, key=f"short_factory_episode_{program_id}")
-    selected_episode_no = None
-    ep_dir = None
-    if episode_choice != SHORT_BLANK_OPTION:
-        m = re.match(r"Ep(\d+)", episode_choice)
-        if m:
-            selected_episode_no = int(m.group(1))
-            ep_dir = short_episode_dir(program, selected_episode_no)
-
-    if ep_dir:
-        st.caption(f"Episode Path: {ep_dir}")
-    else:
-        st.caption("目前為新增/空白設定。")
-
-    tab_control, tab_storyboard, tab_preview, tab_metadata, tab_publish = st.tabs(["控制步驟", "修改分鏡/替換影音", "影片預覽", "Metadata", "發佈"])
-    with tab_control:
-        render_short_control_steps(program, ep_dir, selected_episode_no)
-    with tab_storyboard:
-        if ep_dir:
-            render_short_storyboard_editor(ep_dir)
-        else:
-            st.info("請先在「控制步驟」儲存標題建立新集數。")
-    with tab_preview:
-        if ep_dir:
-            render_short_video_preview(ep_dir)
-        else:
-            st.info("請先在「控制步驟」儲存標題建立新集數。")
-    with tab_metadata:
-        if ep_dir:
-            render_short_metadata_editor(ep_dir)
-        else:
-            st.info("請先建立新集數後再編輯 Metadata。")
-    with tab_publish:
-        if ep_dir:
-            render_short_publish(ep_dir)
-        else:
-            st.info("請先建立新集數後再發佈。")
+configure_story_section(
+    ROOT,
+    WS_ROOT,
+    runner,
+    {
+        "read_json_file": read_json_file,
+        "read_text_file": read_text_file,
+        "parse_srt_entries": parse_srt_entries,
+        "seconds_to_label": seconds_to_label,
+    },
+)
+
+configure_short_generator(
+    ROOT,
+    {
+        "media_duration_seconds": media_duration_seconds,
+        "seconds_to_label": seconds_to_label,
+        "youtube_auth_file_signatures": youtube_auth_file_signatures,
+        "list_youtube_playlists_cached": list_youtube_playlists_cached,
+        "reauthorize_youtube_for_app": reauthorize_youtube_for_app,
+        "resolve_default_playlist_id": resolve_default_playlist_id,
+        "asset_tag_badge": asset_tag_badge,
+        "asset_tag_for_path": asset_tag_for_path,
+        "set_asset_tag_for_path": set_asset_tag_for_path,
+        "collect_asset_tag_options": collect_asset_tag_options,
+        "filter_asset_paths_by_tag": filter_asset_paths_by_tag,
+        "ASSET_TAG_FILTER_ALL": ASSET_TAG_FILTER_ALL,
+    },
+)
+
+configure_episode_merge(
+    ROOT,
+    profiles,
+    {
+        "story_subtitles_srt_path": story_subtitles_srt_path,
+        "media_duration_seconds": media_duration_seconds,
+        "seconds_to_label": seconds_to_label,
+        "get_schedule_status_label": get_schedule_status_label,
+        "read_json_file": read_json_file,
+        "parse_srt_entries": parse_srt_entries,
+        "safe_float": safe_float,
+        "read_text_file": read_text_file,
+        "youtube_auth_file_signatures": youtube_auth_file_signatures,
+        "list_youtube_playlists_cached": list_youtube_playlists_cached,
+        "reauthorize_youtube_for_app": reauthorize_youtube_for_app,
+        "resolve_default_playlist_id": resolve_default_playlist_id,
+    },
+)
 
 # convenience
 STAGE_IDS = get_stage_ids_for_profile(st.session_state["profile_id"])
@@ -9772,6 +6066,7 @@ elif section == "集數合併":
 elif section == "📊 Dashboard":
     st.header("專案與進度總覽")
     if st.session_state["profile_id"] == "vocab":
+        next_ep_default = next_episode_number_default(VOCAB_REBASE_EP)
         with st.expander("第 6 集起單字集數建立工具", expanded=True):
             st.caption("第 1–5 集維持既有每集 30 字。第 6 集起，系統會以第 151 字為起點，依你輸入的每集單字數連續推算區間。")
             notice = st.session_state.pop("episode_generation_notice", None)
@@ -9786,7 +6081,7 @@ elif section == "📊 Dashboard":
             single_tab, batch_tab = st.tabs(["產生單集", "產生多集"])
 
             with single_tab:
-                single_ep = int(st.number_input("產生集數", min_value=VOCAB_REBASE_EP, value=VOCAB_REBASE_EP, step=1, key="gen_single_ep"))
+                single_ep = int(st.number_input("產生集數", min_value=VOCAB_REBASE_EP, value=next_ep_default, step=1, key="gen_single_ep"))
                 single_words = int(st.number_input("單集單字數", min_value=1, value=10, step=1, key="gen_single_words"))
                 single_allow_backup = st.checkbox(
                     "若該集已有不同區間資料夾，先備份舊資料夾再重建",
@@ -9820,8 +6115,8 @@ elif section == "📊 Dashboard":
                     st.rerun()
 
             with batch_tab:
-                batch_start_ep = int(st.number_input("產生起始集數", min_value=VOCAB_REBASE_EP, value=VOCAB_REBASE_EP, step=1, key="gen_batch_start"))
-                batch_end_ep = int(st.number_input("產生結束集數", min_value=batch_start_ep, value=batch_start_ep + 4, step=1, key="gen_batch_end"))
+                batch_start_ep = int(st.number_input("產生起始集數", min_value=VOCAB_REBASE_EP, value=next_ep_default, step=1, key="gen_batch_start"))
+                batch_end_ep = int(st.number_input("產生結束集數", min_value=batch_start_ep, value=max(next_ep_default, batch_start_ep), step=1, key="gen_batch_end"))
                 batch_words = int(st.number_input("每集單字數", min_value=1, value=10, step=1, key="gen_batch_words"))
                 batch_allow_backup = st.checkbox(
                     "若既有集數資料夾區間不同，先備份舊資料夾再重建",
@@ -9856,6 +6151,7 @@ elif section == "📊 Dashboard":
                     st.rerun()
 
     elif st.session_state["profile_id"] == "story":
+        next_ep_default = next_episode_number_default(1)
         with st.expander("故事集數建立工具", expanded=True):
             st.caption("故事生成模式使用 EpNN_0000_0000 作為集數資料夾，並建立 01_preproduction 到 07_publish 的故事製作目錄。")
             notice = st.session_state.pop("story_episode_generation_notice", None)
@@ -9870,7 +6166,7 @@ elif section == "📊 Dashboard":
             single_tab, batch_tab = st.tabs(["產生單集", "產生多集"])
 
             with single_tab:
-                single_ep = int(st.number_input("產生集數", min_value=1, value=1, step=1, key="story_gen_single_ep"))
+                single_ep = int(st.number_input("產生集數", min_value=1, value=next_ep_default, step=1, key="story_gen_single_ep"))
                 single_allow_backup = st.checkbox(
                     "若該集已有不同資料夾，先備份舊資料夾再重建",
                     value=False,
@@ -9903,8 +6199,8 @@ elif section == "📊 Dashboard":
                     st.rerun()
 
             with batch_tab:
-                batch_start_ep = int(st.number_input("產生起始集數", min_value=1, value=1, step=1, key="story_gen_batch_start"))
-                batch_end_ep = int(st.number_input("產生結束集數", min_value=batch_start_ep, value=batch_start_ep + 4, step=1, key="story_gen_batch_end"))
+                batch_start_ep = int(st.number_input("產生起始集數", min_value=1, value=next_ep_default, step=1, key="story_gen_batch_start"))
+                batch_end_ep = int(st.number_input("產生結束集數", min_value=batch_start_ep, value=max(next_ep_default, batch_start_ep), step=1, key="story_gen_batch_end"))
                 batch_allow_backup = st.checkbox(
                     "若既有集數資料夾命名不同，先備份舊資料夾再重建",
                     value=False,
@@ -10101,9 +6397,17 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
             selected_stage = st.selectbox("選擇要執行的階段", STAGE_IDS, key="pm_stage")
             any_running_stage = any(bool(runner.get_stage_state(info, stage_no).get("running")) for stage_no in STAGE_IDS)
             stage_refresh_interval = 2 if (auto_refresh_stage and any_running_stage) else None
+            stage_running_prev_key = f"pm_stage_running_prev_{info['ep']}_{st.session_state['profile_id']}"
+            if any_running_stage:
+                st.session_state[stage_running_prev_key] = True
 
             @st.fragment(run_every=stage_refresh_interval)
             def render_stage_panel():
+                latest_stage_running = any(bool(runner.get_stage_state(info, stage_no).get("running")) for stage_no in STAGE_IDS)
+                if st.session_state.get(stage_running_prev_key) and not latest_stage_running:
+                    st.session_state[stage_running_prev_key] = False
+                    st.rerun()
+                st.session_state[stage_running_prev_key] = latest_stage_running
                 saved_status = read_status(info["path"])
                 saved_stage_statuses = (saved_status.get("stages") or {}) if isinstance(saved_status, dict) else {}
                 cur = infer_stage_statuses_for_profile(info["path"], st.session_state["profile_id"], prev=None)
@@ -10146,11 +6450,17 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                     res = runner.start_stage(info, selected_stage)
                     if res.get("ok"):
                         st.success(f"Stage {selected_stage} 已啟動。log: {res.get('log')}")
+                        st.rerun()
                     else:
                         st.error(f"Stage {selected_stage} 啟動失敗：{res.get('message')}")
 
             @st.fragment(run_every=stage_refresh_interval)
             def render_stage_logs():
+                latest_stage_running = any(bool(runner.get_stage_state(info, stage_no).get("running")) for stage_no in STAGE_IDS)
+                if st.session_state.get(stage_running_prev_key) and not latest_stage_running:
+                    st.session_state[stage_running_prev_key] = False
+                    st.rerun()
+                st.session_state[stage_running_prev_key] = latest_stage_running
                 stage_states = {stage_no: runner.get_stage_state(info, stage_no) for stage_no in STAGE_IDS}
                 st.caption("Stage Log 會在有任務執行中時自動刷新。")
                 st.button("只刷新 Stage Log", key="refresh_stage_logs_fragment")
@@ -10181,10 +6491,24 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                 help="有子步驟執行中時，每 2 秒自動更新一次狀態與 Log。",
             )
             vocab_provider_settings = {}
+            vocab_model_settings = {}
+            vocab_extra_provider_settings = {}
+            vocab_extra_model_settings = {}
+            vocab_image_provider_settings = {}
+            vocab_image_model_settings = {}
+            vocab_image_model_step_settings = {}
+            vocab_animation_settings = {}
             if st.session_state["profile_id"] == "vocab":
                 vocab_provider_settings = load_profile_llm_provider_settings("vocab")
+                vocab_model_settings = load_profile_llm_model_settings("vocab")
+                vocab_extra_provider_settings = load_profile_llm_extra_provider_settings("vocab")
+                vocab_extra_model_settings = load_profile_llm_extra_model_settings("vocab")
+                vocab_image_provider_settings = load_profile_image_provider_settings("vocab")
+                vocab_image_model_settings = load_profile_image_model_settings("vocab")
+                vocab_image_model_step_settings = load_profile_image_model_step_settings("vocab")
+                vocab_animation_settings = load_profile_animation_provider_settings("vocab")
                 st.caption(
-                    "No.3 / No.5 / No.12 / No.14 / No.19 的文字 LLM Provider 會在各步驟列中分開設定並儲存。"
+                    "文字 LLM Provider/Model 與 No.16 圖片 Provider 會在各步驟列中分開設定並儲存；各步驟可依任務使用不同 model。"
                 )
             vocab_text_llm_scripts = {
                 "scripts/generate_vocab_content.py",
@@ -10193,13 +6517,26 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                 "scripts/llm_director.py",
                 "scripts/generate_youtube_meta.py",
             }
+            vocab_image_provider_scripts = {
+                "scripts/gen_matched_preview_v4.py",
+            }
             any_running_sub = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in SUBSTEP_IDS)
             refresh_interval = 2 if (auto_refresh_sub and any_running_sub) else None
+            sub_running_prev_key = f"pm_sub_running_prev_{info['ep']}_{st.session_state['profile_id']}"
+            if any_running_sub:
+                st.session_state[sub_running_prev_key] = True
+            if not any_running_sub:
+                st.caption("目前沒有子步驟執行中；此面板不會自動刷新。")
 
             @st.fragment(run_every=refresh_interval)
             def render_pipeline_substeps():
                 st.caption("只會刷新此面板，不會切回 Dashboard。")
                 st.button("只刷新子步驟狀態", key="refresh_substeps_fragment")
+                latest_sub_running = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in SUBSTEP_IDS)
+                if st.session_state.get(sub_running_prev_key) and not latest_sub_running:
+                    st.session_state[sub_running_prev_key] = False
+                    st.rerun()
+                st.session_state[sub_running_prev_key] = latest_sub_running
                 dbg = evaluate_substeps_debug(info["path"], substeps_map)
                 by_no = {str(r.get('no')): r for r in dbg}
                 for ns in SUBSTEP_IDS:
@@ -10237,6 +6574,8 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                     with cols[4]:
                         if st.session_state["profile_id"] == "vocab" and ns == "10":
                             render_vocab_audio_upload_control(info["path"], ns, bool(row.get("ok")))
+                        elif st.session_state["profile_id"] == "vocab" and ns == "17":
+                            render_vocab_outro_control(info["path"], ns, bool(row.get("ok")))
                         elif ns == publish_substep:
                             if st.button("前往 Studio & Publisher", key=f"goto_pub_{ns}"):
                                 st.session_state['nav_radio'] = "🎬 Studio & Publisher"
@@ -10264,30 +6603,175 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                                     provider_options,
                                     index=provider_options.index(saved_provider),
                                     key=f"pm_vocab_llm_provider_{ns}",
-                                    format_func=lambda value: VOCAB_TEXT_LLM_PROVIDER_LABELS.get(value, value),
+                                    format_func=lambda value, step_no=ns: vocab_text_provider_label(value, step_no),
                                     help=f"只影響 Pipeline Manager 直接執行 No.{ns}。Stage 與排程依各自設定執行。",
                                 )
-                                save_cols = st.columns([1, 1])
+                                current_step_models = {}
+                                for model_provider in ("gemini", "openai", "nvidia"):
+                                    current_step_models[model_provider] = st.text_input(
+                                        f"{model_provider} model",
+                                        value=vocab_text_model_for_step(vocab_model_settings, ns, model_provider),
+                                        key=f"pm_vocab_{model_provider}_model_{ns}",
+                                            help=f"執行 No.{ns} 時注入 {VOCAB_TEXT_LLM_MODEL_ENV_KEYS.get(ns, {}).get(model_provider, '對應環境變數')}。",
+                                    ).strip()
+                                st.caption("目前執行 model：" + vocab_text_model_summary({ns: current_step_models}, ns, provider_choice))
+                                current_extra_models = {}
+                                extra_call_id = ""
+                                extra_model_providers = ()
+                                if ns == "5":
+                                    extra_call_id = "5_review"
+                                    extra_model_providers = ("gemini", "openai")
+                                    st.caption("No.5 review LLM 是獨立呼叫，model 不跟題目生成共用。")
+                                elif ns == "12":
+                                    extra_call_id = "12_nvidia_fallback"
+                                    extra_model_providers = ("nvidia",)
+                                    st.caption("No.12 NVIDIA fallback 可用逗號分隔多個模型，會依序重試；model 不跟主 review 共用。")
+                                if extra_call_id:
+                                    if extra_call_id in VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS:
+                                        extra_provider_options = list(VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS.keys())
+                                        saved_extra_provider = str(
+                                            vocab_extra_provider_settings.get(extra_call_id)
+                                            or VOCAB_TEXT_LLM_EXTRA_PROVIDER_DEFAULTS[extra_call_id]
+                                        )
+                                        if saved_extra_provider not in extra_provider_options:
+                                            saved_extra_provider = "auto"
+                                        current_extra_provider = st.selectbox(
+                                            f"{extra_call_id} provider",
+                                            extra_provider_options,
+                                            index=extra_provider_options.index(saved_extra_provider),
+                                            key=f"pm_vocab_{extra_call_id}_provider_{ns}",
+                                            format_func=lambda value: VOCAB_TEXT_LLM_EXTRA_PROVIDER_LABELS.get(value, value),
+                                            help=f"執行 No.{ns} 額外 LLM 呼叫時注入 {VOCAB_TEXT_LLM_EXTRA_PROVIDER_ENV_KEYS[extra_call_id]}。",
+                                        )
+                                    else:
+                                        current_extra_provider = ""
+                                    extra_cols = st.columns(len(extra_model_providers))
+                                    for extra_col, model_provider in zip(extra_cols, extra_model_providers):
+                                        with extra_col:
+                                            current_extra_models[model_provider] = st.text_input(
+                                                f"{extra_call_id} {model_provider} model",
+                                                value=vocab_text_extra_model_for_call(vocab_extra_model_settings, extra_call_id, model_provider),
+                                                key=f"pm_vocab_{extra_call_id}_{model_provider}_model_{ns}",
+                                                help=f"執行 No.{ns} 額外 LLM 呼叫時注入 {VOCAB_TEXT_LLM_EXTRA_MODEL_ENV_KEYS[extra_call_id][model_provider]}。",
+                                            ).strip()
+                                save_cols = st.columns([1, 1, 1])
                                 if save_cols[0].button("儲存設定", key=f"save_vocab_llm_provider_{ns}"):
                                     vocab_provider_settings[ns] = provider_choice
-                                    saved_path = save_profile_llm_provider_settings("vocab", vocab_provider_settings)
-                                    st.success(f"No.{ns} Provider 已儲存：{VOCAB_TEXT_LLM_PROVIDER_LABELS.get(provider_choice, provider_choice)}")
+                                    saved_path = save_profile_llm_provider_settings("vocab", vocab_provider_settings, vocab_model_settings)
+                                    st.success(f"No.{ns} Provider 已儲存：{vocab_text_provider_label(provider_choice, ns)}")
                                     st.caption(f"設定檔：{saved_path}")
-                                args_list = list(step_def.get("args") or [])
-                                if "--provider" in args_list:
-                                    provider_idx = args_list.index("--provider")
-                                    if provider_idx + 1 < len(args_list):
-                                        args_list[provider_idx + 1] = provider_choice
-                                    else:
-                                        args_list.append(provider_choice)
-                                else:
-                                    args_list.extend(["--provider", provider_choice])
-                                step_def["args"] = args_list
+                                if save_cols[1].button("儲存模型", key=f"save_vocab_llm_model_{ns}"):
+                                    vocab_model_settings[ns] = {
+                                        model_provider: current_step_models.get(model_provider) or VOCAB_TEXT_LLM_MODEL_DEFAULTS.get(ns, {}).get(model_provider, "")
+                                        for model_provider in ("gemini", "openai", "nvidia")
+                                    }
+                                    saved_path = save_profile_llm_provider_settings("vocab", vocab_provider_settings, vocab_model_settings)
+                                    st.success(f"No.{ns} Model 已儲存。")
+                                    st.caption(f"設定檔：{saved_path}")
+                                if extra_call_id and save_cols[2].button("儲存額外呼叫模型", key=f"save_vocab_llm_extra_model_{ns}"):
+                                    if current_extra_provider:
+                                        vocab_extra_provider_settings[extra_call_id] = current_extra_provider
+                                    vocab_extra_model_settings[extra_call_id] = {
+                                        model_provider: current_extra_models.get(model_provider) or VOCAB_TEXT_LLM_EXTRA_MODEL_DEFAULTS[extra_call_id][model_provider]
+                                        for model_provider in extra_model_providers
+                                    }
+                                    saved_path = save_profile_llm_provider_settings(
+                                        "vocab",
+                                        vocab_provider_settings,
+                                        vocab_model_settings,
+                                        extra_model_settings=vocab_extra_model_settings,
+                                        extra_provider_settings=vocab_extra_provider_settings,
+                                    )
+                                    st.success(f"No.{ns} 額外呼叫 Model 已儲存。")
+                                    st.caption(f"設定檔：{saved_path}")
+                                runtime_model_settings = dict(vocab_model_settings)
+                                runtime_model_settings[ns] = current_step_models
+                                runtime_extra_model_settings = dict(vocab_extra_model_settings)
+                                runtime_extra_provider_settings = dict(vocab_extra_provider_settings)
+                                if extra_call_id and current_extra_models:
+                                    runtime_extra_model_settings[extra_call_id] = current_extra_models
+                                if extra_call_id and current_extra_provider:
+                                    runtime_extra_provider_settings[extra_call_id] = current_extra_provider
+                                step_def = apply_vocab_llm_runtime_settings(
+                                    ns,
+                                    step_def,
+                                    provider_choice,
+                                    runtime_model_settings,
+                                    runtime_extra_model_settings,
+                                    runtime_extra_provider_settings,
+                                )
+                            elif st.session_state["profile_id"] == "vocab" and script_name in vocab_image_provider_scripts:
+                                provider_options = list(VOCAB_IMAGE_PROVIDER_LABELS.keys())
+                                saved_provider = str(
+                                    vocab_image_provider_settings.get(ns)
+                                    or VOCAB_IMAGE_PROVIDER_DEFAULTS.get(ns)
+                                    or "auto"
+                                )
+                                if saved_provider not in provider_options:
+                                    saved_provider = "auto"
+                                provider_choice = st.selectbox(
+                                    "圖片 Provider",
+                                    provider_options,
+                                    index=provider_options.index(saved_provider),
+                                    key=f"pm_vocab_image_provider_{ns}",
+                                    format_func=lambda value: VOCAB_IMAGE_PROVIDER_LABELS.get(value, value),
+                                    help=(
+                                        f"No.{ns} 使用 gen_matched_preview_v4.py。auto 會先用 Gemini/Imagen，失敗後改用 OpenAI，再改用 NVIDIA；"
+                                        "NVIDIA 需要設定 CAP_STORYBOARD_NVIDIA_IMAGE_BASE_URL 與 NVIDIA_API_KEY。"
+                                    ),
+                                )
+                                current_image_model_values = {}
+                                for image_provider_key, options in VOCAB_IMAGE_MODEL_OPTIONS.items():
+                                    current_model = vocab_image_model_for_step(vocab_image_model_step_settings, ns, image_provider_key)
+                                    model_options = list(options)
+                                    if current_model not in model_options:
+                                        model_options = [current_model] + model_options
+                                    current_image_model_values[image_provider_key] = st.selectbox(
+                                        f"{image_provider_key} image model",
+                                        model_options,
+                                        index=model_options.index(current_model),
+                                        key=f"pm_vocab_image_model_{image_provider_key}_{ns}",
+                                        help=f"執行 No.{ns} 時注入 {build_storyboard_media_env({image_provider_key: current_model}, vocab_animation_settings).get('CAP_STORYBOARD_' + image_provider_key.upper() + '_IMAGE_MODEL', '對應環境變數')}。",
+                                    )
+                                st.caption("目前執行圖片 model：" + vocab_image_model_summary(current_image_model_values, provider_choice))
+                                if provider_choice == "nvidia" and not os.environ.get("CAP_STORYBOARD_NVIDIA_IMAGE_BASE_URL") and not os.environ.get("NVIDIA_IMAGE_BASE_URL"):
+                                    st.warning("NVIDIA 圖片 Provider 尚未設定 endpoint；執行前請先在 .env 補 CAP_STORYBOARD_NVIDIA_IMAGE_BASE_URL 或 NVIDIA_IMAGE_BASE_URL。")
+                                image_save_cols = st.columns([1, 1])
+                                if image_save_cols[0].button("儲存圖片 Provider", key=f"save_vocab_image_provider_{ns}"):
+                                    vocab_image_provider_settings[ns] = provider_choice
+                                    saved_path = save_profile_llm_provider_settings(
+                                        "vocab",
+                                        vocab_provider_settings,
+                                        vocab_model_settings,
+                                        vocab_image_provider_settings,
+                                        vocab_image_model_settings,
+                                        vocab_animation_settings,
+                                    )
+                                    st.success(f"No.{ns} 圖片 Provider 已儲存：{VOCAB_IMAGE_PROVIDER_LABELS.get(provider_choice, provider_choice)}")
+                                    st.caption(f"設定檔：{saved_path}")
+                                if image_save_cols[1].button("儲存圖片 Models", key=f"save_vocab_image_models_{ns}"):
+                                    vocab_image_model_step_settings[ns] = dict(current_image_model_values)
+                                    saved_path = save_profile_llm_provider_settings(
+                                        "vocab",
+                                        vocab_provider_settings,
+                                        vocab_model_settings,
+                                        vocab_image_provider_settings,
+                                        vocab_image_model_settings,
+                                        vocab_animation_settings,
+                                        image_model_step_settings=vocab_image_model_step_settings,
+                                    )
+                                    st.success("圖片 Models 已儲存。")
+                                    st.caption(f"設定檔：{saved_path}")
+                                step_def = apply_provider_arg(step_def, provider_choice)
+                                step_env = dict(step_def.get("env") or {})
+                                step_env.update(build_storyboard_media_env(current_image_model_values, vocab_animation_settings))
+                                step_def["env"] = step_env
                             show_cmd = f"{step_def['type']} {step_def['script']} {' '.join(step_def['args'])}"
                             if st.button('執行中...' if is_running else '執行子步驟', key=f"run_sub_{ns}", disabled=is_running):
                                 res = runner.start_substep(info, ns, step_def)
                                 if res.get("ok"):
                                     st.success(f"子步驟 No.{ns} 已啟動。log: {res.get('log')}")
+                                    st.rerun()
                                 else:
                                     st.error(f"子步驟 No.{ns} 啟動失敗：{res.get('message')}")
                             st.caption("將執行：" + show_cmd)
@@ -10352,8 +6836,33 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                 f"- 第{publish_substep}步 (發布) 請到 Studio & Publisher。"
             )
 
+        any_pipeline_running_for_output_tabs = (
+            any(bool(runner.get_stage_state(info, stage_no).get("running")) for stage_no in STAGE_IDS)
+            or any(bool(runner.get_substep_state(info, ns).get("running")) for ns in SUBSTEP_IDS)
+        )
+        output_tab_refresh_interval = 2 if any_pipeline_running_for_output_tabs else None
+        output_tabs_running_prev_key = f"pm_output_tabs_running_prev_{info['ep']}_{st.session_state['profile_id']}"
+        if any_pipeline_running_for_output_tabs:
+            st.session_state[output_tabs_running_prev_key] = True
+
+        def stop_output_tab_refresh_when_done():
+            latest_running = (
+                any(bool(runner.get_stage_state(info, stage_no).get("running")) for stage_no in STAGE_IDS)
+                or any(bool(runner.get_substep_state(info, ns).get("running")) for ns in SUBSTEP_IDS)
+            )
+            if st.session_state.get(output_tabs_running_prev_key) and not latest_running:
+                st.session_state[output_tabs_running_prev_key] = False
+                st.rerun()
+            st.session_state[output_tabs_running_prev_key] = latest_running
+
         with tab_prerender_pm:
-            render_prerender_workspace(info["path"])
+            @st.fragment(run_every=output_tab_refresh_interval)
+            def render_prerender_pm_fragment():
+                stop_output_tab_refresh_when_done()
+                st.button("重新載入最新預覽", key=f"refresh_prerender_pm_{info['ep']}_{st.session_state['profile_id']}")
+                render_prerender_workspace(info["path"])
+
+            render_prerender_pm_fragment()
 
         if tab_story_voice_pm is not None:
             with tab_story_voice_pm:
@@ -10370,7 +6879,16 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                 )
         if tab_storyboard_pm is not None:
             with tab_storyboard_pm:
-                render_storyboard_workspace(info, info["path"], st.session_state["profile_id"])
+                @st.fragment(run_every=output_tab_refresh_interval)
+                def render_storyboard_pm_fragment():
+                    stop_output_tab_refresh_when_done()
+                    label = "重新載入最新分鏡"
+                    if st.session_state["profile_id"] == "vocab":
+                        label = "重新載入最新分鏡/單字卡"
+                    st.button(label, key=f"refresh_storyboard_pm_{info['ep']}_{st.session_state['profile_id']}")
+                    render_storyboard_workspace(info, info["path"], st.session_state["profile_id"])
+
+                render_storyboard_pm_fragment()
 
         with st.expander(f"{STAGE_RANGE_LABEL} 與 {SUBSTEP_MIN}–{SUBSTEP_MAX} 對應關係", expanded=False):
             substep_name_map = {str(getattr(s, "no", "")): getattr(s, "name", "") for s in substeps_map}
@@ -10437,6 +6955,7 @@ elif section == "🎬 Studio & Publisher":
         ep_path = info["path"]
         audio_path = audio_merged_path(ep_path)
         video_path = video_output_path(ep_path)
+        video_candidates = publish_video_candidates(ep_path)
         cover_path = images_dir(ep_path) / "cover.png"
         cover_cute_path = images_dir(ep_path) / "cover_cute.png"
         subtitle_path = subtitles_fixed_path(ep_path)
@@ -10450,7 +6969,7 @@ elif section == "🎬 Studio & Publisher":
         upload_state = publisher_task_state(info, "upload")
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("影片", "就緒" if video_path.exists() else "缺少")
+        c1.metric("影片", "就緒" if video_candidates or video_path.exists() else "缺少")
         c2.metric("封面", "就緒" if cover_path.exists() else "缺少")
         c3.metric("字幕", "就緒" if subtitle_path.exists() else "缺少")
         c4.metric("Metadata", "就緒" if meta_path and meta_path.exists() else "缺少")
@@ -10458,8 +6977,8 @@ elif section == "🎬 Studio & Publisher":
         st.caption(f"Episode Path: {ep_path}")
 
         profile_id = st.session_state["profile_id"]
-        tab_preview, tab_meta, tab_publish, tab_logs = st.tabs(
-            ["預覽", "Metadata", "發布", "Log"]
+        tab_preview, tab_meta, tab_publish, tab_posts, tab_logs = st.tabs(
+            ["預覽", "Metadata", "發布 Videos", "發布 Posts", "Log"]
         )
 
         with tab_preview:
@@ -10487,10 +7006,38 @@ elif section == "🎬 Studio & Publisher":
                     )
             with pv2:
                 st.subheader("影片")
-                if video_path.exists():
-                    st.caption(f"{video_path.name} | {video_path.stat().st_size / (1024 * 1024):.1f} MB")
+                preview_video_options = [item["filename"] for item in video_candidates]
+                if not preview_video_options and video_path.exists():
+                    preview_video_options = [video_path.name]
+                preview_video_label_map = {
+                    item["filename"]: (
+                        f"{item['label']} - {item['filename']} "
+                        f"({item['path'].stat().st_size / (1024 * 1024):.1f} MB)"
+                    )
+                    for item in video_candidates
+                }
+                default_preview_video = (
+                    "final_video_with_outro.mp4"
+                    if "final_video_with_outro.mp4" in preview_video_options
+                    else (preview_video_options[0] if preview_video_options else "")
+                )
+                if preview_video_options:
+                    preview_video_name = st.selectbox(
+                        "預覽影片版本",
+                        preview_video_options,
+                        index=preview_video_options.index(default_preview_video),
+                        format_func=lambda name: preview_video_label_map.get(name, name),
+                        key=f"studio_preview_video_name_{info['ep']}_{st.session_state['profile_id']}",
+                    )
+                    preview_video_path = ep_path / "05_output" / Path(preview_video_name).name
+                else:
+                    preview_video_path = video_path
+                if preview_video_path.exists():
+                    st.caption(f"{preview_video_path.name} | {preview_video_path.stat().st_size / (1024 * 1024):.1f} MB")
+                    if video_candidates:
+                        st.caption("可用版本：" + "、".join(f"{item['label']}({item['filename']})" for item in video_candidates))
                     with st.expander("展開影片預覽", expanded=False):
-                        st.video(str(video_path))
+                        st.video(str(preview_video_path))
                 else:
                     st.caption("尚未找到 final_video.mp4。")
             st.caption("此頁為輕量預覽：封面使用壓縮預覽，影片改為手動展開載入。")
@@ -10521,6 +7068,11 @@ elif section == "🎬 Studio & Publisher":
                     )
                 else:
                     st.caption("目前尚無校對字幕；可直接在上方貼上內容後儲存建立。")
+                render_subtitle_compare_panel(
+                    ep_path,
+                    key_prefix=f"studio_subtitle_compare_{info['ep']}_{st.session_state['profile_id']}",
+                    expanded=False,
+                )
             with a2:
                 st.subheader("Metadata 摘要")
                 if meta_data:
@@ -11157,12 +7709,13 @@ elif section == "🎬 Studio & Publisher":
         with tab_publish:
             st.subheader("YouTube 上傳")
             meta_running = bool(meta_state.get("running"))
-            ready_to_upload = bool(video_path.exists() and meta_path and meta_path.exists() and not meta_running)
+            video_candidates = publish_video_candidates(ep_path)
+            ready_to_upload = bool(video_candidates and meta_path and meta_path.exists() and not meta_running)
             if not ready_to_upload:
                 if meta_running:
                     st.warning("Metadata 仍在生成中。上傳只會使用既有 youtube_meta.json，請等待 Metadata 任務完成後再上傳。")
                 else:
-                    st.warning("上傳前至少需要 final_video.mp4 與 youtube_meta.json。")
+                    st.warning("上傳前至少需要可上傳影片與 youtube_meta.json。")
             if not subtitle_path.exists():
                 st.caption("提醒：找不到校對字幕，上傳時會略過字幕。")
             upload_status = upload_record.get("status")
@@ -11195,10 +7748,12 @@ elif section == "🎬 Studio & Publisher":
             publish_time_key = f"studio_publish_time_{info['ep']}"
             playlist_key = f"studio_playlist_{info['ep']}"
             cover_key = f"studio_cover_name_{info['ep']}"
+            video_name_key = f"studio_video_name_{info['ep']}"
 
             publish_dt = parse_publish_at_value(str(publish_defaults.get("publish_at", "")))
             default_playlist_id = str(publish_defaults.get("playlist_id", "")).strip()
             default_playlist_id = resolve_default_playlist_id(playlist_options, default_playlist_id)
+            default_video_name = default_publish_video_name(ep_path, publish_defaults)
 
             if st.session_state.get(publish_state_marker_key) != publish_state_marker:
                 st.session_state[privacy_key] = str(publish_defaults.get("privacy", "private") or "private")
@@ -11207,6 +7762,7 @@ elif section == "🎬 Studio & Publisher":
                 st.session_state[publish_time_key] = (publish_dt or datetime.now().replace(second=0, microsecond=0)).time()
                 st.session_state[playlist_key] = default_playlist_id
                 st.session_state[cover_key] = str(publish_defaults.get("cover_name", "cover.png") or "cover.png")
+                st.session_state[video_name_key] = default_video_name
                 st.session_state[publish_state_marker_key] = publish_state_marker
 
             privacy_opts = ["private", "unlisted", "public"]
@@ -11230,6 +7786,28 @@ elif section == "🎬 Studio & Publisher":
                 ["cover.png", "cover_cute.png"],
                 key=cover_key,
             )
+            video_options = [item["filename"] for item in video_candidates] or ["final_video.mp4"]
+            current_video_name = st.session_state.get(video_name_key, default_video_name)
+            if current_video_name not in video_options:
+                current_video_name = video_options[0]
+                st.session_state[video_name_key] = current_video_name
+            video_label_map = {
+                item["filename"]: (
+                    f"{item['label']} - {item['filename']} "
+                    f"({item['path'].stat().st_size / (1024 * 1024):.1f} MB)"
+                )
+                for item in video_candidates
+            }
+            video_name_val = st.selectbox(
+                "上傳影片版本",
+                video_options,
+                index=video_options.index(current_video_name),
+                format_func=lambda name: video_label_map.get(name, name),
+                key=video_name_key,
+            )
+            selected_upload_video_path = ep_path / "05_output" / Path(video_name_val).name
+            if selected_upload_video_path.exists():
+                st.caption(f"將上傳：{selected_upload_video_path}")
 
             publish_at = f"{publish_date.isoformat()} {publish_time.strftime('%H:%M')}" if schedule_on else ""
             save_cols = st.columns([1, 1.4, 2.2])
@@ -11245,6 +7823,7 @@ elif section == "🎬 Studio & Publisher":
                             "publish_at": publish_at,
                             "playlist_id": selected_playlist_id,
                             "cover_name": cover_name_val,
+                            "video_name": video_name_val,
                         },
                     )
                     st.success(f"已儲存發布設定：{saved_publish_path}")
@@ -11256,7 +7835,16 @@ elif section == "🎬 Studio & Publisher":
                 else:
                     st.caption("目前不加入播放清單。")
 
-            upload_args = ["--ep", str(info["ep"]), "--privacy", privacy_val, "--cover_name", cover_name_val]
+            upload_args = [
+                "--ep",
+                str(info["ep"]),
+                "--privacy",
+                privacy_val,
+                "--cover_name",
+                cover_name_val,
+                "--video_name",
+                Path(video_name_val).name,
+            ]
 
             if schedule_on:
                 upload_args += ["--publish_at", publish_at]
@@ -11292,6 +7880,130 @@ elif section == "🎬 Studio & Publisher":
                 st.json(upload_record)
                 if upload_record.get("video_id"):
                     st.markdown(f"[開啟 YouTube 影片](https://www.youtube.com/watch?v={upload_record['video_id']})")
+
+        with tab_posts:
+            st.subheader("YouTube Posts 草稿與排程")
+            st.info("YouTube Data API 目前沒有公開的 Community Posts 建立/排程 endpoint。此分頁先整理 Posts 內容與發布時程，供手動貼到 YouTube Studio。")
+            cloze_rows = load_cloze_question_rows(ep_path)
+            saved_post_settings = load_post_publish_settings(ep_path)
+            if not cloze_rows:
+                st.warning("尚未找到克漏字題目。請先執行 No.5 產生 cloze_questions.csv / json。")
+            else:
+                saved_selected_ids = {
+                    str(item).strip()
+                    for item in saved_post_settings.get("selected_question_ids", [])
+                    if str(item).strip()
+                }
+                if not saved_selected_ids and cloze_rows:
+                    saved_selected_ids = {cloze_question_id(cloze_rows[0], 1)}
+
+                post_table_rows = []
+                for idx, row in enumerate(cloze_rows, start=1):
+                    qid = cloze_question_id(row, idx)
+                    post_table_rows.append({
+                        "發布": qid in saved_selected_ids,
+                        "題號": qid,
+                        "單字": str(row.get("word", "") or row.get("correct_word", "") or "").strip(),
+                        "題目": str(row.get("blank_sentence", "") or row.get("question", "") or "").strip(),
+                        "A": str(row.get("choice_A", "") or row.get("A", "") or "").strip(),
+                        "B": str(row.get("choice_B", "") or row.get("B", "") or "").strip(),
+                        "C": str(row.get("choice_C", "") or row.get("C", "") or "").strip(),
+                        "D": str(row.get("choice_D", "") or row.get("D", "") or "").strip(),
+                        "答案": str(row.get("correct_option", "") or "").strip(),
+                    })
+
+                edited_posts_df = st.data_editor(
+                    pd.DataFrame(post_table_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    disabled=["題號", "單字", "題目", "A", "B", "C", "D", "答案"],
+                    column_config={
+                        "發布": st.column_config.CheckboxColumn("發布"),
+                        "題目": st.column_config.TextColumn(width="large"),
+                    },
+                    key=f"studio_posts_questions_{info['ep']}_{profile_id}",
+                )
+
+                selected_ids = [
+                    str(row.get("題號", "")).strip()
+                    for row in edited_posts_df.to_dict("records")
+                    if bool(row.get("發布")) and str(row.get("題號", "")).strip()
+                ]
+                selected_cloze_rows = [
+                    row
+                    for idx, row in enumerate(cloze_rows, start=1)
+                    if cloze_question_id(row, idx) in set(selected_ids)
+                ]
+
+                post_publish_dt = parse_publish_at_value(str(saved_post_settings.get("publish_at", "")))
+                posts_marker_key = f"studio_posts_loaded_{profile_id}"
+                posts_marker = f"{profile_id}:{info['ep']}"
+                posts_schedule_key = f"studio_posts_schedule_{info['ep']}"
+                posts_date_key = f"studio_posts_date_{info['ep']}"
+                posts_time_key = f"studio_posts_time_{info['ep']}"
+                posts_text_key = f"studio_posts_text_{info['ep']}"
+
+                generated_post_text = build_cloze_post_text(int(info["ep"]), selected_cloze_rows)
+                if st.session_state.get(posts_marker_key) != posts_marker:
+                    st.session_state[posts_schedule_key] = bool(saved_post_settings.get("schedule_on")) or bool(post_publish_dt)
+                    st.session_state[posts_date_key] = (post_publish_dt or datetime.now()).date()
+                    st.session_state[posts_time_key] = (post_publish_dt or datetime.now().replace(second=0, microsecond=0)).time()
+                    st.session_state[posts_text_key] = str(saved_post_settings.get("post_text", "") or generated_post_text)
+                    st.session_state[posts_marker_key] = posts_marker
+
+                if st.button("用勾選題目重建貼文", key=f"studio_posts_rebuild_{info['ep']}"):
+                    st.session_state[posts_text_key] = generated_post_text
+                    st.rerun()
+
+                posts_schedule_on = st.checkbox("排程發布 Posts", key=posts_schedule_key)
+                posts_sched_cols = st.columns(2)
+                with posts_sched_cols[0]:
+                    posts_publish_date = st.date_input("Posts 發布日期", key=posts_date_key, disabled=not posts_schedule_on)
+                with posts_sched_cols[1]:
+                    posts_publish_time = st.time_input("Posts 發布時間", key=posts_time_key, disabled=not posts_schedule_on)
+
+                st.text_area(
+                    "Posts 文字草稿",
+                    key=posts_text_key,
+                    height=260,
+                    help="可直接複製到 YouTube Studio 的 Community Post。",
+                )
+                render_copy_button(
+                    st.session_state.get(posts_text_key, ""),
+                    key=f"studio_posts_copy_{info['ep']}_{profile_id}",
+                    label="快速複製 Posts 草稿",
+                )
+
+                posts_publish_at = (
+                    f"{posts_publish_date.isoformat()} {posts_publish_time.strftime('%H:%M')}"
+                    if posts_schedule_on else ""
+                )
+                posts_save_cols = st.columns([1, 2.6])
+                with posts_save_cols[0]:
+                    save_posts = st.button("儲存 Posts 設定", key=f"studio_save_posts_{info['ep']}")
+                with posts_save_cols[1]:
+                    st.caption(f"已選 {len(selected_ids)} 題；發布時間以 Asia/Taipei 記錄。")
+                if save_posts:
+                    saved_posts_path = save_post_publish_settings(
+                        ep_path,
+                        {
+                            "platform": "youtube_community_posts",
+                            "api_available": False,
+                            "api_note": "YouTube Data API has no public endpoint for creating or scheduling Community Posts.",
+                            "schedule_on": bool(posts_schedule_on),
+                            "publish_at": posts_publish_at,
+                            "selected_question_ids": selected_ids,
+                            "post_text": st.session_state.get(posts_text_key, ""),
+                        },
+                    )
+                    st.success(f"已儲存 Posts 設定：{saved_posts_path}")
+                    st.rerun()
+
+                if saved_post_settings:
+                    st.divider()
+                    st.caption(f"目前儲存檔：{post_publish_settings_path(ep_path)}")
+                    st.json(saved_post_settings)
 
         with tab_logs:
             if st.button("重新整理發布 Log", key="studio_refresh_logs"):

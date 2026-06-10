@@ -8,9 +8,13 @@ import srt
 from dotenv import load_dotenv
 
 
-VALID_PROVIDERS = {"auto", "gemini", "openai"}
+VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
 GEMINI_MODEL = os.getenv("CAP_SHORT_SUBTITLE_GEMINI_MODEL", os.getenv("CAP_TEXT_MODEL", "gemini-2.5-pro"))
 OPENAI_MODEL = os.getenv("CAP_SHORT_SUBTITLE_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
+NVIDIA_MODEL = os.getenv(
+    "CAP_SHORT_SUBTITLE_NVIDIA_MODEL",
+    os.getenv("CAP_SUBTITLE_REVIEW_NVIDIA_MODEL", os.getenv("CAP_NVIDIA_TEXT_MODEL", "nvidia/nemotron-3-nano-30b-a3b")),
+)
 
 
 def normalize_provider(value: str | None) -> str:
@@ -242,6 +246,17 @@ def review_with_openai(prompt: str) -> str:
     return str(response.output_text or "")
 
 
+def review_with_nvidia(prompt: str) -> str:
+    from llm_provider_utils import nvidia_chat_response
+
+    print(f"[INFO] provider=nvidia model={NVIDIA_MODEL}", flush=True)
+    return nvidia_chat_response(
+        prompt,
+        model=NVIDIA_MODEL,
+        system_prompt="You proofread subtitles and output valid SRT only.",
+    )
+
+
 def is_gemini_quota_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "resource_exhausted" in text or "quota" in text or "spending cap" in text or "rate limit" in text
@@ -277,6 +292,13 @@ def review_subtitles(input_srt: Path, output_srt: Path, provider: str) -> Path:
             cleaned = review_with_openai(prompt)
         except Exception as exc:
             errors.append(f"OpenAI: {exc}")
+            raise RuntimeError("; ".join(errors)) from exc
+
+    if not cleaned and provider == "nvidia":
+        try:
+            cleaned = review_with_nvidia(prompt)
+        except Exception as exc:
+            errors.append(f"NVIDIA: {exc}")
             raise RuntimeError("; ".join(errors)) from exc
 
     if not cleaned:

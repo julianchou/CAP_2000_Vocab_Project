@@ -136,7 +136,7 @@ def summarize_batch_status(
     return "error"
 
 
-def run_batch_animation_for_episode(ep_num: int) -> str:
+def run_batch_animation_for_episode(ep_num: int, provider: str = "gemini") -> str:
     episode_folder, storyboard_csv, scene_rows = collect_ai_scene_rows(ep_num)
 
     print("===== BATCH ANIMATION START =====")
@@ -185,7 +185,7 @@ def run_batch_animation_for_episode(ep_num: int) -> str:
             print(f"PROMPT RESULT scene_id={scene_id} status=ok")
 
             print(f"STEP B generate animation video scene_id={scene_id}")
-            output_path = generate_scene_animation(ep_num, scene_id)
+            output_path = generate_scene_animation(ep_num, scene_id, provider=provider)
             animation_success_ids.append(scene_id)
             row["animation_video_path"] = str(output_path).replace("\\", "/")
             if set_scene_animation_default(storyboard_csv, scene_id, output_path):
@@ -240,9 +240,10 @@ def run_batch_animation_for_episode(ep_num: int) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch-generate animations for all AI scenes in one episode")
     parser.add_argument("--ep", type=int, required=True)
+    parser.add_argument("--provider", default="gemini", choices=["gemini", "openai"])
     args = parser.parse_args()
 
-    status = run_batch_animation_for_episode(args.ep)
+    status = run_batch_animation_for_episode(args.ep, provider=args.provider)
     if status == "error":
         raise SystemExit(1)
 

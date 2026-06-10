@@ -33,6 +33,32 @@ def resolve_asset(ep_dir: Path, value: str) -> Path | None:
     return path
 
 
+def scene_asset_candidates(ep_dir: Path, scene_no: int, kind: str) -> list[Path]:
+    base_dir = ep_dir / "04_images" / ("storyboard" if kind == "image" else "animations")
+    patterns = ["*.png", "*.jpg", "*.jpeg", "*.webp"] if kind == "image" else ["*.mp4", "*.mov", "*.webm", "*.m4v"]
+    tokens = [f"{scene_no:03d}", str(scene_no)]
+    candidates = []
+    for token in dict.fromkeys(tokens):
+        for pattern in patterns:
+            suffix = Path(pattern).suffix
+            candidates.extend(sorted(base_dir.glob(f"scene_{token}{suffix}")))
+            candidates.extend(sorted(base_dir.glob(f"scene_{token}_*{suffix}")))
+    valid = [path for path in candidates if path.exists() and path.is_file() and path.stat().st_size > 0]
+    return sorted(
+        valid,
+        key=lambda path: (
+            0 if "_upload_" in path.name.lower() else 1,
+            -path.stat().st_mtime,
+            path.name.lower(),
+        ),
+    )
+
+
+def fallback_scene_asset(ep_dir: Path, scene_no: int, kind: str) -> Path | None:
+    candidates = scene_asset_candidates(ep_dir, scene_no, kind)
+    return candidates[0] if candidates else None
+
+
 def rel_path(ep_dir: Path, path: Path | None) -> str:
     if not path:
         return ""
@@ -112,6 +138,10 @@ def build_compose_list(ep_dir: Path, storyboard_path: Path, output_path: Path) -
         scene_no = int(scene.get("scene", scene.get("scene_id", idx)) or idx)
         image_path = resolve_asset(ep_dir, str(scene.get("asset", "") or scene.get("image_asset", "")))
         animation_path = resolve_asset(ep_dir, str(scene.get("animation_asset", "") or scene.get("animation_video_path", "")))
+        if not image_path or not image_path.exists():
+            image_path = fallback_scene_asset(ep_dir, scene_no, "image")
+        if not animation_path or not animation_path.exists():
+            animation_path = fallback_scene_asset(ep_dir, scene_no, "animation")
         chosen_visual = animation_path if animation_path and animation_path.exists() else image_path
         visual_type = "animation" if animation_path and animation_path.exists() else "image"
         start_seconds = parse_seconds(scene, "start_seconds", 0)

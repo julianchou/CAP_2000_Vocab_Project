@@ -19,9 +19,10 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options={"api_ve
 MODEL_ID = os.getenv("CAP_CLOZE_MODEL", "gemini-2.5-flash")
 REVIEW_MODEL_ID = os.getenv("CAP_CLOZE_REVIEW_MODEL", "gemini-2.5-flash")
 OPENAI_MODEL_ID = os.getenv("CAP_CLOZE_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
-OPENAI_REVIEW_MODEL_ID = os.getenv("CAP_CLOZE_OPENAI_REVIEW_MODEL", OPENAI_MODEL_ID)
+OPENAI_REVIEW_MODEL_ID = os.getenv("CAP_CLOZE_OPENAI_REVIEW_MODEL", os.getenv("OPENAI_REVIEW_MODEL", "gpt-4o-mini"))
 NVIDIA_MODEL_ID = os.getenv("CAP_CLOZE_NVIDIA_MODEL", DEFAULT_NVIDIA_TEXT_MODEL)
 VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
+VALID_REVIEW_PROVIDERS = {"auto", "gemini", "openai"}
 base_dir = Path(__file__).resolve().parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 OPTION_LABELS = ["A", "B", "C", "D"]
@@ -30,6 +31,11 @@ OPTION_LABELS = ["A", "B", "C", "D"]
 def normalize_provider(value: str | None) -> str:
     provider = str(value or os.getenv("CAP_CLOZE_LLM_PROVIDER") or "auto").strip().lower()
     return provider if provider in VALID_PROVIDERS else "auto"
+
+
+def normalize_review_provider(value: str | None) -> str:
+    provider = str(value or os.getenv("CAP_CLOZE_REVIEW_PROVIDER") or "auto").strip().lower()
+    return provider if provider in VALID_REVIEW_PROVIDERS else "auto"
 
 
 def is_gemini_quota_error(exc: Exception) -> bool:
@@ -333,7 +339,10 @@ def render_prompt(template_text: str, ep_num: int, start_word: int, end_word: in
 
 
 def parse_ai_questions(text: str) -> list[dict]:
-    payload = json.loads(extract_json_text(text))
+    json_text = extract_json_text(text)
+    if not json_text:
+        raise ValueError("AI response was empty; no JSON questions were returned")
+    payload = json.loads(json_text)
     if isinstance(payload, dict):
         questions = payload.get("questions")
         if isinstance(questions, list):
@@ -377,9 +386,9 @@ def generate_questions_with_ai(rendered_prompt: str, provider: str) -> list[dict
             if provider == "gemini":
                 raise
             if is_gemini_quota_error(exc):
-                print("WARN Gemini quota/spending cap exhausted; switching cloze generation to OpenAI.", flush=True)
+                print("WARN Gemini quota/spending cap exhausted; switching cloze generation to OpenAI, then NVIDIA if needed.", flush=True)
             else:
-                print(f"WARN Gemini cloze generation failed; switching to OpenAI: {message}", flush=True)
+                print(f"WARN Gemini cloze generation failed; switching to OpenAI, then NVIDIA if needed: {message}", flush=True)
     if provider in {"auto", "openai"}:
         try:
             questions = generate_questions_with_openai(rendered_prompt)
@@ -388,7 +397,7 @@ def generate_questions_with_ai(rendered_prompt: str, provider: str) -> list[dict
         except Exception as exc:
             errors.append(f"OpenAI: {exc}")
             print(f"ERROR OpenAI cloze generation failed: {exc}", flush=True)
-    if provider == "nvidia":
+    if provider in {"auto", "nvidia"}:
         try:
             questions = generate_questions_with_nvidia(rendered_prompt)
             print(f"cloze_provider=nvidia model={NVIDIA_MODEL_ID} questions={len(questions)}")
@@ -486,7 +495,7 @@ def review_question_uniqueness_with_openai(raw_item: dict, row: pd.Series, corre
 
 def review_question_uniqueness(raw_item: dict, row: pd.Series, provider: str) -> dict:
     correct_option = str(raw_item.get("correct_option", "")).strip().upper()
-    provider = normalize_provider(provider)
+    provider = normalize_review_provider(provider)
     errors = []
     if provider in {"auto", "gemini"}:
         try:
@@ -575,12 +584,19 @@ def validate_ai_question(raw_item: dict, fallback: dict, row: pd.Series) -> list
     return reasons
 
 
-def normalize_ai_question(ep_num: int, idx: int, row: pd.Series, df: pd.DataFrame, raw_item: dict | None, provider: str) -> dict:
+def normalize_ai_question(
+    ep_num: int,
+    idx: int,
+    row: pd.Series,
+    df: pd.DataFrame,
+    raw_item: dict | None,
+    review_provider: str,
+) -> dict:
     fallback = deterministic_fallback_question(ep_num, idx, row, df)
     raw_item = raw_item or {}
     reasons = validate_ai_question(raw_item, fallback, row) if raw_item else ["missing_ai_item"]
     if not reasons:
-        review = review_question_uniqueness(raw_item, row, provider)
+        review = review_question_uniqueness(raw_item, row, review_provider)
         if review.get("verdict") != "unique":
             plausible = review.get("plausible_options") or []
             plausible_suffix = f"_{'-'.join(plausible)}" if plausible else ""
@@ -622,12 +638,12 @@ def normalize_ai_question(ep_num: int, idx: int, row: pd.Series, df: pd.DataFram
     }
 
 
-def build_question_rows(ep_num: int, df: pd.DataFrame, ai_questions: list[dict], provider: str) -> list[dict]:
+def build_question_rows(ep_num: int, df: pd.DataFrame, ai_questions: list[dict], review_provider: str) -> list[dict]:
     rows = []
     ai_questions = ai_questions or []
     for idx, (_, row) in enumerate(df.iterrows(), start=1):
         raw_item = ai_questions[idx - 1] if idx - 1 < len(ai_questions) else None
-        rows.append(normalize_ai_question(ep_num, idx, row, df, raw_item, provider))
+        rows.append(normalize_ai_question(ep_num, idx, row, df, raw_item, review_provider))
     return rows
 
 
@@ -648,10 +664,17 @@ def main():
         "--provider",
         choices=sorted(VALID_PROVIDERS),
         default=os.getenv("CAP_CLOZE_LLM_PROVIDER", "auto"),
-        help="LLM provider: auto tries Gemini first, then falls back to OpenAI.",
+        help="LLM provider: auto tries Gemini first, then OpenAI, then NVIDIA.",
+    )
+    parser.add_argument(
+        "--review-provider",
+        choices=sorted(VALID_REVIEW_PROVIDERS),
+        default=os.getenv("CAP_CLOZE_REVIEW_PROVIDER", "auto"),
+        help="Review LLM provider: auto tries Gemini first, then OpenAI.",
     )
     args = parser.parse_args()
     provider = normalize_provider(args.provider)
+    review_provider = normalize_review_provider(args.review_provider)
 
     episode_folder, start_word, end_word = resolve_episode_range(workspace_dir, args.ep)
     storyboard_dir = episode_folder / "03_storyboards"
@@ -663,14 +686,22 @@ def main():
     prompt_template = prompt_path.read_text(encoding="utf-8")
     rendered_prompt = render_prompt(prompt_template, args.ep, start_word, end_word, vocab_df)
     print(
-        f"cloze_llm_provider={provider} gemini_model={MODEL_ID} "
+        f"cloze_llm_provider={provider} review_provider={review_provider} "
+        f"gemini_model={MODEL_ID} "
         f"openai_model={OPENAI_MODEL_ID} nvidia_model={NVIDIA_MODEL_ID} "
         f"review_gemini_model={REVIEW_MODEL_ID} "
         f"review_openai_model={OPENAI_REVIEW_MODEL_ID}",
         flush=True,
     )
-    ai_questions = generate_questions_with_ai(rendered_prompt, provider)
-    questions = build_question_rows(args.ep, vocab_df, ai_questions, provider)
+    try:
+        ai_questions = generate_questions_with_ai(rendered_prompt, provider)
+    except Exception as exc:
+        print(
+            f"WARN AI cloze generation unavailable; using deterministic fallback questions: {exc}",
+            flush=True,
+        )
+        ai_questions = []
+    questions = build_question_rows(args.ep, vocab_df, ai_questions, review_provider)
     save_questions(storyboard_dir, questions)
 
 

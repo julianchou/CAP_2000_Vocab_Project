@@ -10,6 +10,7 @@ from pathlib import Path
 MODEL_SIZE = "medium"
 SOFT_LIMIT = 18 
 PUNCTUATIONS = ['，', '。', '！', '？', '、', ',', '.', '!', '?']
+LATIN_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 # 專案路徑設定
 base_dir = Path(__file__).parent.parent
@@ -19,6 +20,16 @@ if str(base_dir) not in sys.path:
 from app_utils.power import keep_system_awake
 
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
+
+def should_insert_space(previous_text: str, next_word: str) -> bool:
+    if not previous_text or not next_word:
+        return False
+    return previous_text[-1] in LATIN_CHARS and next_word[0] in LATIN_CHARS
+
+def append_subtitle_word(current_text: str, clean_word: str) -> str:
+    if should_insert_space(current_text, clean_word):
+        return f"{current_text} {clean_word}"
+    return f"{current_text}{clean_word}"
 
 def generate_optimized_subtitles(ep_num):
     # 尋找對應的集數資料夾
@@ -57,7 +68,7 @@ def generate_optimized_subtitles(ep_num):
         for i, word_info in enumerate(words):
             if start_time is None: start_time = word_info['start']
             clean_word = word_info['word'].strip()
-            current_text += clean_word
+            current_text = append_subtitle_word(current_text, clean_word)
             
             has_punctuation = any(p in clean_word for p in PUNCTUATIONS)
             if has_punctuation or len(current_text) >= SOFT_LIMIT or i == len(words) - 1:

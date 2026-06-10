@@ -95,7 +95,7 @@ def main() -> int:
             return 1
 
         stage_id = str(job.get("stage_id", "")).strip()
-        episodes = [int(x) for x in (job.get("episodes") or [])]
+        episodes = sorted(int(x) for x in (job.get("episodes") or []))
         schedule_at_text = str(job.get("schedule_at", "")).strip()
         schedule_at = datetime.fromisoformat(schedule_at_text) if schedule_at_text else datetime.now()
         stages_path = Path(args.stages_path) if args.stages_path else None

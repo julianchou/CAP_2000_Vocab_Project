@@ -5,6 +5,7 @@ import mimetypes
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -15,6 +16,7 @@ if str(BASE_DIR) not in sys.path:
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from PIL import Image
 from generate_animation_prompt import fallback_prompt
 from app_utils.asset_tags import tag_asset_from_row
 
@@ -23,7 +25,14 @@ load_dotenv()
 
 client = genai.Client()
 WORKSPACE_DIR = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(BASE_DIR / "workspace")))
+VALID_ANIMATION_PROVIDERS = {"gemini", "openai"}
+ANIMATION_PROVIDER = os.environ.get("CAP_ANIMATION_PROVIDER", "gemini")
 VIDEO_MODEL = os.environ.get("CAP_ANIMATION_MODEL", "veo-2.0-generate-001")
+OPENAI_VIDEO_MODEL = os.environ.get("CAP_OPENAI_VIDEO_MODEL", "sora-2")
+OPENAI_VIDEO_SIZE = os.environ.get("CAP_OPENAI_VIDEO_SIZE", "1280x720")
+OPENAI_VIDEO_POLL_SECONDS = int(os.environ.get("CAP_OPENAI_VIDEO_POLL_SECONDS", "10"))
+OPENAI_VIDEO_HTTP_RETRIES = int(os.environ.get("CAP_OPENAI_VIDEO_HTTP_RETRIES", "5"))
+OPENAI_VIDEO_HTTP_RETRY_SECONDS = int(os.environ.get("CAP_OPENAI_VIDEO_HTTP_RETRY_SECONDS", "10"))
 POLL_SECONDS = int(os.environ.get("CAP_ANIMATION_POLL_SECONDS", "10"))
 DEFAULT_ANIMATION_SECONDS = int(os.environ.get("CAP_ANIMATION_SECONDS", "5"))
 PERSON_GENERATION = os.environ.get("CAP_ANIMATION_PERSON_GENERATION", "allow_adult")
@@ -388,7 +397,165 @@ def build_generate_videos_config(duration_seconds: int) -> types.GenerateVideosC
         return types.GenerateVideosConfig(**base_kwargs)
 
 
-def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: str = "") -> Path:
+def normalize_animation_provider(value: str | None) -> str:
+    provider = str(value or ANIMATION_PROVIDER or "gemini").strip().lower()
+    return provider if provider in VALID_ANIMATION_PROVIDERS else "gemini"
+
+
+def openai_sora_seconds(duration_seconds: int) -> str:
+    if duration_seconds <= 4:
+        return "4"
+    return "8"
+
+
+def parse_video_size(size_text: str) -> tuple[int, int]:
+    try:
+        width_text, height_text = str(size_text or "").lower().split("x", 1)
+        width = int(width_text.strip())
+        height = int(height_text.strip())
+    except Exception as exc:
+        raise SceneAnimationError(f"Invalid CAP_OPENAI_VIDEO_SIZE: {size_text}") from exc
+    if width <= 0 or height <= 0:
+        raise SceneAnimationError(f"Invalid CAP_OPENAI_VIDEO_SIZE: {size_text}")
+    return width, height
+
+
+def prepare_openai_reference_image(image_path: Path, size_text: str) -> Path:
+    target_size = parse_video_size(size_text)
+    tmp = tempfile.NamedTemporaryFile(prefix="sora_ref_", suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            if img.size != target_size:
+                print(f"resize_openai_reference_image={img.size}->{target_size}")
+                img = img.resize(target_size, Image.Resampling.LANCZOS)
+            img.save(tmp_path, "PNG")
+        return tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def request_with_retries(method: str, url: str, **kwargs):
+    import requests
+
+    attempts = max(1, OPENAI_VIDEO_HTTP_RETRIES)
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.request(method, url, **kwargs)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            print(
+                f"WARN openai_video_http_retry method={method} attempt={attempt}/{attempts} "
+                f"wait_seconds={OPENAI_VIDEO_HTTP_RETRY_SECONDS} error={exc}"
+            )
+            time.sleep(OPENAI_VIDEO_HTTP_RETRY_SECONDS)
+    raise SceneAnimationError(f"OpenAI Sora HTTP request failed after {attempts} attempts: {last_exc}") from last_exc
+
+
+def generate_openai_video_bytes(animation_prompt: str, image_path: Path, duration_seconds: int) -> bytes:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise SceneAnimationError("OPENAI_API_KEY is not configured")
+
+    seconds = os.environ.get("CAP_OPENAI_VIDEO_SECONDS") or openai_sora_seconds(duration_seconds)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    reference_path = prepare_openai_reference_image(image_path, OPENAI_VIDEO_SIZE)
+    try:
+        with reference_path.open("rb") as image_file:
+            response = request_with_retries(
+                "POST",
+                "https://api.openai.com/v1/videos",
+                headers=headers,
+                data={
+                    "model": OPENAI_VIDEO_MODEL,
+                    "prompt": animation_prompt,
+                    "size": OPENAI_VIDEO_SIZE,
+                    "seconds": seconds,
+                },
+                files={
+                    "input_reference": (
+                        reference_path.name,
+                        image_file,
+                        "image/png",
+                    )
+                },
+                timeout=120,
+            )
+    finally:
+        try:
+            reference_path.unlink()
+        except FileNotFoundError:
+            pass
+    if response.status_code >= 400:
+        raise SceneAnimationError(f"OpenAI Sora submit failed: {response.status_code} {response.text[:1000]}")
+
+    video_job = response.json()
+    video_id = str(video_job.get("id") or "").strip()
+    if not video_id:
+        raise SceneAnimationError(f"OpenAI Sora response missing id: {video_job}")
+
+    log_kv("openai_video_id", video_id)
+    log_kv("openai_video_model", OPENAI_VIDEO_MODEL)
+    log_kv("openai_video_size", OPENAI_VIDEO_SIZE)
+    log_kv("openai_video_seconds", seconds)
+    return download_openai_video_bytes(video_id, headers)
+
+
+def download_openai_video_bytes(video_id: str, headers: dict) -> bytes:
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        raise SceneAnimationError("OpenAI Sora video id is empty")
+
+    video_job = {"status": "in_progress", "id": video_id}
+    log_kv("openai_video_id", video_id)
+
+    while str(video_job.get("status", "")).lower() in {"queued", "in_progress"}:
+        log_kv("openai_video_status", video_job.get("status"))
+        log_kv("openai_video_progress", video_job.get("progress"))
+        time.sleep(OPENAI_VIDEO_POLL_SECONDS)
+        status_response = request_with_retries(
+            "GET",
+            f"https://api.openai.com/v1/videos/{video_id}",
+            headers=headers,
+            timeout=120,
+        )
+        if status_response.status_code >= 400:
+            raise SceneAnimationError(f"OpenAI Sora status failed: {status_response.status_code} {status_response.text[:1000]}")
+        video_job = status_response.json()
+
+    if str(video_job.get("status", "")).lower() != "completed":
+        raise SceneAnimationError(f"OpenAI Sora generation failed or stopped: {video_job}")
+
+    content_response = request_with_retries(
+        "GET",
+        f"https://api.openai.com/v1/videos/{video_id}/content",
+        headers=headers,
+        timeout=600,
+    )
+    if content_response.status_code >= 400:
+        raise SceneAnimationError(f"OpenAI Sora download failed: {content_response.status_code} {content_response.text[:1000]}")
+    if not content_response.content:
+        raise SceneAnimationError("OpenAI Sora returned empty video content")
+    return content_response.content
+
+
+def generate_scene_animation(
+    ep_num: int,
+    scene_id: str,
+    image_path_override: str = "",
+    provider: str = "gemini",
+    openai_video_id: str = "",
+) -> Path:
+    provider = normalize_animation_provider(provider)
     episode_folder = find_episode_folder(ep_num)
     if not episode_folder:
         raise FileNotFoundError(f"找不到第 {ep_num:02d} 集資料夾")
@@ -399,6 +566,32 @@ def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: st
 
     rows, fieldnames = read_storyboard_rows(storyboard_csv)
     target_row = next((row for row in rows if str(row.get("scene_id", "")).strip() == str(scene_id)), None)
+    if not target_row and provider == "openai" and openai_video_id:
+        animation_dir = animation_dir_for_episode(episode_folder, storyboard_csv)
+        animation_dir.mkdir(parents=True, exist_ok=True)
+        output_path = next_animation_variant_path(animation_dir, scene_id)
+        print("STEP 1/4 resume without storyboard row")
+        log_kv("scene_id", scene_id)
+        log_kv("output_path", output_path)
+        log_kv("animation_provider", provider)
+        log_kv("openai_video_id", openai_video_id)
+        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        video_bytes = download_openai_video_bytes(openai_video_id, headers)
+
+        raw_output_path = output_path.with_name(output_path.stem + "__raw" + output_path.suffix)
+        raw_output_path.write_bytes(video_bytes)
+        log_kv("raw_output_path", raw_output_path)
+        log_kv("raw_video_size_bytes", len(video_bytes))
+        print("STEP 4.5/4 strip audio track from generated video")
+        strip_audio_track(raw_output_path, output_path)
+        try:
+            raw_output_path.unlink()
+        except FileNotFoundError:
+            pass
+        print("DONE animation generated")
+        log_kv("saved_to", output_path)
+        print("WARN storyboard row was missing; video was saved but storyboard.csv was not updated.")
+        return output_path
     if not target_row:
         raise ValueError(f"找不到 scene_id={scene_id}")
 
@@ -433,7 +626,9 @@ def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: st
     log_kv("image_path", image_path)
     log_kv("output_path", output_path)
     log_kv("duration_seconds", request_duration)
+    log_kv("animation_provider", provider)
     log_kv("video_model", VIDEO_MODEL)
+    log_kv("openai_video_model", OPENAI_VIDEO_MODEL)
     log_kv("poll_seconds", POLL_SECONDS)
     log_kv("person_generation", PERSON_GENERATION)
     log_kv("image_mime_type", guess_mime_type(image_path))
@@ -448,7 +643,16 @@ def generate_scene_animation(ep_num: int, scene_id: str, image_path_override: st
     network_retried = False
     video_bytes = b""
 
-    while True:
+    if provider == "openai":
+        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        if openai_video_id:
+            print("STEP 2/4 resume OpenAI Sora video request")
+            video_bytes = download_openai_video_bytes(openai_video_id, headers)
+        else:
+            print("STEP 2/4 submit OpenAI Sora image-to-video request")
+            video_bytes = generate_openai_video_bytes(animation_prompt, image_path, request_duration)
+
+    while not video_bytes:
         video_bytes = b""
         target_row["animation_prompt"] = animation_prompt
         print("STEP 2/4 submit image-to-video request")
@@ -615,10 +819,18 @@ def main() -> None:
     parser.add_argument("--ep", type=int, required=True)
     parser.add_argument("--scene_id", required=True)
     parser.add_argument("--image_path", default="")
+    parser.add_argument("--provider", default=os.environ.get("CAP_ANIMATION_PROVIDER", "gemini"), choices=sorted(VALID_ANIMATION_PROVIDERS))
+    parser.add_argument("--openai_video_id", default="", help="Resume an existing OpenAI Sora video job and download it.")
     args = parser.parse_args()
 
     try:
-        generate_scene_animation(args.ep, str(args.scene_id), image_path_override=str(args.image_path or ""))
+        generate_scene_animation(
+            args.ep,
+            str(args.scene_id),
+            image_path_override=str(args.image_path or ""),
+            provider=args.provider,
+            openai_video_id=str(args.openai_video_id or ""),
+        )
     except (SceneAnimationError, FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}")
         sys.exit(1)

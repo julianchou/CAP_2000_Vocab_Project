@@ -18,17 +18,17 @@ load_dotenv()
 base_dir = Path(__file__).parent.parent
 workspace_dir = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(base_dir / "workspace")))
 GEMINI_MODEL_NAME = os.getenv("CAP_STORYBOARD_GEMINI_MODEL", os.getenv("CAP_TEXT_MODEL", "gemini-2.5-pro"))
-OPENAI_MODEL_NAME = os.getenv("CAP_STORYBOARD_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini"))
+OPENAI_MODEL_NAME = os.getenv("CAP_STORYBOARD_OPENAI_MODEL", os.getenv("OPENAI_TEXT_MODEL", "gpt-5.2"))
 NVIDIA_MODEL_NAME = os.getenv(
     "CAP_STORYBOARD_NVIDIA_MODEL",
-    os.getenv("NVIDIA_STORYBOARD_MODEL", "nvidia/nemotron-3-nano-30b-a3b"),
+    os.getenv("NVIDIA_STORYBOARD_MODEL", "nvidia/llama-3.3-nemotron-super-49b-v1.5"),
 )
 VALID_PROVIDERS = {"auto", "gemini", "openai", "nvidia"}
 HOST_PROFILE_PATH = base_dir / "core" / "assets" / "host_profiles.json"
 
 
 def normalize_provider(value: str | None) -> str:
-    provider = str(value or os.getenv("CAP_STORYBOARD_PROVIDER") or "openai").strip().lower()
+    provider = str(value or os.getenv("CAP_STORYBOARD_PROVIDER") or "auto").strip().lower()
     return provider if provider in VALID_PROVIDERS else "openai"
 
 
@@ -57,6 +57,214 @@ def extract_json_text(text: str) -> str:
         return text
     match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
     return match.group(1).strip() if match else text
+
+
+def normalize_storyboard_payload(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("scenes", "storyboard", "storyboard_data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    raise ValueError("model response must be a JSON array")
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def flashcard_matches_subtitle(flashcard_word: str, subtitle_reference: str) -> bool:
+    word_key = normalize_match_text(flashcard_word)
+    if not word_key:
+        return False
+    return word_key in normalize_match_text(subtitle_reference)
+
+
+def contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", str(text or "")))
+
+
+def ensure_visual_suffix(prompt: str) -> str:
+    text = strip_visual_suffix(str(prompt or ""))
+    if not text:
+        text = "Cute 3D cartoon educational vocabulary video scene"
+    return text.strip(" ,.") + ", aspect ratio 16:9, cinematic wide shot"
+
+
+def english_fragments_from_subtitle_reference(subtitle_reference: str, max_chars: int = 190) -> str:
+    parts = []
+    for segment in str(subtitle_reference or "").split("|"):
+        text = re.sub(r"\[[^\]]+\]", "", segment).strip()
+        text = re.sub(r"[^A-Za-z0-9 ,.'!?;:()/-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" ,.;")
+        if text and re.search(r"[A-Za-z]", text):
+            parts.append(text)
+    joined = "; ".join(parts)
+    if len(joined) > max_chars:
+        joined = joined[: max_chars - 1].rstrip(" ,.;") + "."
+    return joined
+
+
+def english_scene_focus(scene: dict) -> str:
+    prompt_text = strip_visual_suffix(str(scene.get("image_prompt", "")))
+    if prompt_text and not contains_cjk(prompt_text):
+        return prompt_text
+    reason = str(scene.get("reason", "")).strip()
+    if reason and not contains_cjk(reason):
+        return reason
+    english_subtitles = english_fragments_from_subtitle_reference(str(scene.get("subtitle_reference", "")))
+    if english_subtitles:
+        return f"visual focus on the English learning idea: {english_subtitles}"
+    return "visual focus on a classroom vocabulary learning transition, with simple educational props and a clear teaching moment"
+
+
+def sanitize_image_prompt(scene: dict) -> str:
+    prompt = str(scene.get("image_prompt", "")).strip()
+    if prompt and not contains_cjk(prompt):
+        return ensure_visual_suffix(prompt)
+    focus = english_scene_focus(scene)
+    return ensure_visual_suffix(
+        "Cute 3D cartoon educational vocabulary video scene, two recurring hosts in a classroom podcast studio, "
+        f"{focus}"
+    )
+
+
+def subtitle_text_matches_word(word: str, text: str) -> bool:
+    word_key = normalize_match_text(word)
+    text_key = normalize_match_text(text)
+    if not word_key or not text_key:
+        return False
+    if word_key in text_key:
+        return True
+    # Subtitle review/Whisper sometimes splits English words in bilingual cues:
+    # "det ect", "des k", etc. Keep this bounded to avoid broad fuzzy matches.
+    if len(word_key) >= 4:
+        compact_text = re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+        return word_key in compact_text
+    return False
+
+
+def build_word_occurrence_windows(subs: list, words: list[str], padding: float = 0.18) -> dict[str, list[tuple[float, float]]]:
+    windows: dict[str, list[tuple[float, float]]] = {}
+    unique_words = []
+    seen = set()
+    for word in words:
+        clean_word = str(word or "").strip()
+        key = normalize_word_key(clean_word)
+        if clean_word and key not in seen:
+            unique_words.append(clean_word)
+            seen.add(key)
+
+    for word in unique_words:
+        word_key = normalize_word_key(word)
+        matches = []
+        for sub in subs:
+            if subtitle_text_matches_word(word, sub.content):
+                matches.append(
+                    (
+                        max(0.0, sub.start.total_seconds() - padding),
+                        sub.end.total_seconds() + padding,
+                    )
+                )
+        merged: list[tuple[float, float]] = []
+        for start_t, end_t in matches:
+            if not merged or start_t > merged[-1][1] + 0.35:
+                merged.append((start_t, end_t))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end_t))
+        if merged:
+            windows[word_key] = merged
+    return windows
+
+
+def closest_word_window(
+    word_windows: dict[str, list[tuple[float, float]]],
+    word: str,
+    preferred_start: float,
+) -> tuple[float, float] | None:
+    windows = word_windows.get(normalize_word_key(word)) or []
+    if not windows:
+        return None
+    return min(windows, key=lambda item: abs(float(item[0]) - preferred_start))
+
+
+def align_flashcard_scenes_to_subtitles(scenes: list[dict], word_windows: dict[str, list[tuple[float, float]]]) -> int:
+    aligned = 0
+    for scene in scenes:
+        if str(scene.get("source_type", "")).strip().upper() != "FLASHCARD":
+            continue
+        word = str(scene.get("flashcard_word", "")).strip()
+        if not word:
+            continue
+        start_t = safe_float(scene.get("start_time"), 0.0)
+        end_t = safe_float(scene.get("end_time"), start_t)
+        if closest_word_window(word_windows, word, start_t) is None:
+            continue
+        current_reference = str(scene.get("subtitle_reference", ""))
+        if current_reference and flashcard_matches_subtitle(word, current_reference):
+            continue
+        window = closest_word_window(word_windows, word, start_t)
+        if not window:
+            continue
+        new_start, new_end = window
+        if abs(new_start - start_t) > 0.001 or abs(new_end - end_t) > 0.001:
+            scene["start_time"] = round(new_start, 3)
+            scene["end_time"] = round(new_end, 3)
+            scene["reason"] = (
+                str(scene.get("reason", "")).strip()
+                + f" | aligned_to_subtitle_word:{word}"
+            ).strip(" |")
+            aligned += 1
+    if aligned:
+        scenes.sort(key=lambda item: (safe_float(item.get("start_time"), 0.0), safe_float(item.get("end_time"), 0.0)))
+    return aligned
+
+
+def fallback_ai_image_prompt(scene: dict) -> str:
+    subtitle_reference = english_fragments_from_subtitle_reference(str(scene.get("subtitle_reference", "")))
+    if not subtitle_reference:
+        subtitle_reference = "a vocabulary learning transition moment in an educational podcast"
+    return (
+        "Cute 3D cartoon educational vocabulary video scene, two recurring hosts in a classroom podcast studio, "
+        "visual focus on the learning idea from this subtitle segment: "
+        f"{subtitle_reference}, aspect ratio 16:9, cinematic wide shot"
+    )
+
+
+def write_json_file(path: Path, payload) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def write_storyboard_csv(path: Path, scenes: list[dict]) -> Path:
+    fieldnames = [
+        "scene_id",
+        "start_time",
+        "end_time",
+        "source_type",
+        "flashcard_word",
+        "custom_image_path",
+        "image_prompt",
+        "reason",
+        "subtitle_reference",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for scene in scenes:
+            writer.writerow({key: scene.get(key, "") for key in fieldnames})
+    return path
+
+
+def save_rejected_storyboard_response(provider: str, raw: str) -> Path:
+    debug_dir = base_dir / "runtime" / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = debug_dir / f"storyboard_{provider}_rejected_response.json.txt"
+    debug_path.write_text(str(raw or ""), encoding="utf-8")
+    return debug_path
 
 
 def generate_storyboard_json_with_gemini(prompt: str) -> str:
@@ -102,33 +310,38 @@ def generate_storyboard_json_with_nvidia(prompt: str) -> str:
 def generate_storyboard_json(prompt: str, provider: str) -> tuple[list[dict], str]:
     provider = normalize_provider(provider)
     errors: list[str] = []
-    if provider in {"auto", "gemini"}:
+    if provider in {"auto", "nvidia"}:
         try:
-            raw = generate_storyboard_json_with_gemini(prompt)
-            return json.loads(extract_json_text(raw)), f"gemini:{GEMINI_MODEL_NAME}"
+            raw = generate_storyboard_json_with_nvidia(prompt)
+            try:
+                return normalize_storyboard_payload(json.loads(extract_json_text(raw))), f"nvidia:{NVIDIA_MODEL_NAME}"
+            except Exception as parse_exc:
+                debug_path = save_rejected_storyboard_response("nvidia", raw)
+                raise ValueError(f"{parse_exc}; raw response saved to {debug_path}") from parse_exc
         except Exception as exc:
-            errors.append(f"Gemini: {exc}")
-            if provider == "gemini":
-                raise
-            if is_gemini_quota_error(exc):
-                print("Gemini quota/spending cap reached; falling back to OpenAI/ChatGPT.")
-            else:
-                print(f"Gemini storyboard generation failed; falling back to OpenAI/ChatGPT: {exc}")
+            errors.append(f"NVIDIA: {exc}")
+            if provider == "nvidia":
+                raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
+            print(f"NVIDIA storyboard generation failed; falling back to OpenAI/ChatGPT: {exc}")
 
     if provider in {"auto", "openai"}:
         try:
             raw = generate_storyboard_json_with_openai(prompt)
-            return json.loads(extract_json_text(raw)), f"openai:{OPENAI_MODEL_NAME}"
+            return normalize_storyboard_payload(json.loads(extract_json_text(raw))), f"openai:{OPENAI_MODEL_NAME}"
         except Exception as exc:
             errors.append(f"OpenAI: {exc}")
-            raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
+            if provider == "openai":
+                raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
+            print(f"OpenAI storyboard generation failed; falling back to Gemini: {exc}")
 
-    if provider == "nvidia":
+    if provider in {"auto", "gemini"}:
         try:
-            raw = generate_storyboard_json_with_nvidia(prompt)
-            return json.loads(extract_json_text(raw)), f"nvidia:{NVIDIA_MODEL_NAME}"
+            raw = generate_storyboard_json_with_gemini(prompt)
+            return normalize_storyboard_payload(json.loads(extract_json_text(raw))), f"gemini:{GEMINI_MODEL_NAME}"
         except Exception as exc:
-            errors.append(f"NVIDIA: {exc}")
+            errors.append(f"Gemini: {exc}")
+            if provider == "gemini":
+                raise
             raise RuntimeError("Storyboard generation failed: " + " | ".join(errors)) from exc
 
     raise RuntimeError("Storyboard generation failed: " + " | ".join(errors))
@@ -169,7 +382,7 @@ DEFAULT_PROMPT_TEMPLATE = """你是一位專業的英語教學影片分鏡導演
 3. 串場與故事畫面（AI）
 - 只有在沒有講解重點單字，且也不是克漏字解題/出題段落時，才可設為 "AI"。
 - AI 分鏡盡量控制在 10 到 30 秒之間，過長請拆分，過短可適度合併。
-- AI 分鏡必須提供完整英文 image_prompt，並固定以 ", aspect ratio 16:9, cinematic wide shot" 作結。
+- 你可以閱讀並使用中文字幕脈絡來理解畫面；但輸出的 image_prompt 必須是完整英文，不可直接保留中文、日文、韓文或非英文字幕原文。請把中文脈絡轉寫成英文畫面描述，並固定以 ", aspect ratio 16:9, cinematic wide shot" 作結。
 
 4. 人物一致性規則
 {{HOST_PROFILE_RULES}}
@@ -546,16 +759,36 @@ def clamp_scene_to_timeline(
     timeline_end: float,
     previous_end: float = 0.0,
     min_duration: float = 0.05,
-) -> tuple[float, float] | None:
+) -> tuple[float, float, bool] | None:
+    original_start = safe_float(scene.get("start_time"), previous_end)
+    original_end = safe_float(scene.get("end_time"), original_start)
     start_t, end_t = normalize_scene_times(scene, previous_end)
+    desired_duration = max(end_t - start_t, min_duration)
+
+    repaired = False
+    if start_t < previous_end:
+        start_t = previous_end
+        repaired = True
+    elif start_t > previous_end + 0.001:
+        start_t = previous_end
+        repaired = True
+
     if start_t >= timeline_end - min_duration:
-        return None
-    clipped_end = min(end_t, timeline_end)
+        if previous_end < timeline_end - min_duration:
+            start_t = previous_end
+            repaired = True
+        else:
+            return None
+
+    clipped_end = min(max(end_t, start_t + desired_duration), timeline_end)
     if clipped_end <= start_t + min_duration:
         return None
+
+    if original_start > timeline_end or original_end > timeline_end or abs(start_t - original_start) > 0.001:
+        repaired = True
     scene["start_time"] = round(start_t, 3)
     scene["end_time"] = round(clipped_end, 3)
-    return scene["start_time"], scene["end_time"]
+    return scene["start_time"], scene["end_time"], repaired
 
 
 def collect_scene_subtitles(subs: list, start_t: float, end_t: float) -> str:
@@ -572,23 +805,351 @@ def collect_scene_subtitles(subs: list, start_t: float, end_t: float) -> str:
     return " | ".join(scene_details)
 
 
-def generate_storyboard(ep_num: int, provider: str = "openai") -> bool:
+def subtitle_window_text(subs: list, start_t: float, end_t: float) -> str:
+    parts = []
+    for sub in subs:
+        sub_start = sub.start.total_seconds()
+        sub_end = sub.end.total_seconds()
+        if sub_end <= start_t or sub_start >= end_t:
+            continue
+        parts.append(sub.content.replace("\n", " "))
+    return " ".join(parts).strip()
+
+
+def select_word_window(
+    windows: list[tuple[float, float]],
+    *,
+    after_seconds: float,
+    before_seconds: float | None = None,
+    used_windows: list[tuple[float, float]] | None = None,
+) -> tuple[float, float] | None:
+    if not windows:
+        return None
+    used_windows = used_windows or []
+    candidates = []
+    for start_t, end_t in windows:
+        if before_seconds is not None and start_t >= before_seconds - 0.001:
+            continue
+        if end_t < after_seconds - 1.0:
+            continue
+        candidates.append((start_t, end_t))
+    non_overlapping = []
+    for start_t, end_t in candidates:
+        overlaps = any(not (end_t <= used_start + 0.001 or start_t >= used_end - 0.001) for used_start, used_end in used_windows)
+        if not overlaps:
+            non_overlapping.append((start_t, end_t))
+    if non_overlapping:
+        return min(non_overlapping, key=lambda item: (item[0], item[1]))
+    if candidates:
+        return min(candidates, key=lambda item: (item[0], item[1]))
+    return None
+
+
+def build_storyboard_word_anchors(
+    df_vocab: pd.DataFrame,
+    subs: list,
+    word_windows: dict[str, list[tuple[float, float]]],
+) -> list[dict]:
+    anchors = []
+    prev_answer = previous_answer_window(subs)
+    quiz_window = cloze_question_window(subs)
+    search_start = prev_answer[1] if prev_answer else 0.0
+    quiz_start = quiz_window[0] if quiz_window else None
+    used_windows: list[tuple[float, float]] = []
+    for row_number, (_idx, row) in enumerate(df_vocab.iterrows(), start=1):
+        word = str(row.get("Word", "")).strip()
+        if not word:
+            continue
+        window = select_word_window(
+            word_windows.get(normalize_word_key(word)) or [],
+            after_seconds=search_start,
+            before_seconds=quiz_start,
+            used_windows=used_windows,
+        )
+        if not window:
+            continue
+        start_t, end_t = window
+        used_windows.append((start_t, end_t))
+        anchors.append(
+            {
+                "order": row_number,
+                "word": word,
+                "pos": str(row.get("POS", "")).strip(),
+                "meaning": str(row.get("Meaning", "")).strip(),
+                "english_sentence": str(row.get("English_Sentence", "")).strip(),
+                "start_time": round(start_t, 3),
+                "end_time": round(end_t, 3),
+                "subtitle_reference": collect_scene_subtitles(subs, start_t, end_t),
+            }
+        )
+    anchors.sort(key=lambda item: (float(item["start_time"]), int(item["order"])))
+    return anchors
+
+
+def cloze_question_window(subs: list) -> tuple[float, float] | None:
+    hits = []
+    keywords = ("blank", "選項", "題目", "下一集", "揭曉", "做答")
+    for sub in subs:
+        text = str(sub.content or "").lower()
+        if any(keyword.lower() in text for keyword in keywords):
+            hits.append((sub.start.total_seconds(), sub.end.total_seconds()))
+    if not hits:
+        return None
+    start_t = hits[-1][0]
+    end_t = hits[-1][1]
+    for hit_start, hit_end in reversed(hits[:-1]):
+        if start_t - hit_end <= 45.0:
+            start_t = hit_start
+            end_t = max(end_t, hit_end)
+        else:
+            break
+    return max(0.0, start_t), end_t
+
+
+def previous_answer_window(subs: list) -> tuple[float, float] | None:
+    hits = []
+    keywords = ("上一集", "正確答案", "答案", "解答")
+    for sub in subs:
+        text = str(sub.content or "")
+        if any(keyword in text for keyword in keywords):
+            hits.append((sub.start.total_seconds(), sub.end.total_seconds()))
+    if not hits:
+        return None
+    start_t = hits[0][0]
+    end_t = hits[0][1]
+    for hit_start, hit_end in hits[1:]:
+        if hit_start - end_t <= 12.0:
+            end_t = max(end_t, hit_end)
+        else:
+            break
+    return max(0.0, start_t), end_t
+
+
+def new_ai_scene(start_t: float, end_t: float, reason: str, subs: list) -> dict:
+    return {
+        "start_time": round(start_t, 3),
+        "end_time": round(end_t, 3),
+        "source_type": "AI",
+        "flashcard_word": "",
+        "custom_image_path": "",
+        "image_prompt": "",
+        "reason": reason,
+        "subtitle_reference": collect_scene_subtitles(subs, start_t, end_t),
+    }
+
+
+def new_flashcard_scene(
+    start_t: float,
+    end_t: float,
+    flashcard_word: str,
+    reason: str,
+    subs: list,
+    images_folder: Path,
+    special_asset_map: dict[str, str],
+    flashcard_asset_queues: dict[str, list[str]],
+) -> dict:
+    return {
+        "start_time": round(start_t, 3),
+        "end_time": round(end_t, 3),
+        "source_type": "FLASHCARD",
+        "flashcard_word": flashcard_word,
+        "custom_image_path": resolve_flashcard_image_path(images_folder, flashcard_word, special_asset_map, flashcard_asset_queues),
+        "image_prompt": "",
+        "reason": reason,
+        "subtitle_reference": collect_scene_subtitles(subs, start_t, end_t),
+    }
+
+
+def build_storyboard_skeleton(
+    anchors: list[dict],
+    subs: list,
+    timeline_end: float,
+    images_folder: Path,
+    special_asset_map: dict[str, str],
+    flashcard_asset_queues: dict[str, list[str]],
+) -> list[dict]:
+    scenes: list[dict] = []
+    flash_scenes: list[dict] = []
+
+    prev_window = previous_answer_window(subs) if PREV_CLOZE_ANSWER_TOKEN in special_asset_map else None
+    if prev_window:
+        flash_scenes.append(
+            new_flashcard_scene(
+                prev_window[0],
+                prev_window[1],
+                PREV_CLOZE_ANSWER_TOKEN,
+                "Previous episode cloze answer card.",
+                subs,
+                images_folder,
+                special_asset_map,
+                flashcard_asset_queues,
+            )
+        )
+
+    for anchor in anchors:
+        word = str(anchor.get("word", "")).strip()
+        flash_scenes.append(
+            new_flashcard_scene(
+                float(anchor["start_time"]),
+                float(anchor["end_time"]),
+                word,
+                f"Flashcard for vocabulary word '{word}'.",
+                subs,
+                images_folder,
+                special_asset_map,
+                flashcard_asset_queues,
+            )
+        )
+
+    question_window = cloze_question_window(subs) if CURRENT_CLOZE_QUESTION_TOKEN in special_asset_map else None
+    if question_window:
+        flash_scenes.append(
+            new_flashcard_scene(
+                question_window[0],
+                question_window[1],
+                CURRENT_CLOZE_QUESTION_TOKEN,
+                "Current episode cloze question card.",
+                subs,
+                images_folder,
+                special_asset_map,
+                flashcard_asset_queues,
+            )
+        )
+
+    flash_scenes.sort(key=lambda item: (float(item["start_time"]), float(item["end_time"])))
+    for idx, flash_scene in enumerate(flash_scenes[:-1]):
+        word = str(flash_scene.get("flashcard_word", "")).strip()
+        if word == CURRENT_CLOZE_QUESTION_TOKEN:
+            continue
+        next_start = max(0.0, float(flash_scenes[idx + 1]["start_time"]))
+        if next_start > float(flash_scene["end_time"]) + 0.05:
+            flash_scene["end_time"] = round(min(next_start, timeline_end), 3)
+            if word.startswith("__"):
+                flash_scene["reason"] = str(flash_scene.get("reason", "")).rstrip(".") + "; extended through the card explanation."
+            else:
+                flash_scene["reason"] = str(flash_scene.get("reason", "")).rstrip(".") + "; extended through the vocabulary explanation."
+            flash_scene["subtitle_reference"] = collect_scene_subtitles(
+                subs,
+                float(flash_scene["start_time"]),
+                float(flash_scene["end_time"]),
+            )
+    cursor = 0.0
+    min_gap = 0.2
+    for flash_scene in flash_scenes:
+        flash_start = max(0.0, float(flash_scene["start_time"]))
+        flash_end = min(timeline_end, max(flash_start + 0.05, float(flash_scene["end_time"])))
+        if flash_start > cursor + min_gap:
+            scenes.append(new_ai_scene(cursor, flash_start, "AI transition between required flashcard segments.", subs))
+        if flash_end <= cursor + 0.05:
+            flash_end = min(timeline_end, cursor + 0.05)
+        flash_scene["start_time"] = round(max(cursor, flash_start), 3)
+        flash_scene["end_time"] = round(flash_end, 3)
+        flash_scene["subtitle_reference"] = collect_scene_subtitles(subs, flash_scene["start_time"], flash_scene["end_time"])
+        scenes.append(flash_scene)
+        cursor = max(cursor, flash_end)
+    if cursor < timeline_end - min_gap:
+        scenes.append(new_ai_scene(cursor, timeline_end, "AI closing transition and episode wrap-up.", subs))
+    for idx, scene in enumerate(scenes, start=1):
+        scene["scene_id"] = idx
+    return scenes
+
+
+def ai_enrichment_prompt(scenes: list[dict], host_profile_rules: str) -> str:
+    payload = [
+        {
+            "scene_id": scene.get("scene_id"),
+            "start_time": scene.get("start_time"),
+            "end_time": scene.get("end_time"),
+            "source_type": scene.get("source_type"),
+            "reason": scene.get("reason", ""),
+            "subtitle_reference": scene.get("subtitle_reference", ""),
+        }
+        for scene in scenes
+        if str(scene.get("source_type", "")).upper() == "AI"
+    ]
+    return f"""You are enriching a deterministic storyboard skeleton for an English vocabulary teaching video.
+Do not add, remove, merge, split, or retime scenes.
+Only return JSON for AI scenes. FLASHCARD scenes are intentionally omitted and must not be changed.
+
+For each input AI scene, return:
+- scene_id: same integer
+- reason: Traditional Chinese, concise explanation of this AI transition
+- image_prompt: English only. Use Chinese subtitles as context, but translate the visual idea into English. Do not include Chinese/Japanese/Korean text in image_prompt. End exactly with ", aspect ratio 16:9, cinematic wide shot".
+
+Host/style rules:
+{host_profile_rules or "- Use the recurring podcast hosts only when visually appropriate."}
+
+AI scenes to enrich:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+
+def generate_ai_scene_enrichment(prompt: str, provider: str) -> tuple[list[dict], str]:
+    scenes, provider_used = generate_storyboard_json(prompt, provider)
+    return scenes, provider_used
+
+
+def apply_ai_enrichment(skeleton: list[dict], enriched_items: list[dict], host_profiles: dict) -> int:
+    by_id = {}
+    for item in enriched_items:
+        try:
+            by_id[int(item.get("scene_id"))] = item
+        except Exception:
+            continue
+    updated = 0
+    for scene in skeleton:
+        if str(scene.get("source_type", "")).upper() != "AI":
+            continue
+        item = by_id.get(int(scene.get("scene_id", 0) or 0))
+        if item:
+            scene["reason"] = str(item.get("reason") or scene.get("reason") or "").strip()
+            scene["image_prompt"] = str(item.get("image_prompt") or "").strip()
+        if not str(scene.get("image_prompt", "")).strip():
+            scene["image_prompt"] = fallback_ai_image_prompt(scene)
+        if scene_needs_host_consistency(scene):
+            scene["image_prompt"] = apply_host_profiles_to_prompt(scene.get("image_prompt", ""), host_profiles)
+        scene["image_prompt"] = sanitize_image_prompt(scene)
+        updated += 1
+    return updated
+
+
+def validate_storyboard_skeleton(scenes: list[dict], word_list: list[str]) -> list[str]:
+    warnings = []
+    present_words = {
+        normalize_word_key(scene.get("flashcard_word", ""))
+        for scene in scenes
+        if str(scene.get("source_type", "")).upper() == "FLASHCARD"
+    }
+    for word in word_list:
+        word_key = normalize_word_key(word)
+        if word_key and word_key not in present_words:
+            warnings.append(f"missing flashcard scene for word: {word}")
+    for scene in scenes:
+        if str(scene.get("source_type", "")).upper() == "AI" and contains_cjk(scene.get("image_prompt", "")):
+            warnings.append(f"AI scene {scene.get('scene_id')} image_prompt still contains CJK text")
+    return warnings
+
+
+def generate_storyboard(ep_num: int, provider: str = "auto") -> bool:
     target_folder, _start_word, _end_word = resolve_episode_range(workspace_dir, ep_num)
     srt_folder = target_folder / "02_subtitles"
     storyboard_folder = target_folder / "03_storyboards"
     images_folder = target_folder / "04_images"
-    srt_file = next(srt_folder.glob("*.srt"), None)
+    srt_file = srt_folder / "notebooklm_audio_fixed.srt"
     vocab_csv = storyboard_folder / "vocab_data.csv"
     output_csv = storyboard_folder / "storyboard.csv"
+    anchors_json = storyboard_folder / "storyboard_word_anchors.json"
+    skeleton_csv = storyboard_folder / "storyboard_skeleton.csv"
+    validation_json = storyboard_folder / "storyboard_validation.json"
 
-    if not srt_file:
-        print(f"Missing SRT file in: {srt_folder}")
+    if not srt_file.exists():
+        print(f"Missing fixed subtitle file: {srt_file}")
         return False
     if not vocab_csv.exists():
         print(f"Missing vocab_data.csv: {vocab_csv}")
         return False
 
-    print("Loading vocab data and subtitle file...")
+    print(f"Loading vocab data and fixed subtitle file: {srt_file}")
     df_vocab = pd.read_csv(vocab_csv).fillna("")
     word_list = df_vocab["Word"].astype(str).str.strip().tolist()
     flashcard_asset_queues = build_flashcard_asset_queues(df_vocab)
@@ -597,14 +1158,11 @@ def generate_storyboard(ep_num: int, provider: str = "openai") -> bool:
     if not subs:
         print(f"SRT file has no subtitle entries: {srt_file}")
         return False
+    word_windows = build_word_occurrence_windows(subs, word_list)
     timeline_end = max(sub.end.total_seconds() for sub in subs)
     cloze_card_rules, special_asset_map = build_cloze_card_rules(ep_num, target_folder)
     host_profiles = load_host_profiles()
     host_profile_rules = build_host_profile_rules(host_profiles)
-
-    prompt_template_path = ensure_prompt_template(target_folder)
-    prompt_template = prompt_template_path.read_text(encoding="utf-8")
-    prompt = render_prompt(prompt_template, word_list, srt_text, cloze_card_rules, host_profile_rules)
 
     provider = normalize_provider(provider)
     print(
@@ -613,72 +1171,57 @@ def generate_storyboard(ep_num: int, provider: str = "openai") -> bool:
         f"nvidia_model={NVIDIA_MODEL_NAME}"
     )
     try:
-        storyboard_data, provider_used = generate_storyboard_json(prompt, provider)
-        if not isinstance(storyboard_data, list):
-            raise ValueError("model response must be a JSON array")
-        print(f"Storyboard provider used: {provider_used}")
+        print("14.1 Anchoring vocabulary words from SRT...")
+        anchors = build_storyboard_word_anchors(df_vocab, subs, word_windows)
+        write_json_file(anchors_json, anchors)
+        print(f"Anchors saved to: {anchors_json} ({len(anchors)}/{len(word_list)} words)")
 
-        previous_end = 0.0
-        normalized_scenes = []
-        trimmed_count = 0
-        dropped_count = 0
-        for scene in storyboard_data:
-            original_end = safe_float(scene.get("end_time"), 0.0)
-            clamped = clamp_scene_to_timeline(scene, timeline_end, previous_end)
-            if clamped is None:
-                dropped_count += 1
-                continue
-            start_t, end_t = clamped
-            if original_end > end_t + 0.001:
-                trimmed_count += 1
+        print("14.2 Building deterministic storyboard skeleton...")
+        skeleton = build_storyboard_skeleton(
+            anchors,
+            subs,
+            timeline_end,
+            images_folder,
+            special_asset_map,
+            flashcard_asset_queues,
+        )
+        write_storyboard_csv(skeleton_csv, skeleton)
+        print(f"Skeleton saved to: {skeleton_csv} ({len(skeleton)} scenes)")
 
-            scene["subtitle_reference"] = collect_scene_subtitles(subs, start_t, end_t)
-            scene["flashcard_word"] = str(scene.get("flashcard_word", "")).strip()
+        print("14.3 Enriching AI scenes with LLM prompts/reasons...")
+        provider_used = "local:fallback"
+        try:
+            enrichment_prompt = ai_enrichment_prompt(skeleton, host_profile_rules)
+            enriched_items, provider_used = generate_ai_scene_enrichment(enrichment_prompt, provider)
+            enriched_count = apply_ai_enrichment(skeleton, enriched_items, host_profiles)
+            print(f"AI enrichment provider used: {provider_used}; enriched {enriched_count} AI scene(s).")
+        except Exception as enrich_exc:
+            print(f"WARN AI enrichment failed; using deterministic fallback image prompts. raw_error={enrich_exc}")
+            enriched_count = apply_ai_enrichment(skeleton, [], host_profiles)
+            print(f"Fallback enriched {enriched_count} AI scene(s).")
 
-            if str(scene.get("source_type", "")).strip().upper() == "FLASHCARD" and scene["flashcard_word"]:
-                scene["custom_image_path"] = resolve_flashcard_image_path(
-                    images_folder,
-                    scene["flashcard_word"],
-                    special_asset_map,
-                    flashcard_asset_queues,
-                )
-                scene["image_prompt"] = ""
-                scene["source_type"] = "FLASHCARD"
-            else:
-                scene["custom_image_path"] = ""
-                scene["source_type"] = "AI"
-                scene["flashcard_word"] = ""
-                if scene_needs_host_consistency(scene):
-                    scene["image_prompt"] = apply_host_profiles_to_prompt(scene.get("image_prompt", ""), host_profiles)
-            previous_end = end_t
-            normalized_scenes.append(scene)
+        print("14.4 Validating storyboard...")
+        validation_warnings = validate_storyboard_skeleton(skeleton, word_list)
+        write_json_file(
+            validation_json,
+            {
+                "provider_used": provider_used,
+                "anchor_count": len(anchors),
+                "expected_word_count": len([word for word in word_list if str(word).strip()]),
+                "scene_count": len(skeleton),
+                "warnings": validation_warnings,
+            },
+        )
+        if validation_warnings:
+            for warning in validation_warnings:
+                print(f"WARN {warning}")
 
-        for i, scene in enumerate(normalized_scenes, start=1):
+        for i, scene in enumerate(skeleton, start=1):
             scene["scene_id"] = i
-        storyboard_data = normalized_scenes
-
-        fieldnames = [
-            "scene_id",
-            "start_time",
-            "end_time",
-            "source_type",
-            "flashcard_word",
-            "custom_image_path",
-            "image_prompt",
-            "reason",
-            "subtitle_reference",
-        ]
-        with output_csv.open("w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for scene in storyboard_data:
-                writer.writerow(scene)
+        storyboard_data = skeleton
+        write_storyboard_csv(output_csv, storyboard_data)
 
         print(f"Storyboard saved to: {output_csv}")
-        if trimmed_count:
-            print(f"Trimmed {trimmed_count} scene(s) to fit the SRT timeline end {timeline_end:.3f}s.")
-        if dropped_count:
-            print(f"Dropped {dropped_count} scene(s) that started beyond the SRT timeline.")
         if special_asset_map:
             print("Special flashcard assets:")
             for token, path in special_asset_map.items():
@@ -695,7 +1238,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--provider",
         choices=sorted(VALID_PROVIDERS),
-        default=os.getenv("CAP_STORYBOARD_PROVIDER", "openai"),
+        default=os.getenv("CAP_STORYBOARD_PROVIDER", "auto"),
         help="LLM provider for storyboard generation. Use openai for ChatGPT.",
     )
     args = parser.parse_args()

@@ -5,15 +5,14 @@ import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
 
 
-load_dotenv()
-
-client = genai.Client()
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 WORKSPACE_DIR = Path(os.environ.get("CAP_WORKSPACE_ROOT", str(BASE_DIR / "workspace")))
-TEXT_MODEL = os.environ.get("CAP_TEXT_MODEL", "gemini-2.5-flash")
+VALID_PROVIDERS = {"auto", "gemini", "openai"}
+TEXT_MODEL = os.environ.get("CAP_ANIMATION_PROMPT_GEMINI_MODEL", os.environ.get("CAP_TEXT_MODEL", "gemini-2.5-flash"))
+OPENAI_TEXT_MODEL = os.environ.get("CAP_ANIMATION_PROMPT_OPENAI_MODEL", os.environ.get("OPENAI_TEXT_MODEL", "gpt-5.2"))
 MAX_PROMPT_WORDS = 90
 RISKY_TERMS = [
     "attack",
@@ -204,7 +203,74 @@ def is_compliant_prompt(text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def generate_animation_prompt(ep_num: int, scene_id: str) -> None:
+def normalize_provider(value: str | None) -> str:
+    provider = str(value or os.getenv("CAP_ANIMATION_PROMPT_PROVIDER") or "auto").strip().lower()
+    return provider if provider in VALID_PROVIDERS else "auto"
+
+
+def is_gemini_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "resource_exhausted" in text or "spending cap" in text or "quota" in text or "429" in text
+
+
+def generate_prompt_with_gemini(prompt: str) -> str:
+    from google import genai
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    print(f"animation_prompt_provider=gemini model={TEXT_MODEL}")
+    response = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).models.generate_content(
+        model=TEXT_MODEL,
+        contents=prompt,
+    )
+    return str(getattr(response, "text", "") or "")
+
+
+def generate_prompt_with_openai(prompt: str) -> str:
+    from openai import OpenAI
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    print(f"animation_prompt_provider=openai model={OPENAI_TEXT_MODEL}")
+    response = OpenAI().responses.create(
+        model=OPENAI_TEXT_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": "Return exactly one policy-safe English image-to-video motion prompt. No markdown, labels, bullets, or quotes.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return str(response.output_text or "")
+
+
+def generate_prompt_text(prompt: str, provider: str) -> tuple[str, str]:
+    provider = normalize_provider(provider)
+    errors: list[str] = []
+    if provider in {"auto", "gemini"}:
+        try:
+            return generate_prompt_with_gemini(prompt), f"gemini:{TEXT_MODEL}"
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+            if provider == "gemini":
+                raise
+            if is_gemini_quota_error(exc):
+                print(f"Gemini quota/spending cap reached; falling back to OpenAI: {exc}")
+            else:
+                print(f"Gemini animation prompt failed; falling back to OpenAI: {exc}")
+
+    if provider in {"auto", "openai"}:
+        try:
+            return generate_prompt_with_openai(prompt), f"openai:{OPENAI_TEXT_MODEL}"
+        except Exception as exc:
+            errors.append(f"OpenAI: {exc}")
+            raise RuntimeError("animation prompt generation failed: " + " | ".join(errors)) from exc
+
+    raise RuntimeError("animation prompt generation failed: " + " | ".join(errors))
+
+
+def generate_animation_prompt(ep_num: int, scene_id: str, provider: str = "auto") -> None:
     episode_folder = find_episode_folder(ep_num)
     if not episode_folder:
         raise FileNotFoundError(f"找不到第 {ep_num:02d} 集資料夾")
@@ -219,16 +285,19 @@ def generate_animation_prompt(ep_num: int, scene_id: str) -> None:
         raise ValueError(f"找不到 scene_id={scene_id}")
 
     print(f"Generating safe animation prompt for Scene {scene_id}...")
-    response = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=build_prompt_request(target_row),
-    )
-    model_prompt = sanitize_generated_prompt((getattr(response, "text", "") or "").strip())
-    ok, reason = is_compliant_prompt(model_prompt)
+    try:
+        raw_text, provider_used = generate_prompt_text(build_prompt_request(target_row), provider)
+        model_prompt = sanitize_generated_prompt(raw_text.strip())
+        ok, reason = is_compliant_prompt(model_prompt)
+    except Exception as exc:
+        provider_used = "fallback"
+        model_prompt = ""
+        ok = False
+        reason = f"provider_error={exc}"
 
     if ok:
         suggested_prompt = model_prompt
-        print("prompt_source=model")
+        print(f"prompt_source=model provider_used={provider_used}")
     else:
         suggested_prompt = fallback_prompt(target_row)
         print(f"prompt_source=fallback reason={reason}")
@@ -243,8 +312,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="為指定 scene 產生合規動畫 Prompt")
     parser.add_argument("--ep", type=int, required=True)
     parser.add_argument("--scene_id", required=True)
+    parser.add_argument("--provider", choices=sorted(VALID_PROVIDERS), default=os.getenv("CAP_ANIMATION_PROMPT_PROVIDER", "auto"))
     args = parser.parse_args()
-    generate_animation_prompt(args.ep, str(args.scene_id))
+    generate_animation_prompt(args.ep, str(args.scene_id), provider=args.provider)
 
 
 if __name__ == "__main__":

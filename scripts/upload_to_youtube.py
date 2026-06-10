@@ -102,17 +102,20 @@ def resolve_episode_upload_options(ep_num, args, schedule_data):
     saved_publish_at = str(saved.get("publish_at", "")).strip() if saved_schedule_on else ""
     saved_playlist_id = str(saved.get("playlist_id", "")).strip()
     saved_cover_name = str(saved.get("cover_name", "")).strip()
+    saved_video_name = str(saved.get("video_name", "")).strip()
 
     privacy = args.privacy or saved_privacy or schedule_row.get("privacy", "private")
     publish_at = args.publish_at if args.publish_at is not None else (saved_publish_at or schedule_row.get("publish_time"))
     playlist_id = args.playlist_id if args.playlist_id is not None else saved_playlist_id
     cover_name = args.cover_name if args.cover_name is not None else (saved_cover_name or "cover.png")
+    video_name = args.video_name if args.video_name is not None else (saved_video_name or "final_video.mp4")
 
     return {
         "privacy": privacy,
         "publish_at": publish_at,
         "playlist_id": playlist_id,
         "cover_name": cover_name,
+        "video_name": video_name,
     }
 
 
@@ -569,7 +572,8 @@ def upload_episode(
     privacy_status="private",
     publish_at=None,
     playlist_id=None,
-    cover_name="cover.png"
+    cover_name="cover.png",
+    video_name="final_video.mp4",
 ):
     print(f"\n🚀 [YouTube Upload] 正在處理第 {ep_num:02d} 集...")
 
@@ -579,7 +583,8 @@ def upload_episode(
         return
 
     output_dir = target_folder / "05_output"
-    video_path = output_dir / "final_video.mp4"
+    safe_video_name = Path(str(video_name or "final_video.mp4")).name
+    video_path = output_dir / safe_video_name
 
     meta_candidates = [
         output_dir / "youtube_meta.json",
@@ -609,7 +614,7 @@ def upload_episode(
     cover_path, thumbnail_info = prepare_thumbnail_for_upload(selected_cover_path, output_dir)
 
     if not video_path.exists():
-        print("❌ 缺少 final_video.mp4，跳過。")
+        print(f"❌ 缺少要上傳的影片：{video_path}，跳過。")
         return
 
     if not meta_path.exists():
@@ -634,6 +639,8 @@ def upload_episode(
         "playlist_added": False,
         "thumbnail_uploaded": False,
         "cover_name": cover_name,
+        "video_name": safe_video_name,
+        "video_path": str(video_path),
         "thumbnail_info": thumbnail_info,
         "default_language": DEFAULT_LANGUAGE,
         "default_audio_language": DEFAULT_AUDIO_LANGUAGE,
@@ -738,6 +745,7 @@ def main():
     parser.add_argument("--publish_at", type=str)
     parser.add_argument("--playlist_id", type=str, help="指定要加入的播放清單 ID")
     parser.add_argument("--cover_name", type=str, default=None, help="正式上傳的封面檔名；若未指定，優先讀取已儲存的發布設定")
+    parser.add_argument("--video_name", type=str, default=None, help="正式上傳的影片檔名；限定 05_output 目錄內，例如 final_video_no_outro.mp4")
 
     args = parser.parse_args()
     schedule_data = load_upload_schedule()
@@ -763,6 +771,7 @@ def main():
             publish_at=resolved["publish_at"],
             playlist_id=resolved["playlist_id"],
             cover_name=resolved["cover_name"],
+            video_name=resolved["video_name"],
         )
 
 

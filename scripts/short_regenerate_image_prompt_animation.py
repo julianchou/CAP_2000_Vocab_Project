@@ -17,6 +17,8 @@ def main() -> int:
     parser.add_argument("--storyboard", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--scene-id", required=True)
+    parser.add_argument("--image-provider", default="gemini", choices=["gemini", "openai", "nvidia"])
+    parser.add_argument("--animation-provider", default="gemini", choices=["gemini", "openai", "nvidia"])
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     run([
@@ -32,6 +34,8 @@ def main() -> int:
         "--force",
         "--scene-id",
         args.scene_id,
+        "--provider",
+        args.image_provider,
     ])
     run([
         sys.executable,
@@ -41,6 +45,8 @@ def main() -> int:
         args.storyboard,
         "--scene-id",
         args.scene_id,
+        "--provider",
+        args.animation_provider,
     ])
     run([
         sys.executable,

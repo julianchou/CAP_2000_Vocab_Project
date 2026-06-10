@@ -139,9 +139,9 @@ def generate_meta_json(prompt: str, provider: str) -> tuple[dict, str]:
             if provider == "gemini":
                 raise
             if is_gemini_quota_error(exc):
-                print("Gemini quota/spending cap reached; falling back to OpenAI/ChatGPT.")
+                print("Gemini quota/spending cap reached; falling back to OpenAI/ChatGPT, then NVIDIA if needed.")
             else:
-                print(f"Gemini YouTube metadata generation failed; falling back to OpenAI/ChatGPT: {exc}")
+                print(f"Gemini YouTube metadata generation failed; falling back to OpenAI/ChatGPT, then NVIDIA if needed: {exc}")
 
     if provider in {"auto", "openai"}:
         try:
@@ -149,9 +149,11 @@ def generate_meta_json(prompt: str, provider: str) -> tuple[dict, str]:
             return json.loads(extract_json_text(raw)), f"openai:{OPENAI_MODEL_NAME}"
         except Exception as exc:
             errors.append(f"OpenAI: {exc}")
-            raise RuntimeError("YouTube metadata generation failed: " + " | ".join(errors)) from exc
+            if provider == "openai":
+                raise RuntimeError("YouTube metadata generation failed: " + " | ".join(errors)) from exc
+            print(f"OpenAI YouTube metadata generation failed; falling back to NVIDIA: {exc}")
 
-    if provider == "nvidia":
+    if provider in {"auto", "nvidia"}:
         try:
             raw = generate_meta_json_with_nvidia(prompt)
             return json.loads(extract_json_text(raw)), f"nvidia:{NVIDIA_MODEL_NAME}"
@@ -275,7 +277,7 @@ def main():
         "--provider",
         choices=sorted(VALID_PROVIDERS),
         default=os.getenv("CAP_YOUTUBE_META_PROVIDER", "auto"),
-        help="LLM provider for YouTube metadata. auto tries Gemini first, then falls back to OpenAI.",
+        help="LLM provider for YouTube metadata. auto tries Gemini first, then OpenAI, then NVIDIA.",
     )
     parser.add_argument("--ep", type=int, help="集數")
     args = parser.parse_args()

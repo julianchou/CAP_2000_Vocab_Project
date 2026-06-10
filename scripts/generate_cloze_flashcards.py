@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import textwrap
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -62,11 +61,52 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str
     return "\n".join(lines)
 
 
+def is_ascii_word_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char in "'_-")
+
+
+def mixed_text_tokens(text: str) -> list[str]:
+    tokens = []
+    current = []
+    for char in text:
+        if is_ascii_word_char(char):
+            current.append(char)
+            continue
+        if current:
+            tokens.append("".join(current))
+            current = []
+        tokens.append(" " if char.isspace() else char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def wrap_mixed_line(text: str, width: int) -> str:
+    lines = []
+    current = ""
+    for token in mixed_text_tokens(text):
+        if token == " ":
+            if current and not current.endswith(" "):
+                current += " "
+            continue
+
+        candidate = f"{current}{token}"
+        if current and len(candidate.rstrip()) > width:
+            lines.append(current.rstrip())
+            current = token
+        else:
+            current = candidate
+
+    if current:
+        lines.append(current.rstrip())
+    return "\n".join(lines)
+
+
 def wrap_mixed_text(text: str, width: int) -> str:
     if not text:
         return ""
     parts = text.splitlines() or [text]
-    wrapped = [textwrap.fill(part, width=width, break_long_words=False, break_on_hyphens=False) for part in parts]
+    wrapped = [wrap_mixed_line(part, width) for part in parts]
     return "\n".join(wrapped)
 
 
@@ -114,7 +154,7 @@ def render_card(question: dict, output_path: Path, show_answer: bool):
     white_box = (int(width * 0.065), int(height * 0.12), int(width * 0.72), int(height * 0.88))
     question_box = (white_box[0] + 60, white_box[1] + 160, white_box[2] - 60, white_box[1] + int(height * 0.28))
     hint_box = (white_box[0] + 60, white_box[1] + int(height * 0.31), white_box[2] - 60, white_box[1] + int(height * 0.47))
-    answer_box = (white_box[0] + 440, white_box[1] + int(height * 0.55), white_box[2] - 90, white_box[3] - 90)
+    answer_box = (white_box[0] + 440, white_box[1] + int(height * 0.40), white_box[2] - 90, white_box[3] - 90)
 
     gold = "#B8944E"
     navy = "#20385C"
@@ -150,8 +190,8 @@ def render_card(question: dict, output_path: Path, show_answer: bool):
         answer_font = fit_font(q_draw, answer_title, answer_box[2] - answer_box[0], 50, 28)
         draw.text((answer_box[0], answer_box[1]), answer_title, fill=gold, font=answer_font)
 
-        explanation_text = wrap_mixed_text(f"解析：{question['explanation']}", 28)
-        explain_font = fit_font(q_draw, explanation_text, answer_box[2] - answer_box[0], 40, 22)
+        explanation_text = wrap_mixed_text(f"解析：{question['explanation']}", 20)
+        explain_font = fit_font(q_draw, explanation_text, answer_box[2] - answer_box[0], 52, 32)
         draw.multiline_text((answer_box[0], answer_box[1] + 70), explanation_text, fill=navy, font=explain_font, spacing=12)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
