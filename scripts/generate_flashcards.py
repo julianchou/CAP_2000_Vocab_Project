@@ -70,6 +70,18 @@ def find_font():
     return None
 
 
+def find_phonetic_font():
+    candidates = [
+        core_assets_dir / "arial.ttf",
+        Path("C:\\Windows\\Fonts\\arial.ttf"),
+        Path("C:\\Windows\\Fonts\\seguisym.ttf"),
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return str(path)
+    return find_font()
+
+
 def get_font(font_path: str | None, size: int):
     if font_path:
         return ImageFont.truetype(font_path, size)
@@ -93,6 +105,46 @@ def draw_text_centered(draw: ImageDraw.ImageDraw, text: str, font, color: str, y
     draw.text((center_x - width // 2, y_pos), text, fill=color, font=font)
 
 
+def render_flashcard(
+    base_img: Image.Image,
+    row: pd.Series,
+    font_path: str | None,
+    phonetic_font_path: str | None = None,
+) -> Image.Image:
+    img = base_img.copy()
+    draw = ImageDraw.Draw(img)
+    img_w, img_h = img.size
+    box_y1 = int(img_h * 0.28)
+    box_h = int(img_h * 0.45)
+    box_bottom = box_y1 + box_h
+    center_x = img_w // 2
+    max_text_width = int(img_w * 0.9)
+
+    word = str(row.get("Word", "")).strip()
+    phonetic = str(row.get("Phonetic", "")).strip()
+    f_word = get_font_to_fit(word, font_path, max_text_width, 190, 90)
+    draw_text_centered(draw, word, f_word, "#FFFFFF", box_y1 + 45, center_x)
+
+    if phonetic:
+        f_phonetic = get_font_to_fit(
+            phonetic, phonetic_font_path or find_phonetic_font(), max_text_width, 64, 34
+        )
+        draw_text_centered(draw, phonetic, f_phonetic, "#9FE7FF", box_y1 + 285, center_x)
+
+    meaning_text = f"({row.get('POS', '')}) {row.get('Meaning', '')}"
+    f_mean = get_font_to_fit(meaning_text, font_path, max_text_width, 78, 38)
+    draw_text_centered(draw, meaning_text, f_mean, "#FFD700", box_y1 + 370, center_x)
+
+    sent_text = str(row.get("English_Sentence", ""))
+    f_sent = get_font_to_fit(sent_text, font_path, max_text_width, 70)
+    draw_text_centered(draw, sent_text, f_sent, "#FFFFFF", box_bottom + 60, center_x)
+
+    trans_text = str(row.get("Chinese_Translation", ""))
+    f_trans = get_font_to_fit(trans_text, font_path, max_text_width, 55)
+    draw_text_centered(draw, trans_text, f_trans, "#BCBCBC", box_bottom + 145, center_x)
+    return img
+
+
 def load_vocab_rows(target_folder: Path) -> pd.DataFrame:
     csv_path = target_folder / "03_storyboards" / "vocab_data.csv"
     json_path = target_folder / "03_storyboards" / "vocab_data.json"
@@ -113,15 +165,8 @@ def process_episode(ep_num: int, filter_words=None):
 
     df = load_vocab_rows(target_folder)
     font_path = find_font()
+    phonetic_font_path = find_phonetic_font()
     base_img = Image.open(core_assets_dir / TEMPLATE_FILENAME).convert("RGB")
-    img_w, img_h = base_img.size
-
-    box_y1 = int(img_h * 0.28)
-    box_h = int(img_h * 0.45)
-    box_bottom = box_y1 + box_h
-    center_x = img_w // 2
-    max_text_width = int(img_w * 0.9)
-
     filter_set = {w.lower() for w in filter_words} if filter_words else None
     output_dir = target_folder / "04_images" / "flashcards"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -135,23 +180,7 @@ def process_episode(ep_num: int, filter_words=None):
             continue
 
         print(f"👉 產出完整圖卡: {word}")
-        img = base_img.copy()
-        draw = ImageDraw.Draw(img)
-
-        f_word = get_font(font_path, 210)
-        draw_text_centered(draw, word, f_word, "#FFFFFF", box_y1 + 70, center_x)
-
-        meaning_text = f"({row['POS']}) {row['Meaning']}"
-        f_mean = get_font(font_path, 95)
-        draw_text_centered(draw, meaning_text, f_mean, "#FFD700", box_y1 + 360, center_x)
-
-        sent_text = str(row["English_Sentence"])
-        f_sent = get_font_to_fit(sent_text, font_path, max_text_width, 70)
-        draw_text_centered(draw, sent_text, f_sent, "#FFFFFF", box_bottom + 60, center_x)
-
-        trans_text = str(row["Chinese_Translation"])
-        f_trans = get_font_to_fit(trans_text, font_path, max_text_width, 55)
-        draw_text_centered(draw, trans_text, f_trans, "#BCBCBC", box_bottom + 145, center_x)
+        img = render_flashcard(base_img, row, font_path, phonetic_font_path)
 
         safe_name = flashcard_stems[row_number]
         img.save(output_dir / f"{safe_name}.png")
