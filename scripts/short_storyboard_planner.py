@@ -298,8 +298,9 @@ Rules:
 4. Scenes must be sequential and must not overlap.
 5. Prefer scenes of 2 to {max_seconds:g} seconds.
 6. prompt must be English and suitable for image generation.
-7. Every prompt must describe a vertical 9:16 Short visual. Do not ask to render subtitle text inside the image.
-8. Use the subtitle context to choose the visual subject, emotion, action, and setting.
+7. Every prompt must describe a vertical 9:16 Short visual.
+8. Images must be text-free: do not ask for readable words, letters, numbers, captions, labels, signs, documents, screens, logos, watermarks, or text in any language. Describe concepts with people, objects, actions, symbols, color, and composition instead.
+9. Use the subtitle context to choose the visual subject, emotion, action, and setting.
 
 Subtitles JSON:
 {json.dumps(compact, ensure_ascii=False)}

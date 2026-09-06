@@ -1,108 +1,157 @@
-import os
-import json
-import pandas as pd
+import argparse
+import re
 from pathlib import Path
-from dotenv import load_dotenv
-from google import genai
+
+import pandas as pd
 from PyPDF2 import PdfReader
 
-# 1. 初始化設定
-load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 建立 Client (使用穩定版 v1 接口)
-client = genai.Client(
-    api_key=API_KEY, 
-    http_options={'api_version': 'v1'}
+SOURCE_POS_VALUES = (
+    "\u6240\u6709\u683c",
+    "\u9650\u5b9a\u8a5e",
+    "\u4ee3\u540d\u8a5e",
+    "\u5f62\u5bb9\u8a5e",
+    "\u9023\u63a5\u8a5e",
+    "\u4ecb\u7cfb\u8a5e",
+    "\u52a9\u52d5\u8a5e",
+    "\u611f\u5606\u8a5e",
+    "\u7591\u554f\u8a5e",
+    "\u526f\u8a5e",
+    "\u52d5\u8a5e",
+    "\u540d\u8a5e",
+    "\u6578\u8a5e",
 )
+POS_PATTERN = "|".join(re.escape(value) for value in SOURCE_POS_VALUES)
+COMPOUND_POS_PATTERN = rf"(?:{POS_PATTERN})(?:\s*/\s*(?:{POS_PATTERN}))*"
+EXPECTED_ENTRY_COUNT = 2000
 
-# 使用 Flash 模型，解析表格與處理長文本速度最快
-MODEL_ID = "gemini-2.5-flash" 
 
-def extract_page_with_llm(text, page_num):
-    """請 Gemini 協助解析 PDF 頁面文字，提取精確的單字對照表"""
-    prompt = f"""
-    任務：從以下 PDF 提取的文字中，整理出「編號」與「英文單字」的對照表。
-    
-    待處理文字 (第 {page_num} 頁)：
-    ---
-    {text}
-    ---
+def normalize_pdf_text(text: str) -> str:
+    normalized = " ".join(str(text or "").split())
+    for pos in SOURCE_POS_VALUES:
+        split_pos_pattern = r"\s*".join(re.escape(character) for character in pos)
+        normalized = re.sub(split_pos_pattern, pos, normalized)
+    return normalized
 
-    要求：
-    1. 輸出格式必須是嚴格的 JSON 陣列，例如：[{{"Index": 1, "Word": "a few"}}, {{"Index": 2, "Word": "a little"}}]
-    2. 務必保留完整的英文片語（例如 "a lot" 不要只抓 "a"）。
-    3. 忽略中文解釋、詞性或其他雜訊。
-    4. 只輸出 JSON，不要包含 Markdown 標籤 (```json) 或任何說明。
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID, 
-            contents=prompt
+
+def normalize_meaning(text: str) -> str:
+    # PDF line wrapping inserts spaces inside Chinese words, such as "因 為".
+    return re.sub(r"\s+", "", str(text or "")).strip()
+
+
+def load_existing_words(index_path: Path) -> list[dict[str, object]]:
+    if not index_path.exists():
+        raise FileNotFoundError(
+            f"Existing word index is required to identify exact entry boundaries: {index_path}"
         )
-        
-        raw_text = response.text.strip()
-        # 清除 Markdown 標籤
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            raw_text = "\n".join(lines[1:-1]) if len(lines) > 2 else raw_text
-            
-        return json.loads(raw_text)
-    except Exception as e:
-        print(f"⚠️ 第 {page_num} 頁解析出錯: {e}")
-        return []
 
-def main():
-    base_dir = Path(__file__).parent.parent
-    pdf_path = base_dir / "core" / "assets" / "cap_vocab_2000_source.pdf"
-    output_path = base_dir / "core" / "assets" / "vocab_index.csv"
+    frame = pd.read_csv(index_path, usecols=["Index", "Word"])
+    frame["Index"] = pd.to_numeric(frame["Index"], errors="raise").astype(int)
+    frame["Word"] = frame["Word"].fillna("").astype(str).str.strip()
+    frame = frame.sort_values("Index").drop_duplicates(subset=["Index"], keep="first")
 
+    expected = list(range(1, EXPECTED_ENTRY_COUNT + 1))
+    actual = frame["Index"].tolist()
+    if actual != expected:
+        raise ValueError(
+            f"Existing index must contain contiguous entries 1-{EXPECTED_ENTRY_COUNT}; "
+            f"found {len(actual)} entries."
+        )
+    if frame["Word"].eq("").any():
+        raise ValueError("Existing index contains blank Word values.")
+    return frame[["Index", "Word"]].to_dict(orient="records")
+
+
+def find_entry(
+    pages: list[str],
+    index: int,
+    word: str,
+    next_index: int | None,
+    next_word: str | None,
+) -> dict[str, object]:
+    start_pattern = re.compile(
+        rf"(?<!\d){index}\s+{re.escape(word)}\s+(?P<pos>{COMPOUND_POS_PATTERN})\s+"
+    )
+    matches: list[tuple[int, re.Match[str]]] = []
+    for page_number, page_text in enumerate(pages, start=1):
+        match = start_pattern.search(page_text)
+        if match:
+            matches.append((page_number, match))
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"Entry {index} {word!r}: expected one PDF match, found {len(matches)}."
+        )
+
+    page_number, match = matches[0]
+    page_text = pages[page_number - 1]
+    end = len(page_text)
+    if next_index is not None and next_word is not None:
+        next_pattern = re.compile(
+            rf"(?<!\d){next_index}\s+{re.escape(next_word)}\s+{COMPOUND_POS_PATTERN}\s+"
+        )
+        next_match = next_pattern.search(page_text, match.end())
+        if next_match:
+            end = next_match.start()
+
+    meaning = normalize_meaning(page_text[match.end():end])
+    if not meaning:
+        raise ValueError(f"Entry {index} {word!r}: blank meaning extracted from page {page_number}.")
+
+    return {
+        "Index": index,
+        "Word": word,
+        "POS": re.sub(r"\s+", "", match.group("pos")),
+        "Meaning": meaning,
+    }
+
+
+def extract_vocab_index(pdf_path: Path, index_path: Path) -> pd.DataFrame:
+    seed_rows = load_existing_words(index_path)
+    reader = PdfReader(str(pdf_path))
+    pages = [normalize_pdf_text(page.extract_text() or "") for page in reader.pages]
+
+    rows: list[dict[str, object]] = []
+    for offset, seed in enumerate(seed_rows):
+        next_seed = seed_rows[offset + 1] if offset + 1 < len(seed_rows) else None
+        rows.append(
+            find_entry(
+                pages=pages,
+                index=int(seed["Index"]),
+                word=str(seed["Word"]),
+                next_index=int(next_seed["Index"]) if next_seed else None,
+                next_word=str(next_seed["Word"]) if next_seed else None,
+            )
+        )
+
+    frame = pd.DataFrame(rows, columns=["Index", "Word", "POS", "Meaning"])
+    if len(frame) != EXPECTED_ENTRY_COUNT:
+        raise ValueError(
+            f"Expected {EXPECTED_ENTRY_COUNT} extracted entries, found {len(frame)}."
+        )
+    if frame[["Word", "POS", "Meaning"]].replace("", pd.NA).isna().any().any():
+        raise ValueError("Extracted index contains blank required fields.")
+    return frame
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Rebuild vocab_index.csv from the source PDF with authoritative POS and meaning."
+    )
+    parser.add_argument("--pdf", type=Path, help="Override source PDF path.")
+    parser.add_argument("--output", type=Path, help="Override vocab index output path.")
+    args = parser.parse_args()
+
+    base_dir = Path(__file__).resolve().parent.parent
+    pdf_path = args.pdf or base_dir / "core" / "assets" / "cap_vocab_2000_source.pdf"
+    output_path = args.output or base_dir / "core" / "assets" / "vocab_index.csv"
     if not pdf_path.exists():
-        print(f"❌ 找不到 PDF 檔案: {pdf_path}")
-        return
+        raise FileNotFoundError(f"Source PDF not found: {pdf_path}")
 
-    print(f"🚀 開始使用 LLM 解析 PDF：{pdf_path.name}")
-    reader = PdfReader(pdf_path)
-    full_vocab_list = []
+    frame = extract_vocab_index(pdf_path, output_path)
+    frame.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"Wrote {len(frame)} authoritative entries to {output_path}", flush=True)
 
-    # 逐頁讀取並請 AI 解析
-    for i, page in enumerate(reader.pages):
-        page_num = i + 1
-        print(f"⏳ 正在處理第 {page_num} / {len(reader.pages)} 頁...")
-        
-        page_text = page.extract_text()
-        if not page_text.strip():
-            continue
-            
-        page_data = extract_page_with_llm(page_text, page_num)
-        if page_data:
-            full_vocab_list.extend(page_data)
-            print(f"   ✅ 已擷取 {len(page_data)} 個單字")
-
-    # 儲存結果
-    if full_vocab_list:
-        df = pd.DataFrame(full_vocab_list)
-        
-        # 確保 Index 欄位是數字並排序
-        df['Index'] = pd.to_numeric(df['Index'], errors='coerce')
-        df = df.dropna(subset=['Index'])
-        df['Index'] = df['Index'].astype(int)
-        
-        # 排序並移除重複編號
-        df = df.sort_values("Index").drop_duplicates(subset=['Index'])
-        
-        # 建立目錄並存檔
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        
-        print(f"\n✨ 任務完成！")
-        print(f"📊 最終抓取單字量: {len(df)}")
-        print(f"📂 索引檔已儲存至: {output_path}")
-        print(f"🧐 前三個單字預覽：")
-        print(df.head(3))
-    else:
-        print("💥 失敗：未能從 PDF 中擷取到任何有效單字。")
 
 if __name__ == "__main__":
     main()

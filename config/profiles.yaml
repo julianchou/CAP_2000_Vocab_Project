@@ -35,3 +35,9 @@
     stages: config/short_generator/stages.yaml
     substeps: config/short_generator/substeps.yaml
     costs: config/short_generator/costs.yaml
+  - id: single_video
+    name: 單一影片生成器
+    workspace: workspaces/single_video
+    stages: config/single_video/stages.yaml
+    substeps: config/single_video/substeps.yaml
+    costs: config/single_video/costs.yaml

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -122,6 +123,16 @@ def detect_profile_id() -> str:
 def shared_prompt_path() -> Path:
     return base_dir / "config" / detect_profile_id() / "prompts" / "subtitle_review_prompt.txt"
 
+def read_youtube_title(target_folder: Path) -> str:
+    info_path = target_folder / "video_info.json"
+    if not info_path.exists():
+        return ""
+    try:
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("youtube_title") or "").strip() if isinstance(payload, dict) else ""
+
 DEFAULT_PROMPT_TEMPLATE = """你是一位專業的影片字幕校對專家。請針對以下 SRT 內容進行修正，並務必遵守下列規則：
 
 0. 參考資料：
@@ -191,11 +202,17 @@ def read_notebooklm_prompt_context(target_folder: Path, ep_num: int) -> str:
     return prompt_path.read_text(encoding="utf-8", errors="ignore").strip()
 
 
-def render_prompt(template_text: str, raw_srt_content: str, notebooklm_prompt: str = "") -> str:
+def render_prompt(
+    template_text: str,
+    raw_srt_content: str,
+    notebooklm_prompt: str = "",
+    youtube_title: str = "",
+) -> str:
     rendered = (
         template_text
         .replace("{{SRT_CONTENT}}", raw_srt_content)
         .replace("{{NOTEBOOKLM_PROMPT}}", notebooklm_prompt or "（未找到 No.8 output，請僅依原始字幕內容校對。）")
+        .replace("{{YOUTUBE_TITLE}}", youtube_title)
     )
     if "{{NOTEBOOKLM_PROMPT}}" not in template_text and notebooklm_prompt:
         rendered = (
@@ -912,13 +929,14 @@ def review_subtitles_chunked(
     output_srt: Path,
     term_candidates: set[str],
     provider_candidate: str,
+    youtube_title: str = "",
     chunk_size: int = SUBTITLE_REVIEW_CHUNK_CUES,
     chunk_overlap: int = SUBTITLE_REVIEW_CHUNK_OVERLAP,
 ) -> tuple[str, str, str]:
     raw_items = parse_srt_or_raise(raw_srt_content)
     chunks = split_subtitle_items(raw_items, chunk_size, chunk_overlap)
     if len(chunks) <= 1:
-        prompt = render_prompt(prompt_template, raw_srt_content, notebooklm_prompt)
+        prompt = render_prompt(prompt_template, raw_srt_content, notebooklm_prompt, youtube_title)
         cleaned_srt, provider_used = call_subtitle_review_llm(prompt, provider_candidate)
         cleaned_srt, message = validate_or_repair_llm_srt(
             raw_srt_content,
@@ -942,7 +960,7 @@ def review_subtitles_chunked(
         original_start = int(original_chunk[0].index)
         original_end = int(original_chunk[-1].index)
         chunk_raw_srt = compose_reindexed_srt(original_chunk, start_index=1)
-        chunk_prompt = render_prompt(prompt_template, chunk_raw_srt, notebooklm_prompt)
+        chunk_prompt = render_prompt(prompt_template, chunk_raw_srt, notebooklm_prompt, youtube_title)
         print(
             f"Subtitle review chunk {chunk_index}/{len(chunks)} "
             f"raw_cues={original_start}-{original_end} provider={provider_candidate}"
@@ -1013,6 +1031,9 @@ def review_subtitles_with_llm(ep_num: int, provider: str = "auto") -> bool:
     notebooklm_prompt = read_notebooklm_prompt_context(target_folder, ep_num)
     prompt_template_path = ensure_prompt_template(target_folder)
     prompt_template = prompt_template_path.read_text(encoding="utf-8")
+    youtube_title = read_youtube_title(target_folder)
+    if youtube_title:
+        print(f"Loaded YouTube title: {youtube_title}")
     if notebooklm_prompt:
         print(f"Loaded No.8 NotebookLM prompt context: {notebooklm_prompt_output_path(target_folder, ep_num)}")
     else:
@@ -1034,6 +1055,7 @@ def review_subtitles_with_llm(ep_num: int, provider: str = "auto") -> bool:
                 raw_srt_content=raw_srt_content,
                 prompt_template=prompt_template,
                 notebooklm_prompt=notebooklm_prompt,
+                youtube_title=youtube_title,
                 output_srt=output_srt,
                 term_candidates=term_candidates,
                 provider_candidate=provider_candidate,

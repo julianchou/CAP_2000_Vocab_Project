@@ -23,6 +23,11 @@ NVIDIA_IMAGE_SIZE = os.getenv("CAP_SHORT_NVIDIA_IMAGE_SIZE", os.getenv("NVIDIA_S
 SHORT_IMAGE_SIZE = (1080, 1920)
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".m4v"}
+TEXT_FREE_IMAGE_INSTRUCTION = (
+    "The final image must contain no readable text in any language: no words, letters, "
+    "numbers, captions, labels, signs, document text, screen text, logos, or watermarks. "
+    "Communicate the concept only through people, objects, actions, symbols, color, and composition."
+)
 
 
 class ImageQuotaExhausted(RuntimeError):
@@ -101,7 +106,7 @@ def scene_prompt(scene: dict) -> str:
         prompt = f"{summary}. Vertical 9:16 short video frame, cinematic lighting, clear subject."
     if "9:16" not in prompt and "vertical" not in prompt.lower():
         prompt = prompt.rstrip(" .") + ". Vertical 9:16 short video frame."
-    return prompt
+    return f"{prompt.rstrip()} {TEXT_FREE_IMAGE_INSTRUCTION}"
 
 
 def save_placeholder(path: Path, scene: dict, message: str) -> None:

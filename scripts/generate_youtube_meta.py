@@ -172,9 +172,22 @@ def detect_profile_id() -> str:
         return workspace_dir.name
     return "default"
 
+def is_single_video_profile() -> bool:
+    return detect_profile_id() == "single_video"
+
 
 def shared_prompt_path() -> Path:
     return base_dir / "config" / detect_profile_id() / "prompts" / "youtube_meta_prompt.txt"
+
+def read_youtube_title(target_folder: Path) -> str:
+    info_path = target_folder / "video_info.json"
+    if not info_path.exists():
+        return ""
+    try:
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("youtube_title") or "").strip() if isinstance(payload, dict) else ""
 
 
 def ensure_prompt_template(_target_folder: Path) -> Path:
@@ -185,12 +198,19 @@ def ensure_prompt_template(_target_folder: Path) -> Path:
     return prompt_path
 
 
-def render_prompt(template_text: str, start_word: int, end_word: int, srt_content: str) -> str:
+def render_prompt(
+    template_text: str,
+    start_word: int,
+    end_word: int,
+    srt_content: str,
+    youtube_title: str = "",
+) -> str:
     return (
         template_text
         .replace("{{START_WORD}}", str(start_word))
         .replace("{{END_WORD}}", str(end_word))
         .replace("{{SRT_CONTENT}}", srt_content)
+        .replace("{{YOUTUBE_TITLE}}", youtube_title)
     )
 
 
@@ -232,7 +252,10 @@ def generate_youtube_meta(ep_num: int, provider: str = "auto"):
     srt_content = srt_path.read_text(encoding="utf-8")
     prompt_template_path = ensure_prompt_template(target_folder)
     prompt_template = prompt_template_path.read_text(encoding="utf-8")
-    prompt = render_prompt(prompt_template, start_word, end_word, srt_content)
+    youtube_title = read_youtube_title(target_folder)
+    if youtube_title:
+        print(f"Loaded YouTube title: {youtube_title}")
+    prompt = render_prompt(prompt_template, start_word, end_word, srt_content, youtube_title)
 
     provider = normalize_provider(provider)
     print(
@@ -244,15 +267,19 @@ def generate_youtube_meta(ep_num: int, provider: str = "auto"):
     try:
         ai_data, provider_used = generate_meta_json(prompt, provider)
         print(f"YouTube metadata provider used: {provider_used}")
-        final_description = build_final_description(ai_data)
+        final_description = (
+            str(ai_data.get("description") or ai_data.get("summary") or "").strip()
+            if is_single_video_profile()
+            else build_final_description(ai_data)
+        )
 
-        fixed_title = (
+        fixed_title = youtube_title or (
             f"考前必聽｜國中英文會考2000單字攻略-EP{ep_num:02d} "
             f"({start_word:03d}-{end_word:03d})"
         )
 
         meta_data = {
-            "title": fixed_title,
+            "title": str(ai_data.get("title") or fixed_title).strip() if is_single_video_profile() else fixed_title,
             "description": final_description,
             "tags": ai_data.get("tags", []),
             "drive_link": "",

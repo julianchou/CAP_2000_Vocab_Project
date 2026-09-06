@@ -12,6 +12,7 @@ google-auth-oauthlib         # Google OAuth 2.0 登入驗證套件
 # --- 資料處理與素材處理 ---
 pandas                       # 用於處理 CSV 與單字清單
 openpyxl                     # 讓 pandas 支援讀寫 Excel 檔案
+PyPDF2                       # Parse the authoritative CAP vocabulary source PDF
 Pillow                       # 用於圖片與圖卡處理 (PIL)
 requests                     # 用於呼叫 API 與下載網路檔案
 

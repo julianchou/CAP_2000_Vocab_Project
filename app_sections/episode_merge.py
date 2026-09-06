@@ -70,6 +70,13 @@ def _root() -> Path:
 
 MERGE_PROFILE_ID = "episode_merge"
 
+def path_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime), int(stat.st_size))
+    except OSError:
+        return (0, 0)
+
 def merge_jobs_dir() -> Path:
     path = _root() / "runtime" / "merge_jobs"
     path.mkdir(parents=True, exist_ok=True)
@@ -166,20 +173,45 @@ def source_subtitle_path(profile_id: str, ep_path: Path) -> Path | None:
             return path
     return None
 
-def list_merge_episode_sources(profile_id: str) -> list[dict]:
+def merge_episode_sources_signature(profile_id: str) -> tuple:
     profile_data = profiles.get(profile_id, {})
     workspace = profile_data.get("workspace", "")
-    rows = []
+    sig = []
     for ep_path in list_episode_dirs(_root(), workspace):
+        video_path = source_video_path(profile_id, ep_path)
+        variants = source_video_variants(profile_id, ep_path)
+        subtitle_path = source_subtitle_path(profile_id, ep_path)
+        sig.append(
+            (
+                ep_path.name,
+                path_signature(video_path),
+                path_signature(Path(variants.get("no_outro", ""))),
+                path_signature(Path(variants.get("with_outro", ""))),
+                path_signature(subtitle_path) if subtitle_path else (0, 0),
+            )
+        )
+    return tuple(sig)
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _list_merge_episode_sources_cached(
+    root_path: str,
+    profile_id: str,
+    profile_name: str,
+    workspace: str,
+    signature: tuple,
+) -> list[dict]:
+    rows = []
+    root = Path(root_path)
+    for ep_path in list_episode_dirs(root, workspace):
         info = parse_episode_info(ep_path)
         video_path = source_video_path(profile_id, ep_path)
         video_variants = source_video_variants(profile_id, ep_path)
         subtitle_path = source_subtitle_path(profile_id, ep_path)
-        duration = media_duration_seconds(str(video_path)) if video_path.exists() else None
+        duration = None
         rows.append(
             {
                 "profile_id": profile_id,
-                "profile_name": profile_data.get("name", profile_id),
+                "profile_name": profile_name,
                 "ep": int(info.get("ep") or 0),
                 "range": f"{int(info.get('start') or 0):04d}-{int(info.get('end') or 0):04d}",
                 "ep_path": str(ep_path),
@@ -195,6 +227,18 @@ def list_merge_episode_sources(profile_id: str) -> list[dict]:
             }
         )
     return sorted(rows, key=lambda row: int(row.get("ep") or 0))
+
+def list_merge_episode_sources(profile_id: str) -> list[dict]:
+    profile_data = profiles.get(profile_id, {})
+    workspace = str(profile_data.get("workspace", "") or "")
+    profile_name = str(profile_data.get("name", profile_id) or profile_id)
+    return _list_merge_episode_sources_cached(
+        str(_root()),
+        profile_id,
+        profile_name,
+        workspace,
+        merge_episode_sources_signature(profile_id),
+    )
 
 def merge_source_label(row: dict) -> str:
     ep_text = f"Ep{int(row.get('ep') or 0):02d}"
@@ -249,6 +293,7 @@ def write_merge_saved_config(title: str, items: list[dict], config_id: str = "")
     clean_items = []
     for idx, item in enumerate(items, start=1):
         item = normalize_merge_item(item, idx, default_include_outro=(idx == len(items)))
+        duration = merge_item_duration_seconds(item, probe_missing=True)
         clean_items.append(
             {
                 "order": idx,
@@ -263,6 +308,7 @@ def write_merge_saved_config(title: str, items: list[dict], config_id: str = "")
                 "include_outro": bool(item.get("include_outro")),
                 "merge_video_path": item.get("merge_video_path", ""),
                 "subtitle_path": item.get("subtitle_path", ""),
+                "duration": duration,
             }
         )
     payload = {
@@ -344,23 +390,25 @@ def merge_saved_config_label(config: dict) -> str:
     count = len(config.get("items") or [])
     return f"{title} | {count} 支影片 | {updated}"
 
-def merge_item_duration_seconds(item: dict) -> float | None:
+def merge_item_duration_seconds(item: dict, probe_missing: bool = True) -> float | None:
     duration = item.get("duration")
     if duration not in (None, ""):
         try:
             return max(float(duration), 0.0)
         except Exception:
             pass
+    if not probe_missing:
+        return None
     video_path = selected_merge_video_path(item).strip() or str(item.get("video_path") or "").strip()
     if not video_path:
         return None
     return media_duration_seconds(video_path)
 
-def merge_queue_duration_seconds(items: list[dict]) -> tuple[float, int]:
+def merge_queue_duration_seconds(items: list[dict], probe_missing: bool = True) -> tuple[float, int]:
     total = 0.0
     missing = 0
     for item in items:
-        duration = merge_item_duration_seconds(item)
+        duration = merge_item_duration_seconds(item, probe_missing=probe_missing)
         if duration is None:
             missing += 1
         else:
@@ -481,9 +529,16 @@ def start_merge_upload_job(job: dict, privacy: str, publish_at: str = "", playli
     except Exception as exc:
         return {"ok": False, "message": str(exc), "log": str(log_path)}
 
-def list_merge_jobs_for_config(config_id: str = "") -> list[dict]:
-    jobs = []
+def merge_jobs_signature() -> tuple:
+    sig = []
     for path in merge_jobs_dir().glob("merge_*.json"):
+        sig.append((path.name, path_signature(path)))
+    return tuple(sorted(sig))
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _list_merge_jobs_for_config_cached(jobs_dir: str, config_id: str, signature: tuple) -> list[dict]:
+    jobs = []
+    for path in Path(jobs_dir).glob("merge_*.json"):
         try:
             job = json.loads(path.read_text(encoding="utf-8"))
             if config_id and str(job.get("saved_config_id") or "") != str(config_id):
@@ -493,6 +548,13 @@ def list_merge_jobs_for_config(config_id: str = "") -> list[dict]:
             continue
     jobs.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
     return jobs
+
+def list_merge_jobs_for_config(config_id: str = "") -> list[dict]:
+    return _list_merge_jobs_for_config_cached(
+        str(merge_jobs_dir()),
+        str(config_id or ""),
+        merge_jobs_signature(),
+    )
 
 def merge_job_output_video_path(job: dict) -> Path:
     explicit = str(job.get("output_video") or "").strip()
@@ -650,7 +712,25 @@ def parse_source_chapters_from_metadata(meta: dict) -> list[dict]:
             chapters.append({"seconds": seconds, "title": title})
     return chapters
 
-def merge_source_metadata_bundle(job: dict) -> dict:
+def merge_source_metadata_bundle_signature(job: dict) -> tuple:
+    sig = []
+    for item in job.get("items") or []:
+        selected_video = Path(selected_merge_video_path(item))
+        metadata_paths = merge_source_metadata_paths(item)
+        sig.append(
+            (
+                str(item.get("profile_id") or ""),
+                int(item.get("ep") or 0),
+                str(item.get("range") or ""),
+                path_signature(selected_video),
+                tuple((str(path), path_signature(path)) for path in metadata_paths),
+            )
+        )
+    return tuple(sig)
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _merge_source_metadata_bundle_cached(job_json: str, signature: tuple) -> dict:
+    job = json.loads(job_json)
     sources = []
     merged_chapters = []
     offset = 0.0
@@ -715,6 +795,10 @@ def merge_source_metadata_bundle(job: dict) -> dict:
         "total_episodes": len(job.get("items") or []),
         "total_duration_seconds": offset,
     }
+
+def merge_source_metadata_bundle(job: dict) -> dict:
+    job_json = json.dumps(job, ensure_ascii=False, sort_keys=True)
+    return _merge_source_metadata_bundle_cached(job_json, merge_source_metadata_bundle_signature(job))
 
 def extract_json_object(text: str) -> dict:
     raw = str(text or "").strip()
@@ -1196,6 +1280,7 @@ def render_episode_merge_workspace() -> None:
                     queue = [normalize_merge_item(row, idx, default_include_outro=False) for idx, row in enumerate(queue, start=1)]
                     item["include_outro"] = True
                     item = normalize_merge_item(item, len(queue) + 1, default_include_outro=True)
+                    item["duration"] = merge_item_duration_seconds(item, probe_missing=True)
                     queue.append(item)
                     st.session_state["merge_queue"] = queue
                     st.session_state["merge_editor_sig"] = int(st.session_state.get("merge_editor_sig", 0) or 0) + 1
@@ -1211,6 +1296,7 @@ def render_episode_merge_workspace() -> None:
             table_rows = []
             queue = [normalize_merge_item(item, idx, default_include_outro=(idx == len(queue))) for idx, item in enumerate(queue, start=1)]
             for idx, item in enumerate(queue, start=1):
+                item_duration = merge_item_duration_seconds(item, probe_missing=False)
                 table_rows.append(
                     {
                         "順序": idx,
@@ -1218,7 +1304,7 @@ def render_episode_merge_workspace() -> None:
                         "專案模式": item.get("profile_name", item.get("profile_id", "")),
                         "集數": f"Ep{int(item.get('ep') or 0):02d}",
                         "範圍": item.get("range", ""),
-                        "時間長度": seconds_to_label(merge_item_duration_seconds(item)) if merge_item_duration_seconds(item) is not None else "未知",
+                        "時間長度": seconds_to_label(item_duration) if item_duration is not None else "未知",
                         "字幕": "有" if item.get("subtitle_path") else "無",
                         "影片路徑": item.get("video_path", ""),
                     }
@@ -1241,7 +1327,7 @@ def render_episode_merge_workspace() -> None:
                 disabled=["專案模式", "集數", "範圍", "時間長度", "字幕", "影片路徑"],
             )
             preview_queue = queue_from_editor(queue, edited)
-            total_duration, missing_duration_count = merge_queue_duration_seconds(preview_queue)
+            total_duration, missing_duration_count = merge_queue_duration_seconds(preview_queue, probe_missing=False)
             duration_cols = st.columns([1.2, 1.2, 3.6])
             duration_cols[0].metric("合併後時間長度", seconds_to_label(total_duration))
             duration_cols[1].metric("待合併影片數", len(preview_queue))
@@ -1319,7 +1405,7 @@ def render_episode_merge_workspace() -> None:
 
             st.subheader("合併 / 排程執行 Log")
             selected_merge_config_id = str(st.session_state.get("merge_loaded_config_id") or "")
-            merge_log_jobs = list_merge_jobs_for_config(selected_merge_config_id)[:8]
+            merge_log_jobs = list_merge_jobs_for_config(selected_merge_config_id)[:8] if selected_merge_config_id else []
             if not merge_log_jobs:
                 st.caption("尚無合併或排程執行紀錄。")
             else:
@@ -1359,10 +1445,12 @@ def render_episode_merge_workspace() -> None:
         else:
             st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
 
-        preview_jobs = [
-            job for job in list_merge_jobs_for_config(selected_preview_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
-        ]
+        preview_jobs = []
+        if selected_preview_config_id:
+            preview_jobs = [
+                job for job in list_merge_jobs_for_config(selected_preview_config_id)
+                if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
+            ]
         if not preview_jobs:
             st.info("尚無可預覽的合併結果。請先完成一次合併。")
         else:
@@ -1450,10 +1538,12 @@ def render_episode_merge_workspace() -> None:
         else:
             st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
 
-        metadata_jobs = [
-            job for job in list_merge_jobs_for_config(selected_metadata_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_subtitle_path(job).exists()
-        ]
+        metadata_jobs = []
+        if selected_metadata_config_id:
+            metadata_jobs = [
+                job for job in list_merge_jobs_for_config(selected_metadata_config_id)
+                if str(job.get("status") or "").lower() == "done" and merge_job_output_subtitle_path(job).exists()
+            ]
         if not metadata_jobs:
             st.info("尚無可產生 Metadata 的合併結果。請先完成一次合併。")
         else:
@@ -1557,10 +1647,12 @@ def render_episode_merge_workspace() -> None:
         else:
             st.caption("目前未選擇已儲存合併設定，顯示全部已完成合併結果。")
 
-        publish_jobs = [
-            job for job in list_merge_jobs_for_config(selected_publish_config_id)
-            if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
-        ]
+        publish_jobs = []
+        if selected_publish_config_id:
+            publish_jobs = [
+                job for job in list_merge_jobs_for_config(selected_publish_config_id)
+                if str(job.get("status") or "").lower() == "done" and merge_job_output_video_path(job).exists()
+            ]
         if not publish_jobs:
             st.info("尚無可發布的合併結果。請先完成合併。")
         else:
@@ -1728,6 +1820,9 @@ def render_episode_merge_workspace() -> None:
 
         @st.fragment(run_every=5 if auto_refresh else None)
         def render_merge_logs():
+            if not selected_log_config_id:
+                st.caption("請先選擇已儲存合併設定。")
+                return
             jobs = list_merge_jobs_for_config(selected_log_config_id)
             if not jobs:
                 st.caption("尚無合併 Log。")

@@ -113,13 +113,30 @@ def load_host_profile_json_text() -> str:
         return "{}"
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
+def read_youtube_title(episode_folder: Path) -> str:
+    info_path = episode_folder / "video_info.json"
+    if not info_path.exists():
+        return ""
+    try:
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("youtube_title") or "").strip() if isinstance(payload, dict) else ""
 
-def render_prompt(template_text: str, ep_num: int, vocab_list_text: str, host_profile_json_text: str) -> str:
+
+def render_prompt(
+    template_text: str,
+    ep_num: int,
+    vocab_list_text: str,
+    host_profile_json_text: str,
+    youtube_title: str = "",
+) -> str:
     return (
         template_text
         .replace("{{EPISODE}}", str(ep_num))
         .replace("{{VOCAB_LIST}}", vocab_list_text)
         .replace("{{HOST_PROFILE_JSON}}", host_profile_json_text)
+        .replace("{{YOUTUBE_TITLE}}", youtube_title)
     ).strip() + "\n"
 
 
@@ -151,6 +168,7 @@ def generate_ai_cover(ep_num: int) -> None:
         ep_num,
         build_vocab_list_text(vocab_df),
         load_host_profile_json_text(),
+        read_youtube_title(episode_folder),
     )
 
     prompt_output_path = images_dir / f"cover_prompt_ep{ep_num:02d}.txt"

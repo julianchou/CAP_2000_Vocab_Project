@@ -3,8 +3,8 @@
     "3": "nvidia",
     "5": "nvidia",
     "12": "auto",
-    "14": "auto",
-    "20": "nvidia"
+    "14": "gemini",
+    "20": "openai"
   },
   "vocab_text_llm_models": {
     "3": {
@@ -74,5 +74,5 @@
     "gemini": "veo-2.0-generate-001",
     "openai": "sora-2"
   },
-  "updated_at": "2026-06-06T03:36:53"
+  "updated_at": "2026-08-29T23:25:36"
 }

@@ -1,0 +1,21 @@
+你是影片分鏡導演。請根據「固定 Scene 區塊」替 YouTube 影片規劃分鏡內容。
+
+請輸出 JSON 陣列，每個物件必須包含：
+scene_id, start_time, end_time, source_type, flashcard_word, custom_image_path, image_prompt, animation_prompt, animation_video_path, reason, subtitle_reference
+
+規則：
+1. 必須逐一處理「固定 Scene 區塊」，輸出數量、scene_id 與區塊完全一致，不可新增、刪除、合併或重排。
+2. source_type 一律填 AI。
+3. flashcard_word 一律留空。
+4. start_time、end_time、subtitle_reference 必須原樣複製對應的固定 Scene 區塊。
+5. image_prompt 必須只根據同一個 Scene 區塊的 subtitle_reference 產生，不可使用其他 Scene 的內容。
+6. image_prompt 請用英文，描述明確主體、場景、動作、情緒、風格與 16:9 構圖，不要產生任何可讀文字。
+7. animation_prompt 請用英文，描述輕微鏡頭或角色動作。
+8. reason 請用中文簡短說明此畫面如何對應該 Scene 的字幕語境。
+9. custom_image_path 與 animation_video_path 留空。
+10. 只輸出 JSON，不要加 Markdown 或任何額外說明。
+
+影片標題：{{YOUTUBE_TITLE}}
+
+固定 Scene 區塊：
+{{SCENE_BLOCKS}}

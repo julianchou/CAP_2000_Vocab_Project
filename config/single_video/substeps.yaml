@@ -1,0 +1,119 @@
+substeps:
+  - no: "1"
+    key: "single_audio_upload"
+    name: "上傳語音音訊"
+    rule: any
+    outputs:
+      - pattern: "01_audio/notebooklm_audio.m4a"
+        nonempty: true
+
+  - no: "2"
+    key: "single_whisper_subtitles"
+    name: "Whisper 產生字幕"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio.srt"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/generate_subtitles_only.py
+      args: ["--ep", "{ep}"]
+
+  - no: "3"
+    key: "single_ai_subtitle_review"
+    name: "AI 字幕校對"
+    rule: any
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/llm_subtitle_reviewer.py
+      args: ["--ep", "{ep}", "--provider", "openai"]
+
+  - no: "4"
+    key: "single_manual_subtitle_confirm"
+    name: "人工字幕確認"
+    rule: all
+    outputs:
+      - pattern: "02_subtitles/notebooklm_audio_fixed.srt"
+        nonempty: true
+      - pattern: "00_logs/step4_manual_done.txt"
+
+  - no: "5"
+    key: "single_storyboard_ai"
+    name: "AI 依語境分鏡規劃"
+    rule: any
+    outputs:
+      - pattern: "03_storyboards/storyboard.csv"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/llm_director.py
+      args: ["--ep", "{ep}", "--provider", "openai"]
+
+  - no: "6"
+    key: "single_storyboard_images"
+    name: "AI 產生分鏡圖片"
+    rule: any
+    outputs:
+      - pattern: "04_images/preview_images/*.*"
+      - pattern: "04_images/ai_generated/*.png"
+    run:
+      type: python
+      script: scripts/gen_matched_preview_v4.py
+      args: ["--ep", "{ep}", "--provider", "nvidia"]
+
+  - no: "7"
+    key: "single_outro"
+    name: "片尾製作"
+    rule: all
+    outputs:
+      - pattern: "05_output/outro/outro_config.json"
+        nonempty: true
+      - pattern: "05_output/outro/outro_media.*"
+        nonempty: true
+
+  - no: "8"
+    key: "single_inputs_list"
+    name: "產生合成清單"
+    rule: any
+    outputs:
+      - pattern: "05_output/inputs.txt"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/gen_matched_preview_v4.py
+      args: ["--ep", "{ep}"]
+
+  - no: "9"
+    key: "single_render"
+    name: "FFmpeg 影片合成"
+    rule: any
+    outputs:
+      - pattern: "05_output/final_video.mp4"
+        nonempty: true
+    run:
+      type: python
+      script: run_stage6_render.py
+      args: ["--ep", "{ep}"]
+
+  - no: "10"
+    key: "single_youtube_meta"
+    name: "產生 Youtube metadata"
+    rule: any
+    outputs:
+      - pattern: "05_output/youtube_meta.json"
+        nonempty: true
+    run:
+      type: python
+      script: scripts/generate_youtube_meta.py
+      args: ["--ep", "{ep}"]
+
+  - no: "11"
+    key: "single_upload_youtube"
+    name: "上傳 Youtube"
+    rule: any
+    outputs:
+      - pattern: "05_output/upload.ok"
+        nonempty: true

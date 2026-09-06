@@ -237,6 +237,24 @@ def write_json_file(path: Path, payload) -> Path:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
+def detect_profile_id() -> str:
+    profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
+    if profile_id:
+        return profile_id
+    if workspace_dir.parent.name == "workspaces" and workspace_dir.name:
+        return workspace_dir.name
+    return "default"
+
+def read_youtube_title(target_folder: Path) -> str:
+    info_path = target_folder / "video_info.json"
+    if not info_path.exists():
+        return ""
+    try:
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("youtube_title") or "").strip() if isinstance(payload, dict) else ""
+
 
 def write_storyboard_csv(path: Path, scenes: list[dict]) -> Path:
     fieldnames = [
@@ -247,6 +265,8 @@ def write_storyboard_csv(path: Path, scenes: list[dict]) -> Path:
         "flashcard_word",
         "custom_image_path",
         "image_prompt",
+        "animation_prompt",
+        "animation_video_path",
         "reason",
         "subtitle_reference",
     ]
@@ -346,14 +366,6 @@ def generate_storyboard_json(prompt: str, provider: str) -> tuple[list[dict], st
 
     raise RuntimeError("Storyboard generation failed: " + " | ".join(errors))
 
-def detect_profile_id() -> str:
-    profile_id = str(os.environ.get("CAP_PROFILE_ID", "")).strip()
-    if profile_id:
-        return profile_id
-    if workspace_dir.parent.name == "workspaces" and workspace_dir.name:
-        return workspace_dir.name
-    return "default"
-
 def shared_prompt_path() -> Path:
     return base_dir / "config" / detect_profile_id() / "prompts" / "storyboard_prompt.txt"
 
@@ -406,6 +418,29 @@ DEFAULT_PROMPT_TEMPLATE = """你是一位專業的英語教學影片分鏡導演
 {{SRT_CONTENT}}
 """
 
+DEFAULT_SINGLE_VIDEO_PROMPT_TEMPLATE = """你是影片分鏡導演。請根據「固定 Scene 區塊」替 YouTube 影片規劃分鏡內容。
+
+請輸出 JSON 陣列，每個物件必須包含：
+scene_id, start_time, end_time, source_type, flashcard_word, custom_image_path, image_prompt, animation_prompt, animation_video_path, reason, subtitle_reference
+
+規則：
+1. 必須逐一處理「固定 Scene 區塊」，輸出數量、scene_id 與區塊完全一致，不可新增、刪除、合併或重排。
+2. source_type 一律填 AI。
+3. flashcard_word 一律留空。
+4. start_time、end_time、subtitle_reference 必須原樣複製對應的固定 Scene 區塊。
+5. image_prompt 必須只根據同一個 Scene 區塊的 subtitle_reference 產生，不可使用其他 Scene 的內容。
+6. image_prompt 請用英文，描述明確主體、場景、動作、情緒、風格與 16:9 構圖，不要產生任何可讀文字。
+7. animation_prompt 請用英文，描述輕微鏡頭或角色動作。
+8. reason 請用中文簡短說明此畫面如何對應該 Scene 的字幕語境。
+9. custom_image_path 與 animation_video_path 留空。
+10. 只輸出 JSON，不要加 Markdown 或任何額外說明。
+
+影片標題：{{YOUTUBE_TITLE}}
+
+固定 Scene 區塊：
+{{SCENE_BLOCKS}}
+"""
+
 
 def prompt_template_path_for(_target_folder: Path) -> Path:
     return shared_prompt_path()
@@ -415,7 +450,8 @@ def ensure_prompt_template(target_folder: Path) -> Path:
     prompt_path = prompt_template_path_for(target_folder)
     if not prompt_path.exists():
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_path.write_text(DEFAULT_PROMPT_TEMPLATE, encoding="utf-8")
+        default_template = DEFAULT_SINGLE_VIDEO_PROMPT_TEMPLATE if detect_profile_id() == "single_video" else DEFAULT_PROMPT_TEMPLATE
+        prompt_path.write_text(default_template, encoding="utf-8")
     return prompt_path
 
 
@@ -585,6 +621,7 @@ def render_prompt(
     srt_text: str,
     cloze_card_rules: str,
     host_profile_rules: str,
+    youtube_title: str = "",
 ) -> str:
     rendered = (
         template_text
@@ -592,6 +629,7 @@ def render_prompt(
         .replace("{{CLOZE_CARD_RULES}}", cloze_card_rules)
         .replace("{{HOST_PROFILE_RULES}}", host_profile_rules)
         .replace("{{SRT_CONTENT}}", srt_text)
+        .replace("{{YOUTUBE_TITLE}}", youtube_title)
     )
     if "{{CLOZE_CARD_RULES}}" not in template_text and cloze_card_rules.strip():
         rendered += "\n\nCloze card rules:\n" + cloze_card_rules.strip()
@@ -604,6 +642,267 @@ def render_prompt(
         "- If the episode ends at the last subtitle, the storyboard must also end there.\n"
     )
     return rendered
+
+def build_single_video_fallback_storyboard(subs: list[srt.Subtitle]) -> list[dict]:
+    scenes = []
+    if not subs:
+        return scenes
+    chunk_size = max(int(os.getenv("CAP_SINGLE_VIDEO_SCENE_SUBTITLE_CUES", "3") or "3"), 1)
+    for idx in range(0, len(subs), chunk_size):
+        chunk = subs[idx: idx + chunk_size]
+        start_time = round(chunk[0].start.total_seconds(), 3)
+        end_time = round(chunk[-1].end.total_seconds(), 3)
+        subtitle_reference = " | ".join(
+            re.sub(r"\s+", " ", str(item.content or "")).strip()
+            for item in chunk
+            if str(item.content or "").strip()
+        )
+        focus = english_fragments_from_subtitle_reference(subtitle_reference, max_chars=220)
+        if not focus:
+            focus = "the main idea from this spoken segment"
+        scenes.append({
+            "scene_id": len(scenes) + 1,
+            "start_time": start_time,
+            "end_time": end_time,
+            "source_type": "AI",
+            "flashcard_word": "",
+            "custom_image_path": "",
+            "image_prompt": ensure_visual_suffix(
+                "Bright cinematic YouTube explainer scene, visually representing "
+                f"{focus}"
+            ),
+            "animation_prompt": "Subtle camera push-in with gentle ambient motion, no text overlays.",
+            "animation_video_path": "",
+            "reason": f"字幕 {idx + 1}-{idx + len(chunk)} 的語境畫面",
+            "subtitle_reference": subtitle_reference,
+        })
+    return scenes
+
+def single_video_subtitle_groups(subs: list[srt.Subtitle], group_count: int) -> list[tuple[float, float, str]]:
+    if not subs or group_count <= 0:
+        return []
+    groups = []
+    total = len(subs)
+    for idx in range(group_count):
+        start_idx = int(idx * total / group_count)
+        end_idx = int((idx + 1) * total / group_count) - 1
+        end_idx = max(start_idx, min(end_idx, total - 1))
+        chunk = subs[start_idx: end_idx + 1]
+        if not chunk:
+            continue
+        subtitle_reference = " | ".join(
+            re.sub(r"\s+", " ", str(item.content or "")).strip()
+            for item in chunk
+            if str(item.content or "").strip()
+        )
+        groups.append((
+            round(chunk[0].start.total_seconds(), 3),
+            round(chunk[-1].end.total_seconds(), 3),
+            subtitle_reference,
+        ))
+    return groups
+
+def single_video_scene_count(timeline_end: float, subtitle_count: int) -> int:
+    configured = str(os.getenv("CAP_SINGLE_VIDEO_SCENE_COUNT", "")).strip()
+    if configured:
+        try:
+            return max(1, min(int(configured), max(subtitle_count, 1)))
+        except ValueError:
+            pass
+    target_seconds = max(safe_float(os.getenv("CAP_SINGLE_VIDEO_TARGET_SCENE_SECONDS"), 18.0), 5.0)
+    estimated = max(1, round(max(timeline_end, 0.2) / target_seconds))
+    return max(1, min(estimated, max(subtitle_count, 1), 80))
+
+def single_video_scene_blocks(subs: list[srt.Subtitle], group_count: int) -> list[dict]:
+    blocks = []
+    for idx, (start_time, end_time, subtitle_reference) in enumerate(single_video_subtitle_groups(subs, group_count), start=1):
+        blocks.append({
+            "scene_id": idx,
+            "start_time": start_time,
+            "end_time": end_time,
+            "subtitle_reference": subtitle_reference,
+        })
+    return blocks
+
+def single_video_timeline_invalid(scenes: list[dict], timeline_end: float) -> bool:
+    if not scenes:
+        return True
+    previous_end = -1.0
+    ranges: list[tuple[float, float]] = []
+    for scene in scenes:
+        start_time = safe_float(scene.get("start_time"), -1.0)
+        end_time = safe_float(scene.get("end_time"), -1.0)
+        if start_time < 0 or end_time <= start_time:
+            return True
+        if previous_end >= 0 and start_time < previous_end - 0.05:
+            return True
+        previous_end = end_time
+        ranges.append((round(start_time, 3), round(end_time, 3)))
+    if timeline_end > 5 and previous_end < max(timeline_end * 0.75, timeline_end - 5):
+        return True
+    unique_ranges = len(set(ranges))
+    if len(ranges) >= 3 and unique_ranges <= max(1, len(ranges) // 3):
+        return True
+    return False
+
+def single_video_fallback_scene_for_block(block: dict) -> dict:
+    subtitle_reference = str(block.get("subtitle_reference") or "").strip()
+    focus = english_fragments_from_subtitle_reference(subtitle_reference, max_chars=220)
+    if not focus:
+        focus = "the main idea from this spoken segment"
+    return {
+        "image_prompt": ensure_visual_suffix(
+            "Bright cinematic YouTube explainer scene, visually representing "
+            f"{focus}"
+        ),
+        "animation_prompt": "Subtle camera push-in with gentle ambient motion, no text overlays.",
+        "animation_video_path": "",
+        "reason": "依此字幕區塊產生語境畫面",
+    }
+
+def normalize_single_video_scene_for_block(scene: dict, block: dict, idx: int) -> dict:
+    source = dict(scene or {})
+    if not str(source.get("image_prompt") or "").strip():
+        source.update(single_video_fallback_scene_for_block(block))
+    start_time = safe_float(block.get("start_time"), 0.0)
+    end_time = max(safe_float(block.get("end_time"), start_time + 0.2), start_time + 0.2)
+    return {
+        "scene_id": idx,
+        "start_time": round(start_time, 3),
+        "end_time": round(end_time, 3),
+        "source_type": "AI",
+        "flashcard_word": "",
+        "custom_image_path": str(source.get("custom_image_path") or "").strip(),
+        "image_prompt": sanitize_image_prompt({**source, "source_type": "AI"}),
+        "animation_prompt": str(source.get("animation_prompt") or "Subtle camera movement with gentle natural motion.").strip(),
+        "animation_video_path": str(source.get("animation_video_path") or "").strip(),
+        "reason": str(source.get("reason") or "依此字幕區塊產生語境畫面").strip(),
+        "subtitle_reference": str(block.get("subtitle_reference") or "").strip(),
+    }
+
+def apply_single_video_scene_blocks(scenes: list[dict], blocks: list[dict]) -> list[dict]:
+    if not blocks:
+        return []
+    scenes_by_id: dict[int, dict] = {}
+    ordered_scenes = [scene for scene in scenes if isinstance(scene, dict)]
+    for scene in ordered_scenes:
+        scene_id = int(safe_float(scene.get("scene_id"), 0))
+        if scene_id > 0 and scene_id not in scenes_by_id:
+            scenes_by_id[scene_id] = scene
+    retimed = []
+    for idx, block in enumerate(blocks, start=1):
+        scene = scenes_by_id.get(idx)
+        if scene is None and idx - 1 < len(ordered_scenes):
+            scene = ordered_scenes[idx - 1]
+        if scene is None:
+            scene = single_video_fallback_scene_for_block(block)
+        retimed.append(normalize_single_video_scene_for_block(scene, block, idx))
+    return retimed
+
+def apply_existing_single_video_assets(target_folder: Path, storyboard_csv: Path, scenes: list[dict]) -> None:
+    existing_by_id: dict[int, dict] = {}
+    if storyboard_csv.exists():
+        try:
+            with storyboard_csv.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    scene_id = int(safe_float(row.get("scene_id"), 0))
+                    if scene_id > 0:
+                        existing_by_id[scene_id] = row
+        except Exception:
+            existing_by_id = {}
+
+    for scene in scenes:
+        scene_id = int(safe_float(scene.get("scene_id"), 0))
+        if scene_id <= 0:
+            continue
+        existing = existing_by_id.get(scene_id, {})
+        if not str(scene.get("custom_image_path") or "").strip():
+            existing_image = str(existing.get("custom_image_path") or "").strip()
+            if existing_image:
+                scene["custom_image_path"] = existing_image
+            else:
+                candidates = [
+                    target_folder / "04_images" / "ai" / f"scene_{scene_id:02d}.png",
+                    target_folder / "04_images" / "ai" / f"scene_{scene_id:03d}.png",
+                    target_folder / "04_images" / "ai_generated" / f"img_{scene.get('start_time')}.png",
+                    target_folder / "04_images" / "preview_images" / f"img_{scene.get('start_time')}.png",
+                ]
+                match = next((path for path in candidates if path.exists()), None)
+                if match:
+                    scene["custom_image_path"] = str(match)
+        if not str(scene.get("animation_video_path") or "").strip():
+            existing_animation = str(existing.get("animation_video_path") or "").strip()
+            if existing_animation:
+                scene["animation_video_path"] = existing_animation
+
+def retime_single_video_scenes(scenes: list[dict], subs: list[srt.Subtitle]) -> list[dict]:
+    blocks = single_video_scene_blocks(subs, len(scenes))
+    return apply_single_video_scene_blocks(scenes, blocks) if blocks else scenes
+
+def normalize_single_video_scene(scene: dict, idx: int, timeline_end: float) -> dict:
+    start_time = max(0.0, safe_float(scene.get("start_time"), 0.0))
+    end_time = safe_float(scene.get("end_time"), start_time + 3.0)
+    end_time = min(max(end_time, start_time + 0.2), timeline_end)
+    return {
+        "scene_id": idx,
+        "start_time": round(start_time, 3),
+        "end_time": round(end_time, 3),
+        "source_type": "AI",
+        "flashcard_word": "",
+        "custom_image_path": str(scene.get("custom_image_path") or "").strip(),
+        "image_prompt": sanitize_image_prompt({**scene, "source_type": "AI"}),
+        "animation_prompt": str(scene.get("animation_prompt") or "Subtle camera movement with gentle natural motion.").strip(),
+        "animation_video_path": str(scene.get("animation_video_path") or "").strip(),
+        "reason": str(scene.get("reason") or "").strip(),
+        "subtitle_reference": str(scene.get("subtitle_reference") or "").strip(),
+    }
+
+def generate_single_video_storyboard(
+    *,
+    ep_num: int,
+    target_folder: Path,
+    srt_file: Path,
+    storyboard_csv: Path,
+    provider: str,
+) -> bool:
+    srt_text = srt_file.read_text(encoding="utf-8")
+    subs = list(srt.parse(srt_text))
+    if not subs:
+        print(f"SRT file has no subtitle entries: {srt_file}")
+        return False
+    timeline_end = max(sub.end.total_seconds() for sub in subs)
+    scene_count = single_video_scene_count(timeline_end, len(subs))
+    scene_blocks = single_video_scene_blocks(subs, scene_count)
+    prompt_template_path = ensure_prompt_template(target_folder)
+    prompt_template = prompt_template_path.read_text(encoding="utf-8")
+    youtube_title = read_youtube_title(target_folder)
+    prompt = render_prompt(
+        prompt_template,
+        [],
+        srt_text,
+        "",
+        "",
+        youtube_title,
+    )
+    prompt = prompt.replace("{{SCENE_BLOCKS}}", json.dumps(scene_blocks, ensure_ascii=False, indent=2))
+    provider = normalize_provider(provider)
+    try:
+        scenes, provider_used = generate_storyboard_json(prompt, provider)
+        print(f"Single video storyboard provider used: {provider_used}")
+        normalized = apply_single_video_scene_blocks(scenes, scene_blocks)
+        if not normalized:
+            raise ValueError("model returned no usable scenes")
+        if single_video_timeline_invalid(normalized, timeline_end):
+            print("WARN single video AI storyboard timeline is invalid; retiming scenes from subtitle cues.")
+            normalized = retime_single_video_scenes(normalized, subs)
+    except Exception as exc:
+        print(f"WARN single video AI storyboard failed; using subtitle fallback: {exc}")
+        normalized = build_single_video_fallback_storyboard(subs)
+    apply_existing_single_video_assets(target_folder, storyboard_csv, normalized)
+    write_storyboard_csv(storyboard_csv, normalized)
+    write_json_file(storyboard_csv.with_suffix(".json"), normalized)
+    print(f"Single video storyboard saved to: {storyboard_csv} ({len(normalized)} scenes)")
+    return True
 
 
 def resolve_flashcard_image_path(
@@ -1145,6 +1444,14 @@ def generate_storyboard(ep_num: int, provider: str = "auto") -> bool:
     if not srt_file.exists():
         print(f"Missing fixed subtitle file: {srt_file}")
         return False
+    if detect_profile_id() == "single_video" and not vocab_csv.exists():
+        return generate_single_video_storyboard(
+            ep_num=ep_num,
+            target_folder=target_folder,
+            srt_file=srt_file,
+            storyboard_csv=output_csv,
+            provider=provider,
+        )
     if not vocab_csv.exists():
         print(f"Missing vocab_data.csv: {vocab_csv}")
         return False

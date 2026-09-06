@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 
-EP_DIR_PATTERN = re.compile(r"^Ep(?P<ep>\d{2})_(?P<start>\d{4})_(?P<end>\d{4})$")
+EP_DIR_PATTERN = re.compile(r"^Ep(?P<ep>\d{2,})_(?P<start>\d{4})_(?P<end>\d{4})$")
 
 
 def find_episode_folder(workspace_dir: Path, ep_num: int) -> Path | None:

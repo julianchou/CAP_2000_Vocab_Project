@@ -155,6 +155,11 @@ PROFILE_SECTION_OPTIONS = {
         "Short 管理",
         "短影音工廠",
     ],
+    "single_video": [
+        "📊 Dashboard",
+        "⚙️ Pipeline Manager",
+        "🎬 Studio & Publisher",
+    ],
 }
 
 def file_signature(path: Path) -> tuple[int, int]:
@@ -472,6 +477,28 @@ DEFAULT_STORYBOARD_PROMPT_TEMPLATE = """你是一位專業的英語教學影片�
 【字幕內容】
 {{SRT_CONTENT}}
 """
+DEFAULT_SINGLE_VIDEO_STORYBOARD_PROMPT_TEMPLATE = """你是影片分鏡導演。請根據「固定 Scene 區塊」替 YouTube 影片規劃分鏡內容。
+
+請輸出 JSON 陣列，每個物件必須包含：
+scene_id, start_time, end_time, source_type, flashcard_word, custom_image_path, image_prompt, animation_prompt, animation_video_path, reason, subtitle_reference
+
+規則：
+1. 必須逐一處理「固定 Scene 區塊」，輸出數量、scene_id 與區塊完全一致，不可新增、刪除、合併或重排。
+2. source_type 一律填 AI。
+3. flashcard_word 一律留空。
+4. start_time、end_time、subtitle_reference 必須原樣複製對應的固定 Scene 區塊。
+5. image_prompt 必須只根據同一個 Scene 區塊的 subtitle_reference 產生，不可使用其他 Scene 的內容。
+6. image_prompt 請用英文，描述明確主體、場景、動作、情緒、風格與 16:9 構圖，不要產生任何可讀文字。
+7. animation_prompt 請用英文，描述輕微鏡頭或角色動作。
+8. reason 請用中文簡短說明此畫面如何對應該 Scene 的字幕語境。
+9. custom_image_path 與 animation_video_path 留空。
+10. 只輸出 JSON，不要加 Markdown 或任何額外說明。
+
+影片標題：{{YOUTUBE_TITLE}}
+
+固定 Scene 區塊：
+{{SCENE_BLOCKS}}
+"""
 DEFAULT_YOUTUBE_META_PROMPT_TEMPLATE = """你是一位專業的 YouTube SEO 專家與國中英文老師。
 請根據以下提供的完整影片字幕檔（SRT），為影片生成 YouTube Metadata。
 
@@ -506,6 +533,117 @@ def get_episode_scaffold_dirs(profile_id: str) -> list[str]:
     if profile_id == "story":
         return STORY_EPISODE_SCAFFOLD_DIRS
     return DEFAULT_EPISODE_SCAFFOLD_DIRS
+
+def single_video_info_path(ep_path: Path) -> Path:
+    return ep_path / "video_info.json"
+
+def load_single_video_info(ep_path: Path) -> Dict:
+    payload = read_json_file(single_video_info_path(ep_path)) or {}
+    return payload if isinstance(payload, dict) else {}
+
+def save_single_video_info(ep_path: Path, youtube_title: str) -> Path:
+    payload = load_single_video_info(ep_path)
+    payload["youtube_title"] = str(youtube_title or "").strip()
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    target = single_video_info_path(ep_path)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+def single_video_title(ep_path: Path) -> str:
+    info = load_single_video_info(ep_path)
+    title = str(info.get("youtube_title") or "").strip()
+    if title:
+        return title
+    meta = read_json_file(first_existing_path(youtube_meta_paths(ep_path))) or {}
+    if isinstance(meta, dict):
+        title = str(meta.get("title") or "").strip()
+    return title
+
+def single_video_option_label(item: Dict) -> str:
+    raw = item.get("_raw", {})
+    ep_path = raw.get("path")
+    title = single_video_title(ep_path) if isinstance(ep_path, Path) else ""
+    base = f"Ep{int(raw.get('ep') or 0):02d}"
+    return f"{base} | {title}" if title else f"{base} | 未命名影片"
+
+def build_single_video_generation_plan(start_ep: int, end_ep: int, title: str = "") -> list[Dict]:
+    if start_ep > end_ep:
+        raise ValueError("起始集數不可大於結束集數。")
+    plans = []
+    for ep_num in range(start_ep, end_ep + 1):
+        dir_name = episode_dir_name(ep_num, 0, 0)
+        existing_dirs = find_episode_dirs_by_ep(ROOT, ep_num, WS_ROOT)
+        exact_match = next((p for p in existing_dirs if p.name == dir_name), None)
+        conflict_dirs = [p for p in existing_dirs if p.name != dir_name]
+        if exact_match and not conflict_dirs:
+            action = "沿用"
+        elif exact_match and conflict_dirs:
+            action = "沿用 + 備份衝突"
+        elif conflict_dirs:
+            action = "需備份舊資料夾"
+        else:
+            action = "建立"
+        plans.append({
+            "ep": ep_num,
+            "start": 0,
+            "end": 0,
+            "dir_name": dir_name,
+            "target_path": ROOT / WS_ROOT / dir_name,
+            "existing_dirs": existing_dirs,
+            "exact_match": exact_match,
+            "conflict_dirs": conflict_dirs,
+            "action": action,
+            "youtube_title": title if start_ep == end_ep else "",
+        })
+    return plans
+
+def single_video_generation_plan_table(plans: list[Dict]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "影片": f"Ep{plan['ep']:02d}",
+            "YouTube Title": plan.get("youtube_title") or "—",
+            "目標資料夾": plan["dir_name"],
+            "現有資料夾": "\n".join(p.name for p in plan["existing_dirs"]) or "—",
+            "動作": plan["action"],
+        }
+        for plan in plans
+    ])
+
+def single_video_prompt_scene_count(timeline_end: float, subtitle_count: int) -> int:
+    configured = str(os.getenv("CAP_SINGLE_VIDEO_SCENE_COUNT", "")).strip()
+    if configured:
+        try:
+            return max(1, min(int(configured), max(subtitle_count, 1)))
+        except ValueError:
+            pass
+    target_seconds = max(safe_float(os.getenv("CAP_SINGLE_VIDEO_TARGET_SCENE_SECONDS"), 18.0), 5.0)
+    estimated = max(1, round(max(timeline_end, 0.2) / target_seconds))
+    return max(1, min(estimated, max(subtitle_count, 1), 80))
+
+def build_single_video_prompt_scene_blocks(srt_path: Path) -> list[Dict]:
+    entries = parse_srt_entries(srt_path)
+    if not entries:
+        return []
+    timeline_end = max(safe_float(row.get("end", 0), 0) for row in entries)
+    scene_count = single_video_prompt_scene_count(timeline_end, len(entries))
+    blocks = []
+    total = len(entries)
+    for idx in range(scene_count):
+        start_idx = int(idx * total / scene_count)
+        end_idx = int((idx + 1) * total / scene_count) - 1
+        end_idx = max(start_idx, min(end_idx, total - 1))
+        chunk = entries[start_idx: end_idx + 1]
+        blocks.append({
+            "scene_id": idx + 1,
+            "start_time": round(safe_float(chunk[0].get("start", 0), 0), 3),
+            "end_time": round(safe_float(chunk[-1].get("end", 0), 0), 3),
+            "subtitle_reference": " | ".join(
+                re.sub(r"\s+", " ", str(row.get("content") or "")).strip()
+                for row in chunk
+                if str(row.get("content") or "").strip()
+            ),
+        })
+    return blocks
 
 def build_episode_generation_plan(start_ep: int, end_ep: int, words_per_episode: int) -> list[Dict]:
     if start_ep > end_ep:
@@ -660,6 +798,19 @@ def get_pipeline_mapping(profile_id: str):
         manual_labels = {}
         publish_substep = "7.2"
         storyboard_manual_substep = "5.1"
+    elif profile_id == "single_video":
+        mapping = {
+            "1": ["1", "2", "3", "4"],
+            "2": ["5"],
+            "3": ["6"],
+            "4": ["7", "8", "9", "10"],
+            "5": ["11"],
+        }
+        manual_labels = {
+            "4": "Step 4 完成 (人工字幕)",
+        }
+        publish_substep = "11"
+        storyboard_manual_substep = ""
     else:
         mapping = {
             "1": ["3", "4", "5", "6", "7"],
@@ -698,6 +849,8 @@ def get_stage_ids_for_profile(profile_id: str) -> list[str]:
         return ["1", "2", "3", "4", "5", "6"]
     if profile_id == "story":
         return ["1", "2", "3", "4", "5", "6", "7"]
+    if profile_id == "single_video":
+        return ["1", "2", "3", "4", "5"]
     if profile_id == "episode_merge":
         return []
     return ["1", "1.5", "2", "3", "4", "5", "6", "7"]
@@ -787,6 +940,38 @@ def infer_stage_statuses_for_profile(ep_path: Path, profile_id: str, prev: Dict 
                     st[sid] = pv
         return st
 
+    if profile_id == "single_video":
+        stage_ids = get_stage_ids_for_profile(profile_id)
+        st = {sid: "pending" for sid in stage_ids}
+        if subtitles_fixed_path(ep_path).exists():
+            st["1"] = "done"
+        if storyboard_csv_path(ep_path).exists():
+            st["2"] = "done"
+        preview_image_dirs = [
+            ep_path / "04_images" / "preview_images",
+            ep_path / "04_images" / "ai_generated",
+        ]
+        if any(p.exists() and any(p.iterdir()) for p in preview_image_dirs):
+            st["3"] = "done"
+        inputs_ready = _file_nonempty(inputs_txt_path(ep_path))
+        final_video = video_output_path(ep_path).exists()
+        meta_exists = any(p.exists() for p in youtube_meta_paths(ep_path))
+        if inputs_ready and final_video and meta_exists:
+            st["4"] = "done"
+        upload_record = read_json_file(ep_path / "05_output" / "upload_record.json") or {}
+        uploaded_markers = [ep_path / "05_output" / "uploaded.txt", ep_path / "05_output" / "upload.ok"]
+        if (
+            (isinstance(upload_record, dict) and str(upload_record.get("status", "")).strip().lower() == "success")
+            or any(m.exists() for m in uploaded_markers)
+        ):
+            st["5"] = "done"
+        if prev and isinstance(prev, dict):
+            p_st = (prev.get("stages") or {}) if "stages" in prev else prev
+            for sid, pv in p_st.items():
+                if sid in st and st.get(sid) != "done" and pv in ("error", "running"):
+                    st[sid] = pv
+        return st
+
     if profile_id != "vocab":
         return infer_stage_statuses(ep_path, prev=prev)
 
@@ -849,6 +1034,8 @@ def stage_table(eps):
             "Ep": e["Ep"],
             "Range": e["Range"],
         }
+        if st.session_state["profile_id"] == "single_video":
+            row["YouTube Title"] = single_video_title(e["_raw"]["path"]) or "—"
         for sid in stage_ids:
             row[sid] = with_emoji(stg.get(sid, "pending"))
         row["Latest"] = latest or "—"
@@ -881,6 +1068,8 @@ def substeps_table(eps):
     snapshot = compute_substeps_status(eps)
     for item in snapshot:
         row = {"Ep": item["Ep"], "Range": item["Range"]}
+        if st.session_state["profile_id"] == "single_video":
+            row["YouTube Title"] = single_video_title(Path(item["_path"])) or "—"
         for k in SUBSTEP_IDS:
             row[k] = with_emoji(item["status"].get(k, "pending"))
         rows.append(row)
@@ -1980,6 +2169,37 @@ def render_final_prompt_expander(title: str, prompt_text: str, *, key_prefix: st
         )
 
 def build_prompt_source_rows(profile_id: str) -> list[Dict]:
+    if profile_id == "single_video":
+        return [
+            {
+                "Step": "0",
+                "用途": "AI 封面圖 Prompt",
+                "Prompt 檔案": str(cover_image_prompt_path(profile_id)),
+                "缺檔時預設": "DEFAULT_COVER_IMAGE_PROMPT_TEMPLATE",
+                "主要資料來源": "video_info.json + 字幕",
+            },
+            {
+                "Step": "3",
+                "用途": "AI 字幕校對",
+                "Prompt 檔案": str(subtitle_review_prompt_path(profile_id)),
+                "缺檔時預設": "DEFAULT_SUBTITLE_REVIEW_PROMPT_TEMPLATE",
+                "主要資料來源": "02_subtitles/notebooklm_audio.srt",
+            },
+            {
+                "Step": "5",
+                "用途": "AI 分鏡規劃",
+                "Prompt 檔案": str(storyboard_prompt_path(profile_id)),
+                "缺檔時預設": "DEFAULT_STORYBOARD_PROMPT_TEMPLATE",
+                "主要資料來源": "校對字幕 + YouTube Title",
+            },
+            {
+                "Step": "10",
+                "用途": "YouTube Metadata",
+                "Prompt 檔案": str(youtube_meta_prompt_path(profile_id)),
+                "缺檔時預設": "DEFAULT_YOUTUBE_META_PROMPT_TEMPLATE",
+                "主要資料來源": "字幕 + YouTube Title",
+            },
+        ]
     return [
         {
             "Step": "5",
@@ -2183,7 +2403,8 @@ def render_manual_subtitle_editor(ep_path: Path, step_no: str, *, key_prefix: st
         if audio_path.exists():
             st.audio(str(audio_path))
         else:
-            st.warning("尚未找到語音檔，請先完成 No.10 上傳語音音訊與 No.10.5 合併片頭音訊。")
+            upload_hint = "No.1 上傳語音音訊" if st.session_state.get("profile_id") == "single_video" else "No.10 上傳語音音訊與 No.10.5 合併片頭音訊"
+            st.warning(f"尚未找到語音檔，請先完成 {upload_hint}。")
         st.caption(f"字幕檔案：{subtitle_path}")
         if dirty:
             st.warning("目前字幕內容尚未存檔。")
@@ -2360,6 +2581,134 @@ def render_prompts_workspace(
                     st.caption(f"Log 檔案：{log_path}")
                     st.code(log_path.read_text(encoding="utf-8", errors="ignore")[-5000:])
             return state, log_path, dirty
+
+    if profile_id == "single_video":
+        title = single_video_title(ep_path)
+        raw_subtitle_path = ep_path / "02_subtitles" / "notebooklm_audio.srt"
+        fixed_subtitle_path = subtitles_fixed_path(ep_path)
+
+        def render_single_prompt_preview(template_text: str, srt_path: Path | None = None) -> str:
+            selected_srt_path = srt_path or fixed_subtitle_path
+            scene_blocks = build_single_video_prompt_scene_blocks(selected_srt_path)
+            return (
+                str(template_text or "")
+                .replace("{{EPISODE}}", str(info["ep"]))
+                .replace("{{YOUTUBE_TITLE}}", title or "")
+                .replace("{{SRT_CONTENT}}", read_text_file(selected_srt_path, ""))
+                .replace("{{SCENE_BLOCKS}}", json.dumps(scene_blocks, ensure_ascii=False, indent=2))
+            )
+
+        single_step_defs = {
+            "0": {
+                "name": "AI 封面圖 Prompt",
+                "type": "python",
+                "script": "scripts/generate_ai_cover.py",
+                "args": ["--ep", str(info["ep"])],
+            },
+            "3": {
+                "name": "AI 字幕校對",
+                "type": "python",
+                "script": "scripts/llm_subtitle_reviewer.py",
+                "args": ["--ep", str(info["ep"]), "--provider", "openai"],
+            },
+            "5": {
+                "name": "AI 依語境分鏡規劃",
+                "type": "python",
+                "script": "scripts/llm_director.py",
+                "args": ["--ep", str(info["ep"]), "--provider", "openai"],
+            },
+            "10": {
+                "name": "產生 YouTube Metadata",
+                "type": "python",
+                "script": "scripts/generate_youtube_meta.py",
+                "args": ["--ep", str(info["ep"])],
+            },
+        }
+        prompt_step_ids = list(single_step_defs.keys())
+        any_prompt_running = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in prompt_step_ids)
+        prompt_refresh_interval = 2 if (prompt_auto_refresh and any_prompt_running) else None
+        prompt_running_prev_key = f"prompt_running_prev_{info['ep']}_{profile_id}_{int(show_header)}"
+        if any_prompt_running:
+            st.session_state[prompt_running_prev_key] = True
+
+        @st.fragment(run_every=prompt_refresh_interval)
+        def render_single_prompt_panels():
+            st.caption("只會刷新此面板，不會切換影片或跳離目前頁面。")
+            st.button("只刷新 Prompt 狀態", key=f"refresh_prompt_blocks_{info['ep']}_{profile_id}_{int(show_header)}")
+            latest_prompt_running = any(bool(runner.get_substep_state(info, ns).get("running")) for ns in prompt_step_ids)
+            if st.session_state.get(prompt_running_prev_key) and not latest_prompt_running:
+                st.session_state[prompt_running_prev_key] = False
+                st.rerun()
+            st.session_state[prompt_running_prev_key] = latest_prompt_running
+
+            render_prompt_block(
+                "0",
+                "AI 封面圖 Prompt",
+                ensure_cover_image_prompt_file(profile_id),
+                DEFAULT_COVER_IMAGE_PROMPT_TEMPLATE,
+                single_step_defs["0"],
+                help_text="No.0 放置封面圖 Prompt；不列入子步驟 1–10 的完成追蹤。",
+                output_renderer=lambda: render_text_output_expander(
+                    "No.0 輸出 Prompt",
+                    cover_prompt_output_path(ep_path, info["ep"]),
+                    text_label="Cover Prompt 輸出",
+                    key_prefix=f"single_step0_prompt_{info['ep']}_{profile_id}",
+                    expanded=False,
+                    height=260,
+                ),
+                final_prompt_renderer=lambda template_text: render_single_prompt_preview(template_text, fixed_subtitle_path),
+            )
+            render_prompt_block(
+                "3",
+                "AI 字幕校對",
+                ensure_subtitle_review_prompt_file(profile_id),
+                DEFAULT_SUBTITLE_REVIEW_PROMPT_TEMPLATE,
+                single_step_defs["3"],
+                help_text="No.3 會讀取 Whisper 原始字幕，產生校對後的 notebooklm_audio_fixed.srt。",
+                output_renderer=lambda: render_text_output_expander(
+                    "No.3 輸出預覽",
+                    fixed_subtitle_path,
+                    text_label="校對字幕",
+                    key_prefix=f"single_step3_{info['ep']}_{profile_id}",
+                    expanded=False,
+                    height=260,
+                ) if fixed_subtitle_path.exists() else None,
+                final_prompt_renderer=lambda template_text: render_single_prompt_preview(template_text, raw_subtitle_path),
+            )
+            render_prompt_block(
+                "5",
+                "AI 依語境分鏡規劃",
+                ensure_storyboard_prompt_file(profile_id),
+                DEFAULT_STORYBOARD_PROMPT_TEMPLATE,
+                single_step_defs["5"],
+                help_text="No.5 會依校對字幕與 YouTube Title 生成 storyboard.csv。",
+                output_renderer=lambda: render_dataframe_output_expander(
+                    "No.5 輸出預覽",
+                    read_storyboard_df(ep_path),
+                    expanded=False,
+                ),
+                final_prompt_renderer=lambda template_text: render_single_prompt_preview(template_text, fixed_subtitle_path),
+            )
+            render_prompt_block(
+                "10",
+                "產生 YouTube Metadata",
+                ensure_youtube_meta_prompt_file(profile_id),
+                DEFAULT_YOUTUBE_META_PROMPT_TEMPLATE,
+                single_step_defs["10"],
+                help_text="No.10 會讀取校對字幕與 YouTube Title，產生 youtube_meta.json。",
+                output_renderer=lambda: render_text_output_expander(
+                    "No.10 輸出預覽",
+                    first_existing_path(youtube_meta_paths(ep_path)),
+                    text_label="YouTube Metadata JSON",
+                    key_prefix=f"single_step10_{info['ep']}_{profile_id}",
+                    expanded=False,
+                    height=260,
+                ) if first_existing_path(youtube_meta_paths(ep_path)) and first_existing_path(youtube_meta_paths(ep_path)).exists() else None,
+                final_prompt_renderer=lambda template_text: render_single_prompt_preview(template_text, fixed_subtitle_path),
+            )
+
+        render_single_prompt_panels()
+        return
 
     step5_def = {
         "name": "產生克漏字題目檔",
@@ -2938,21 +3287,24 @@ def render_prerender_workspace(ep_path: Path):
 
 def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
     is_story_mode = profile_id == "story"
+    no_flashcard_mode = profile_id in ("story", "single_video")
     if profile_id == "story":
         st.subheader("No.5.1 修改分鏡")
+    elif profile_id == "single_video":
+        st.subheader("修改分鏡 / 替換圖片")
     else:
         st.subheader("No.13 修改分鏡 / 替換單字卡")
     storyboard_path = storyboard_path_for(ep_path)
     storyboard_sig = storyboard_file_signature(ep_path)
     storyboard_key_suffix = f"{info['ep']}_{profile_id}_{storyboard_sig}"
     storyboard_df = read_storyboard_df(ep_path)
-    flashcards = {} if is_story_mode else flashcard_map_for(ep_path)
+    flashcards = {} if no_flashcard_mode else flashcard_map_for(ep_path)
     if storyboard_df.empty:
         st.warning(f"找不到分鏡表：{storyboard_path}")
         return
 
     storyboard_df = normalize_storyboard_df(ep_path, storyboard_df)
-    if profile_id == "story":
+    if profile_id in ("story", "single_video"):
         st.caption(f"分鏡檔：{storyboard_path}")
     else:
         done13 = has_manual_marker(ep_path, "13")
@@ -3046,7 +3398,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
             )
             with st.expander("合併預覽", expanded=True):
                 merge_cols = ["scene_id", "start_time", "end_time", "source_type", "reason"]
-                if not is_story_mode:
+                if not no_flashcard_mode:
                     merge_cols.insert(4, "flashcard_word")
                 st.dataframe(merge_preview_df[merge_cols], use_container_width=True, hide_index=True)
             merge_disabled = len(merge_preview_df) < 2
@@ -3088,7 +3440,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
             split_scene_id = scene_option_map[split_scene_label]
             split_source_row = storyboard_df[storyboard_df["scene_id"].astype(str) == str(split_scene_id)].iloc[0].copy()
             split_draft_df = build_split_scene_draft(ep_path, split_source_row, split_count)
-            split_editor_df = split_draft_df.drop(columns=["flashcard_word"], errors="ignore") if is_story_mode else split_draft_df
+            split_editor_df = split_draft_df.drop(columns=["flashcard_word"], errors="ignore") if no_flashcard_mode else split_draft_df
             split_editor_key = f"storyboard_split_editor_{info['ep']}_{profile_id}_{split_scene_id}_{split_count}"
             st.caption("預設先等分時間。你可以直接改每段的開始/結束時間與 reason，再套用。")
             edited_split_df = st.data_editor(
@@ -3099,8 +3451,8 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                 column_config={
                     "start_time": st.column_config.NumberColumn("開始", format="%.3f"),
                     "end_time": st.column_config.NumberColumn("結束", format="%.3f"),
-                    "source_type": st.column_config.SelectboxColumn("素材來源", options=["AI"] if is_story_mode else ["AI", "FLASHCARD"]),
-                    "flashcard_word": st.column_config.TextColumn("單字卡", disabled=is_story_mode),
+                    "source_type": st.column_config.SelectboxColumn("素材來源", options=["AI"] if no_flashcard_mode else ["AI", "FLASHCARD"]),
+                    "flashcard_word": st.column_config.TextColumn("單字卡", disabled=no_flashcard_mode),
                     "custom_image_path": st.column_config.TextColumn("圖片路徑", width="large"),
                     "image_prompt": st.column_config.TextColumn("圖片 Prompt", width="large"),
                     "animation_prompt": st.column_config.TextColumn("動畫 Prompt", width="large"),
@@ -3109,7 +3461,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
                 },
                 key=split_editor_key,
             )
-            if is_story_mode:
+            if no_flashcard_mode:
                 edited_split_df["source_type"] = "AI"
                 edited_split_df["flashcard_word"] = ""
             split_times = [
@@ -3335,10 +3687,10 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
     asset_tag_loaded_key = f"{asset_tag_input_key}__loaded"
     reason_key = f"storyboard_reason_{storyboard_key_suffix}_{selected_scene_id}"
     if source_key not in st.session_state:
-        st.session_state[source_key] = "AI" if is_story_mode else (str(selected_row.get("source_type", "")).upper() or "AI")
+        st.session_state[source_key] = "AI" if no_flashcard_mode else (str(selected_row.get("source_type", "")).upper() or "AI")
     if flashcard_key not in st.session_state:
         st.session_state[flashcard_key] = current_word if current_word in flashcards else ""
-    if is_story_mode:
+    if no_flashcard_mode:
         st.session_state[source_key] = "AI"
         st.session_state[flashcard_key] = ""
     if custom_image_key not in st.session_state:
@@ -3502,6 +3854,40 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         )
     else:
         st.caption("目前沒有已選定的素材。")
+
+    with st.expander("上傳圖片到此 Scene", expanded=False):
+        uploaded_scene_image = st.file_uploader(
+            "上傳圖片",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"storyboard_upload_image_{storyboard_key_suffix}_{selected_scene_id}",
+        )
+        if uploaded_scene_image is not None:
+            suffix = Path(uploaded_scene_image.name).suffix.lower() or ".png"
+            if suffix == ".jpeg":
+                suffix = ".jpg"
+            target_image_path = ep_path / "04_images" / "uploads" / f"scene_{str(selected_scene_id).zfill(3)}{suffix}"
+            st.caption(f"將儲存為：{target_image_path}")
+            if st.button("儲存並套用上傳圖片", key=f"storyboard_apply_uploaded_image_{storyboard_key_suffix}_{selected_scene_id}"):
+                save_uploaded_file(uploaded_scene_image, target_image_path)
+                scene_updates = {
+                    "source_type": "AI",
+                    "flashcard_word": "",
+                    "custom_image_path": str(target_image_path),
+                    "image_prompt": st.session_state.get(prompt_key, str(selected_row.get("image_prompt", ""))),
+                    "animation_prompt": st.session_state.get(animation_prompt_key, str(selected_row.get("animation_prompt", ""))),
+                    "animation_video_path": "",
+                    "reason": st.session_state.get(reason_key, str(selected_row.get("reason", ""))),
+                }
+                saved_storyboard, _latest_df, idx = update_storyboard_scene(ep_path, selected_scene_id, scene_updates)
+                if saved_storyboard is None or idx is None:
+                    st.error("找不到對應 scene，可能已被修改。請重新整理後再試。")
+                else:
+                    st.session_state[source_key] = "AI"
+                    st.session_state[flashcard_key] = ""
+                    st.session_state[asset_mode_key] = "圖片"
+                    st.session_state[custom_image_key] = str(target_image_path)
+                    st.success(f"已上傳並套用 Scene {selected_scene_id} 圖片：{saved_storyboard}")
+                    st.rerun()
 
     st.subheader("素材 Tag")
     st.caption("先為素材設定單一 Tag，再用同一個 Tag 篩選下方圖片與動畫；選好素材後仍需按「儲存此 Scene」。")
@@ -3672,7 +4058,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
     st.subheader("Scene 設定")
     basic1, basic2, basic3 = st.columns([1, 1.2, 1.4])
     with basic1:
-        if is_story_mode:
+        if no_flashcard_mode:
             source_type_val = "AI"
             st.text_input("source_type", value="AI", disabled=True, key=f"{source_key}_story_fixed")
         else:
@@ -3688,7 +4074,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
             horizontal=True,
         )
     with basic2:
-        if is_story_mode:
+        if no_flashcard_mode:
             flashcard_word_val = ""
         else:
             flashcard_options = [""] + sorted(flashcards.keys())
@@ -3772,7 +4158,14 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         )
 
     if apply_scene:
-        chosen_ai_image_path = selected_image_choice_path or custom_image_val.strip()
+        current_custom_image_path = str(selected_row.get("custom_image_path", "")).strip()
+        custom_image_path_input = custom_image_val.strip()
+        custom_image_changed = bool(custom_image_path_input) and custom_image_path_input != current_custom_image_path
+        chosen_ai_image_path = (
+            custom_image_path_input
+            if custom_image_changed
+            else (selected_image_choice_path or custom_image_path_input)
+        )
         chosen_animation_path = selected_animation_choice_path if asset_mode_val == "動畫" else ""
         scene_updates = {
             "source_type": source_type_val,
@@ -4158,6 +4551,8 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
     st.divider()
     st.caption("整張分鏡表快速編輯")
     editable_df = storyboard_df.copy()
+    if no_flashcard_mode:
+        editable_df = editable_df.drop(columns=["flashcard_word"], errors="ignore")
     edited_storyboard_df = st.data_editor(
         editable_df,
         use_container_width=True,
@@ -4168,7 +4563,7 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
             "scene_id": st.column_config.NumberColumn(),
             "start_time": st.column_config.NumberColumn(format="%.2f"),
             "end_time": st.column_config.NumberColumn(format="%.2f"),
-            "source_type": st.column_config.SelectboxColumn(options=["AI", "FLASHCARD"]),
+            "source_type": st.column_config.SelectboxColumn(options=["AI"] if no_flashcard_mode else ["AI", "FLASHCARD"]),
             "flashcard_word": st.column_config.TextColumn(),
             "custom_image_path": st.column_config.TextColumn(width="large"),
             "image_prompt": st.column_config.TextColumn(width="large"),
@@ -4180,6 +4575,9 @@ def render_storyboard_workspace(info: Dict, ep_path: Path, profile_id: str):
         key=f"storyboard_editor_{storyboard_key_suffix}",
     )
     if st.button("儲存整張分鏡表", key=f"save_storyboard_all_{storyboard_key_suffix}"):
+        if no_flashcard_mode:
+            edited_storyboard_df["source_type"] = "AI"
+            edited_storyboard_df["flashcard_word"] = ""
         saved_storyboard = save_storyboard_df(ep_path, edited_storyboard_df)
         st.success(f"已儲存分鏡表：{saved_storyboard}")
         st.rerun()
@@ -4211,7 +4609,12 @@ def storyboard_prompt_path(profile_id: str) -> Path:
 def ensure_storyboard_prompt_file(profile_id: str) -> Path:
     prompt_path = storyboard_prompt_path(profile_id)
     if not prompt_path.exists():
-        save_text_file(prompt_path, DEFAULT_STORYBOARD_PROMPT_TEMPLATE)
+        default_template = (
+            DEFAULT_SINGLE_VIDEO_STORYBOARD_PROMPT_TEMPLATE
+            if profile_id == "single_video"
+            else DEFAULT_STORYBOARD_PROMPT_TEMPLATE
+        )
+        save_text_file(prompt_path, default_template)
     return prompt_path
 
 def youtube_meta_prompt_path(profile_id: str) -> Path:
@@ -5127,8 +5530,8 @@ def safe_float(value, default: float = 0.0) -> float:
     except Exception:
         return default
 
-@st.cache_data(show_spinner=False, max_entries=128)
-def media_duration_seconds(path_str: str) -> float | None:
+@st.cache_data(show_spinner=False, max_entries=1024)
+def _media_duration_seconds_cached(path_str: str, signature: tuple[int, int]) -> float | None:
     path = Path(path_str)
     if not path.exists():
         return None
@@ -5153,6 +5556,10 @@ def media_duration_seconds(path_str: str) -> float | None:
         return None
     duration = safe_float((result.stdout or "").strip(), -1.0)
     return duration if duration >= 0 else None
+
+def media_duration_seconds(path_str: str) -> float | None:
+    path = Path(path_str)
+    return _media_duration_seconds_cached(str(path), file_signature(path))
 
 def file_to_data_uri(path: Path | None) -> str:
     if not path or not Path(path).exists():
@@ -5220,8 +5627,17 @@ def image_to_preview_data_uri(path_str: str, max_width: int = 960, quality: int 
 def build_episode_preview_payload(ep_path: Path, storyboard_df: pd.DataFrame, subtitle_entries: list[Dict]) -> Dict:
     image_cache: Dict[str, str] = {}
     video_cache: Dict[str, str] = {}
+    sorted_storyboard_df = storyboard_df.copy()
+    if not sorted_storyboard_df.empty:
+        sorted_storyboard_df["_preview_start"] = sorted_storyboard_df["start_time"].apply(lambda v: safe_float(v, 0))
+        sorted_storyboard_df["_preview_end"] = sorted_storyboard_df["end_time"].apply(lambda v: safe_float(v, 0))
+        sorted_storyboard_df["_preview_scene"] = sorted_storyboard_df["scene_id"].apply(lambda v: safe_float(v, 0))
+        sorted_storyboard_df = sorted_storyboard_df.sort_values(
+            ["_preview_start", "_preview_end", "_preview_scene"],
+            kind="stable",
+        ).drop(columns=["_preview_start", "_preview_end", "_preview_scene"])
     animation_paths = []
-    for _, row in storyboard_df.iterrows():
+    for _, row in sorted_storyboard_df.iterrows():
         animation_path = storyboard_scene_animation_path(ep_path, row)
         if animation_path and animation_path.exists():
             animation_paths.append(animation_path)
@@ -5230,7 +5646,7 @@ def build_episode_preview_payload(ep_path: Path, storyboard_df: pd.DataFrame, su
     inline_animation_limit = 25 * 1024 * 1024
     allow_inline_animations = total_animation_bytes <= inline_animation_limit
     scenes = []
-    for _, row in storyboard_df.iterrows():
+    for _, row in sorted_storyboard_df.iterrows():
         image_path = storyboard_scene_image_path(ep_path, row)
         animation_path = storyboard_scene_animation_path(ep_path, row)
         image_path_str = str(image_path) if image_path else ""
@@ -5595,14 +6011,22 @@ def render_episode_preview_player(audio_path: Path, payload: Dict, height: int =
 
       function findActiveIndex(items, currentTime) {{
         if (!items.length) return -1;
+        let latestCompletedIndex = -1;
+        let latestCompletedEnd = -Infinity;
         for (let i = 0; i < items.length; i += 1) {{
           const item = items[i];
-          if (currentTime >= Number(item.start || 0) && currentTime < Number(item.end || 0)) return i;
+          const start = Number(item.start || 0);
+          const end = Number(item.end || 0);
+          if (currentTime >= start && currentTime < end) return i;
+          if (currentTime >= end && end > latestCompletedEnd) {{
+            latestCompletedIndex = i;
+            latestCompletedEnd = end;
+          }}
         }}
-        for (let i = items.length - 1; i >= 0; i -= 1) {{
-          if (currentTime >= Number(items[i].start || 0)) return i;
+        for (let i = 0; i < items.length; i += 1) {{
+          if (currentTime < Number(items[i].start || 0)) return i;
         }}
-        return -1;
+        return latestCompletedIndex;
       }}
 
       function setActive(listEl, selector, activeIndex) {{
@@ -6233,6 +6657,61 @@ elif section == "📊 Dashboard":
                         }
                     st.rerun()
 
+    elif st.session_state["profile_id"] == "single_video":
+        next_ep_default = next_episode_number_default(1)
+        with st.expander("新增 YouTube Title", expanded=True):
+            st.caption("單一影片生成器使用 EpNN_0000_0000 資料夾；YouTube Title 會儲存在該影片的 video_info.json，並用於 Pipeline 下拉選單與 Prompt。")
+            notice = st.session_state.pop("single_video_generation_notice", None)
+            if isinstance(notice, dict):
+                if notice.get("level") == "success":
+                    st.success(notice.get("message", ""))
+                elif notice.get("level") == "warning":
+                    st.warning(notice.get("message", ""))
+                elif notice.get("level") == "error":
+                    st.error(notice.get("message", ""))
+
+            single_ep = int(st.number_input("影片編號", min_value=1, value=next_ep_default, step=1, key="single_video_gen_ep"))
+            youtube_title = st.text_input("YouTube Title", key="single_video_youtube_title")
+            single_allow_backup = st.checkbox(
+                "若該編號已有不同資料夾，先備份舊資料夾再重建",
+                value=False,
+                key="single_video_allow_backup",
+            )
+            single_plans = build_single_video_generation_plan(single_ep, single_ep, youtube_title)
+            st.dataframe(single_video_generation_plan_table(single_plans), use_container_width=True, hide_index=True)
+            if single_plans[0]["conflict_dirs"] and not single_allow_backup:
+                st.warning("此編號已有不同命名的既有資料夾。若要套用單一影片資料夾，請勾選備份舊資料夾。")
+            if st.button("建立 / 更新影片", key="single_video_gen_submit"):
+                if not youtube_title.strip():
+                    st.session_state["single_video_generation_notice"] = {
+                        "level": "error",
+                        "message": "請先輸入 YouTube Title。",
+                    }
+                    st.rerun()
+                result = apply_episode_generation(single_plans, single_allow_backup, get_episode_scaffold_dirs("single_video"))
+                if result["conflicts"]:
+                    blocked_eps = ", ".join(f"Ep{p['ep']:02d}" for p in result["conflicts"])
+                    st.session_state["single_video_generation_notice"] = {
+                        "level": "error",
+                        "message": f"{blocked_eps} 有既有資料夾衝突，尚未變更。請勾選備份舊資料夾後再執行。",
+                    }
+                else:
+                    target_path = single_plans[0]["target_path"]
+                    info_path = save_single_video_info(target_path, youtube_title)
+                    parts = []
+                    if result["created"]:
+                        parts.append("新建影片")
+                    if result["reused"]:
+                        parts.append("更新影片")
+                    if result["backed_up"]:
+                        parts.append(f"備份舊資料夾 {len(result['backed_up'])} 個")
+                    parts.append(f"已儲存 Title：{info_path}")
+                    st.session_state["single_video_generation_notice"] = {
+                        "level": "success",
+                        "message": "；".join(parts),
+                    }
+                st.rerun()
+
     elif st.session_state["profile_id"] == "youtube_ai":
         render_youtube_ai_dashboard()
 
@@ -6345,12 +6824,26 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
     if not eps:
         st.info("尚未發現 workspace 內容。請先建立或同步集數資料夾。")
     else:
-        ep_map = {f"Ep{e['_raw']['ep']:02d} ({e['Range']})": e for e in eps}
+        if st.session_state["profile_id"] == "single_video":
+            ep_map = {single_video_option_label(e): e for e in eps}
+            ep_select_label = "選擇要編輯的影片"
+        else:
+            ep_map = {f"Ep{e['_raw']['ep']:02d} ({e['Range']})": e for e in eps}
+            ep_select_label = "選擇集數"
         ep_options = list(ep_map.keys())
-        ep_choice = st.selectbox("選擇集數", ep_options, index=max(len(ep_options) - 1, 0), key="pm_ep")
+        ep_choice = st.selectbox(ep_select_label, ep_options, index=max(len(ep_options) - 1, 0), key="pm_ep")
         target = ep_map[ep_choice]
         info = target["_raw"]
         st.caption(f"Episode Path: {info['path']}")
+        if st.session_state["profile_id"] == "single_video":
+            title_cols = st.columns([2.4, 0.8])
+            current_title = single_video_title(info["path"])
+            title_key = f"single_video_pm_title_{info['ep']}"
+            title_cols[0].text_input("YouTube Title", value=current_title, key=title_key)
+            if title_cols[1].button("儲存 Title", key=f"single_video_pm_save_title_{info['ep']}", use_container_width=True):
+                saved_path = save_single_video_info(info["path"], st.session_state.get(title_key, ""))
+                st.success(f"已儲存 Title：{saved_path}")
+                st.rerun()
         if st.session_state["profile_id"] == "story":
             render_story_summary(read_json_file(story_selected_json_path(info["path"])) or {})
             render_story_outline_result(info["path"])
@@ -6366,9 +6859,10 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
         auto_substep_ids = [s for s in SUBSTEP_IDS if s != publish_substep]
         max_auto_substep = auto_substep_ids[-1] if auto_substep_ids else SUBSTEP_MAX
 
-        if st.session_state["profile_id"] == "vocab":
+        if st.session_state["profile_id"] in ("vocab", "single_video"):
+            storyboard_tab_name = "修改分鏡/替換單字卡" if st.session_state["profile_id"] == "vocab" else "修改分鏡/替換圖片"
             tab_stage, tab_sub, tab_prerender_pm, tab_prompts_pm, tab_storyboard_pm = st.tabs(
-                [f"階段控制 ({STAGE_RANGE_LABEL})", f"子步驟 ({SUBSTEP_MIN}–{SUBSTEP_MAX})", "預渲染預覽", "Prompts", "修改分鏡/替換單字卡"]
+                [f"階段控制 ({STAGE_RANGE_LABEL})", f"子步驟 ({SUBSTEP_MIN}–{SUBSTEP_MAX})", "預渲染預覽", "Prompts", storyboard_tab_name]
             )
             tab_story_voice_pm = None
         elif st.session_state["profile_id"] == "story":
@@ -6384,7 +6878,12 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
             tab_prompts_pm = None
             tab_storyboard_pm = None
         if st.session_state.pop("pipeline_open_tab", None) == "storyboard":
-            storyboard_tab_label = "修改分鏡" if st.session_state["profile_id"] == "story" else "修改分鏡/替換單字卡"
+            if st.session_state["profile_id"] == "story":
+                storyboard_tab_label = "修改分鏡"
+            elif st.session_state["profile_id"] == "single_video":
+                storyboard_tab_label = "修改分鏡/替換圖片"
+            else:
+                storyboard_tab_label = "修改分鏡/替換單字卡"
             st.info(f"請使用「{storyboard_tab_label}」分頁進行調整。")
 
         with tab_stage:
@@ -6483,7 +6982,12 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
 
         with tab_sub:
             st.caption(f"在此直接執行 {SUBSTEP_MIN}–{max_auto_substep}（第{publish_substep}發布請到 Studio & Publisher）。")
-            subtitle_manual_substep = "13" if st.session_state["profile_id"] == "vocab" else "11"
+            if st.session_state["profile_id"] == "vocab":
+                subtitle_manual_substep = "13"
+            elif st.session_state["profile_id"] == "single_video":
+                subtitle_manual_substep = "4"
+            else:
+                subtitle_manual_substep = "11"
             auto_refresh_sub = st.toggle(
                 "自動刷新執行中的子步驟 Log",
                 value=True,
@@ -6572,9 +7076,15 @@ elif section in ("⚙️ Pipeline Manager", "🧩 Pipeline Manager"):
                     with cols[3]:
                         st.write("Nonempty OK: " + ("✅" if nonempty_ok else ("❌" if nonempty_required else "")))
                     with cols[4]:
-                        if st.session_state["profile_id"] == "vocab" and ns == "10":
+                        if (
+                            (st.session_state["profile_id"] == "vocab" and ns == "10")
+                            or (st.session_state["profile_id"] == "single_video" and ns == "1")
+                        ):
                             render_vocab_audio_upload_control(info["path"], ns, bool(row.get("ok")))
-                        elif st.session_state["profile_id"] == "vocab" and ns == "17":
+                        elif (
+                            (st.session_state["profile_id"] == "vocab" and ns == "17")
+                            or (st.session_state["profile_id"] == "single_video" and ns == "7")
+                        ):
                             render_vocab_outro_control(info["path"], ns, bool(row.get("ok")))
                         elif ns == publish_substep:
                             if st.button("前往 Studio & Publisher", key=f"goto_pub_{ns}"):
@@ -7322,7 +7832,14 @@ elif section == "🎬 Studio & Publisher":
                     )
 
                     if apply_scene:
-                        chosen_ai_image_path = selected_image_choice_path or custom_image_val.strip()
+                        current_custom_image_path = str(selected_row.get("custom_image_path", "")).strip()
+                        custom_image_path_input = custom_image_val.strip()
+                        custom_image_changed = bool(custom_image_path_input) and custom_image_path_input != current_custom_image_path
+                        chosen_ai_image_path = (
+                            custom_image_path_input
+                            if custom_image_changed
+                            else (selected_image_choice_path or custom_image_path_input)
+                        )
                         chosen_animation_path = selected_animation_choice_path if asset_mode_val == "動畫" else ""
                         scene_updates = {
                             "source_type": source_type_val,

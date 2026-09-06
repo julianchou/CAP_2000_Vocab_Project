@@ -1,0 +1,58 @@
+stages:
+  - id: "1"
+    key: "single_audio_subtitles"
+    name: "音訊與字幕"
+    steps:
+      - name: "No.2 Whisper 產生字幕"
+        type: python
+        script: scripts/generate_subtitles_only.py
+        args: ["--ep", "{ep}"]
+      - name: "No.3 AI 字幕校對"
+        type: python
+        script: scripts/llm_subtitle_reviewer.py
+        args: ["--ep", "{ep}", "--provider", "openai"]
+
+  - id: "2"
+    key: "single_storyboard"
+    name: "分鏡規劃"
+    steps:
+      - name: "No.5 AI 依語境分鏡規劃"
+        type: python
+        script: scripts/llm_director.py
+        args: ["--ep", "{ep}", "--provider", "openai"]
+
+  - id: "3"
+    key: "single_images"
+    name: "產生分鏡圖片"
+    steps:
+      - name: "No.6 AI 產生分鏡圖片"
+        type: python
+        script: scripts/gen_matched_preview_v4.py
+        args: ["--ep", "{ep}", "--provider", "nvidia"]
+
+  - id: "4"
+    key: "single_render"
+    name: "影片合成"
+    steps:
+      - name: "No.8 產生合成清單"
+        type: python
+        script: scripts/gen_matched_preview_v4.py
+        args: ["--ep", "{ep}"]
+      - name: "No.9 FFmpeg 影片合成"
+        type: python
+        script: run_stage6_render.py
+        args: ["--ep", "{ep}"]
+      - name: "No.10 產生 Youtube metadata"
+        type: python
+        script: scripts/generate_youtube_meta.py
+        args: ["--ep", "{ep}"]
+
+  - id: "5"
+    key: "single_publish"
+    name: "上傳 YouTube"
+    steps:
+      - name: "No.11 上傳 Youtube"
+        type: python
+        script: scripts/upload_to_youtube.py
+        args: ["--ep", "{ep}"]
+        optional: true

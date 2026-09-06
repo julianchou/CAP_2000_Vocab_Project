@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 MANUAL_MARKER_TEMPLATE = "step{no}_manual_done.txt"
 
-EP_DIR_PATTERN = re.compile(r"^Ep(?P<ep>\d{2})_(?P<start>\d{4})_(?P<end>\d{4})$")
+EP_DIR_PATTERN = re.compile(r"^Ep(?P<ep>\d{2,})_(?P<start>\d{4})_(?P<end>\d{4})$")
 
 STATUS_DEFAULT = {
     "1": "pending",
@@ -29,7 +29,15 @@ def list_episode_dirs(root: Path, ws_override: str | None = None) -> List[Path]:
     ws = workspace_dir(root, ws_override)
     if not ws.exists():
         return []
-    return sorted([p for p in ws.iterdir() if p.is_dir() and EP_DIR_PATTERN.match(p.name)])
+    episodes = [p for p in ws.iterdir() if p.is_dir() and EP_DIR_PATTERN.match(p.name)]
+    return sorted(
+        episodes,
+        key=lambda p: (
+            int(EP_DIR_PATTERN.match(p.name).group("ep")),
+            int(EP_DIR_PATTERN.match(p.name).group("start")),
+            int(EP_DIR_PATTERN.match(p.name).group("end")),
+        ),
+    )
 
 def find_episode_dirs_by_ep(root: Path, ep: int, ws_override: str | None = None) -> List[Path]:
     target_ep = int(ep)

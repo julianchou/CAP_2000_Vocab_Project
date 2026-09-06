@@ -279,7 +279,7 @@ def short_rerun_when_step_finishes(ep_dir: Path, step_no: str, key_suffix: str =
     is_running = bool(state.get("running"))
     st.session_state[state_key] = is_running
     if was_running and not is_running:
-        st.rerun()
+        st.rerun(scope="app")
     return state
 
 def short_output_completed(path: Path) -> bool:
@@ -493,6 +493,9 @@ def short_start_logged_script(ep_dir: Path, step_no: str, label: str, cmd: list[
         ),
         encoding="utf-8",
     )
+    st.session_state[
+        f"short_step_was_running_{ep_dir.name}_{str(step_no).replace('.', '_')}_control"
+    ] = True
     short_append_step_log(ep_dir, step_no, f"背景程序已啟動，PID {proc.pid}。")
     return True
 
@@ -1039,6 +1042,16 @@ def render_short_control_steps(program: Dict, ep_dir: Path | None, selected_epis
         if step_no == "4":
             source_path = output_path if short_output_completed(output_path) else (ep_dir / "02_subtitles" / "whisper.srt")
             subtitle_text = source_path.read_text(encoding="utf-8", errors="ignore") if short_output_completed(source_path) else ""
+            manual_srt_key = f"short_step4_manual_srt_{ep_dir.name}"
+            manual_source_key = f"{manual_srt_key}_source"
+            manual_source_sig = (
+                f"{source_path.resolve()}:{source_path.stat().st_mtime_ns}:{source_path.stat().st_size}"
+                if short_output_completed(source_path)
+                else "missing"
+            )
+            if st.session_state.get(manual_source_key) != manual_source_sig:
+                st.session_state[manual_srt_key] = subtitle_text
+                st.session_state[manual_source_key] = manual_source_sig
             with st.expander("手動調整字幕", expanded=not short_output_completed(output_path) and bool(subtitle_text)):
                 st.caption("優先編輯 AI 校對後的 reviewed.srt；若尚未產生，會先載入 whisper.srt。儲存後會寫入 reviewed.srt。")
                 review_audio_files = short_audio_files(ep_dir)
@@ -1056,7 +1069,7 @@ def render_short_control_steps(program: Dict, ep_dir: Path | None, selected_epis
                     "字幕內容",
                     value=subtitle_text,
                     height=320,
-                    key=f"short_step4_manual_srt_{ep_dir.name}",
+                    key=manual_srt_key,
                 )
                 if st.button("儲存手動調整字幕", key=f"short_step4_save_manual_srt_{ep_dir.name}"):
                     def save_manual_reviewed_srt():
@@ -1242,6 +1255,7 @@ def render_short_storyboard_editor(ep_dir: Path):
             scene_image_provider = provider_cols[0].selectbox(
                 "產生圖片 Provider",
                 scene_image_providers,
+                index=scene_image_providers.index("nvidia"),
                 key=f"short_scene_image_provider_{ep_dir.name}_{selected_scene}",
                 format_func=lambda value: {
                     "gemini": "Gemini",
